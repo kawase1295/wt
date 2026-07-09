@@ -1,28 +1,113 @@
 #!/usr/bin/env bash
-# wt — git worktree + herdr workspace で並列開発セッションを立ち上げる汎用 CLI
+# wt — a CLI for parallel development sessions using git worktree + herdr workspace
 #
-# 使い方 (対象リポジトリ内の任意の場所から実行する):
+# Usage (run from anywhere inside the target repository):
 #   wt new <task> [--base <ref>] [--no-claude]
-#       worktree を ~/.herdr/worktrees/<repo>/<task> に作り、herdr workspace を
-#       開き、bootstrap 後に Claude Code を起動する (base 省略時は本体の現在ブランチ)
+#       Create a worktree at ~/.herdr/worktrees/<repo>/<task>, open a herdr
+#       workspace, bootstrap, and launch Claude Code
+#       (defaults to the main checkout's current branch if --base is omitted)
 #   wt bootstrap [<path>]
-#       既存 worktree に gitignore されて入らないファイルを補完する。
-#       Claude Code が作る .claude/worktrees/* にも使える
+#       Fill in gitignored files missing from an existing worktree.
+#       Also works with .claude/worktrees/* created by Claude Code
 #   wt open <task>
-#       既存 worktree を herdr workspace として開き直す
+#       Reopen an existing worktree as a herdr workspace
 #   wt list
-#       worktree と herdr workspace の対応を一覧表示
+#       Show worktrees and their corresponding herdr workspaces
 #   wt rm <task> [--force]
-#       worktree / workspace / ブランチを削除 (未コミット変更があれば中断)
+#       Remove worktree / workspace / branch (aborts if there are uncommitted changes)
 #
-# bootstrap の共通処理: .env を本体へ symlink、.claude/settings.local.json をコピー。
-# リポジトリ固有の準備 (secrets の symlink、DB コピー、native rebuild 等) は
-# repo 側の scripts/worktree-setup (実行可能ファイル) に書く。存在すれば依存
-# インストール含めそちらに委譲し (cwd=worktree、WT_MAIN_ROOT / WT_TARGET を渡す)、
-# 無ければ lockfile から検出した package manager で依存をインストールする。
+# Bootstrap common steps: symlink .env from the main checkout, copy
+# .claude/settings.local.json. Repo-specific setup (secrets symlinking,
+# DB copies, native rebuilds, etc.) goes in the repo's scripts/worktree-setup
+# (must be executable). When the hook exists, wt delegates everything
+# (including dependency installation) to it, passing cwd=worktree,
+# WT_MAIN_ROOT and WT_TARGET as environment variables. Without the hook,
+# wt detects the package manager from lockfiles and installs dependencies.
 set -euo pipefail
 
 WT_HOME="${WT_HOME:-$HOME/.herdr/worktrees}"
+WT_LANG="${WT_LANG:-en}"
+
+# ---------------------------------------------------------------------------
+# i18n message catalog
+# ---------------------------------------------------------------------------
+msg() {
+  local key="$1"; shift
+  case "$WT_LANG" in
+    ja) msg_ja "$key" "$@" ;;
+    *)  msg_en "$key" "$@" ;;
+  esac
+}
+
+msg_en() {
+  local key="$1"; shift
+  case "$key" in
+    not_in_repo)        printf 'must be run inside a git repository: %s' "$1" ;;
+    skip_real_file)     printf 'skip: %s is a real file, not overwriting' "$1" ;;
+    link_created)       printf 'link: %s -> %s' "$1" "$2" ;;
+    no_lockfile)        printf 'no lockfile found, skipping dependency install' ;;
+    not_linked_wt)      printf '%s is not a linked worktree' "$1" ;;
+    main_no_bootstrap)  printf 'bootstrap is not needed for the main checkout' ;;
+    copy_settings)      printf 'copy: .claude/settings.local.json' ;;
+    running_hook)       printf 'running repo hook: scripts/worktree-setup' ;;
+    installing_deps)    printf 'installing dependencies… (%s)' "$1" ;;
+    bootstrap_done)     printf 'bootstrap complete: %s' "$1" ;;
+    unknown_option)     printf '%s: unknown option %s' "$1" "$2" ;;
+    too_many_args)      printf '%s: too many arguments' "$1" ;;
+    branch_exists)      printf 'branch %s already exists (use wt open %s to reopen)' "$1" "$1" ;;
+    base_not_found)     printf 'base ref not found: %s' "$1" ;;
+    created_wt_ws)      printf 'worktree + workspace %s created: %s (%s ← %s)' "$1" "$2" "$3" "$4" ;;
+    herdr_fallback)     printf 'cannot connect to herdr server, creating git worktree only' ;;
+    claude_started)     printf 'Claude Code started in workspace %s' "$1" ;;
+    ready)              printf 'ready: %s' "$1" ;;
+    herdr_unavailable)  printf 'cannot connect to herdr server' ;;
+    opened_ws)          printf 'opened in workspace %s: %s' "$1" "$2" ;;
+    wt_not_found)       printf 'worktree for branch %s not found' "$1" ;;
+    cannot_rm_main)     printf 'cannot remove the main checkout' ;;
+    uncommitted)        printf '%s has uncommitted changes (use --force to force removal)' "$1" ;;
+    removed_ws_wt)      printf 'removed workspace %s and worktree' "$1" ;;
+    removed_wt)         printf 'removed worktree: %s' "$1" ;;
+    branch_unmerged)    printf 'branch %s is unmerged, keeping it (use git branch -D %s to delete)' "$1" "$1" ;;
+    unknown_subcmd)     printf 'unknown subcommand: %s (see --help)' "$1" ;;
+    *) printf '%s' "$key" ;;
+  esac
+}
+
+msg_ja() {
+  local key="$1"; shift
+  case "$key" in
+    not_in_repo)        printf 'git リポジトリ内で実行する必要がある: %s' "$1" ;;
+    skip_real_file)     printf 'skip: %s は実体があるため触らない' "$1" ;;
+    link_created)       printf 'link: %s -> %s' "$1" "$2" ;;
+    no_lockfile)        printf 'lockfile が見つからないため依存インストールをスキップした' ;;
+    not_linked_wt)      printf '%s は linked worktree ではない' "$1" ;;
+    main_no_bootstrap)  printf '本体 checkout に bootstrap は不要' ;;
+    copy_settings)      printf 'copy: .claude/settings.local.json' ;;
+    running_hook)       printf 'repo フック実行中: scripts/worktree-setup' ;;
+    installing_deps)    printf '依存インストール中… (%s)' "$1" ;;
+    bootstrap_done)     printf 'bootstrap 完了: %s' "$1" ;;
+    unknown_option)     printf '%s: 不明なオプション %s' "$1" "$2" ;;
+    too_many_args)      printf '%s: 引数が多すぎる' "$1" ;;
+    branch_exists)      printf 'ブランチ %s は既に存在する (wt open %s で開き直せる)' "$1" "$1" ;;
+    base_not_found)     printf 'base ref が見つからない: %s' "$1" ;;
+    created_wt_ws)      printf 'worktree + workspace %s 作成: %s (%s ← %s)' "$1" "$2" "$3" "$4" ;;
+    herdr_fallback)     printf 'herdr サーバに接続できないため git worktree のみ作成する' ;;
+    claude_started)     printf 'Claude Code を workspace %s で起動した' "$1" ;;
+    ready)              printf '準備完了: %s' "$1" ;;
+    herdr_unavailable)  printf 'herdr サーバに接続できない' ;;
+    opened_ws)          printf 'workspace %s で開いた: %s' "$1" "$2" ;;
+    wt_not_found)       printf 'ブランチ %s の worktree が見つからない' "$1" ;;
+    cannot_rm_main)     printf '本体 checkout は削除できない' ;;
+    uncommitted)        printf '%s に未コミットの変更がある (--force で強制削除)' "$1" ;;
+    removed_ws_wt)      printf 'workspace %s と worktree を削除した' "$1" ;;
+    removed_wt)         printf 'worktree を削除した: %s' "$1" ;;
+    branch_unmerged)    printf 'ブランチ %s は未マージのため残した (git branch -D %s で削除可)' "$1" "$1" ;;
+    unknown_subcmd)     printf '不明なサブコマンド: %s (--help 参照)' "$1" ;;
+    *) printf '%s' "$key" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
 
 log() { printf '[wt] %s\n' "$*"; }
 die() {
@@ -35,35 +120,29 @@ usage() {
   exit "${1:-0}"
 }
 
-# カレント (または引数のパス) が属するリポジトリの本体 checkout を特定する。
-# git-common-dir は linked worktree から呼んでも常に本体の .git を指す。
 resolve_repo() {
   local from="${1:-$PWD}"
   MAIN_ROOT="$(dirname "$(git -C "$from" rev-parse --path-format=absolute --git-common-dir)")" ||
-    die "git リポジトリ内で実行する必要がある: $from"
+    die "$(msg not_in_repo "$from")"
   REPO_NAME="$(basename "$MAIN_ROOT")"
   WT_DIR="$WT_HOME/$REPO_NAME"
 }
 
-# herdr サーバが起動していて socket API が使えるか
 herdr_ok() {
   command -v herdr >/dev/null 2>&1 && herdr workspace list >/dev/null 2>&1
 }
 
-# 本体の gitignore 済みファイルを worktree へ symlink する。
-# 実体ファイルが既にある場合は上書きしない (worktree 固有の設定を尊重)。
 link_shared() {
   local src="$1" dst="$2"
   [ -e "$src" ] || return 0
   if [ -e "$dst" ] && [ ! -L "$dst" ]; then
-    log "skip: $dst は実体があるため触らない"
+    log "$(msg skip_real_file "$dst")"
     return 0
   fi
   ln -sfn "$src" "$dst"
-  log "link: $dst -> $src"
+  log "$(msg link_created "$dst" "$src")"
 }
 
-# lockfile から package manager を検出して依存をインストールする
 install_deps() {
   local target="$1"
   if [ -f "$target/package-lock.json" ]; then
@@ -77,7 +156,7 @@ install_deps() {
   elif [ -f "$target/uv.lock" ]; then
     (cd "$target" && uv sync)
   else
-    log "lockfile が見つからないため依存インストールをスキップした"
+    log "$(msg no_lockfile)"
   fi
 }
 
@@ -86,28 +165,27 @@ cmd_bootstrap() {
   target="$(cd "$target" && pwd)"
   resolve_repo "$target"
 
-  [ -f "$target/.git" ] || die "$target は linked worktree ではない"
-  [ "$target" != "$MAIN_ROOT" ] || die "本体 checkout に bootstrap は不要"
+  [ -f "$target/.git" ] || die "$(msg not_linked_wt "$target")"
+  [ "$target" != "$MAIN_ROOT" ] || die "$(msg main_no_bootstrap)"
 
   link_shared "$MAIN_ROOT/.env" "$target/.env"
 
-  # Claude Code の許可設定を引き継ぐ (無ければ毎回プロンプトからやり直しになる)
   if [ -f "$MAIN_ROOT/.claude/settings.local.json" ] && [ ! -e "$target/.claude/settings.local.json" ]; then
     mkdir -p "$target/.claude"
     cp "$MAIN_ROOT/.claude/settings.local.json" "$target/.claude/"
-    log "copy: .claude/settings.local.json"
+    log "$(msg copy_settings)"
   fi
 
   if [ -x "$target/scripts/worktree-setup" ]; then
-    log "repo フック実行中: scripts/worktree-setup"
+    log "$(msg running_hook)"
     (cd "$target" && WT_MAIN_ROOT="$MAIN_ROOT" WT_TARGET="$target" scripts/worktree-setup)
   else
     if [ ! -d "$target/node_modules" ]; then
-      log "依存インストール中… ($target)"
+      log "$(msg installing_deps "$target")"
       install_deps "$target"
     fi
   fi
-  log "bootstrap 完了: $target"
+  log "$(msg bootstrap_done "$target")"
 }
 
 cmd_new() {
@@ -119,22 +197,21 @@ cmd_new() {
         shift
         ;;
       --no-claude) start_claude=0 ;;
-      -*) die "new: 不明なオプション $1" ;;
-      *) [ -z "$task" ] && task="$1" || die "new: 引数が多すぎる" ;;
+      -*) die "$(msg unknown_option new "$1")" ;;
+      *) [ -z "$task" ] && task="$1" || die "$(msg too_many_args new)" ;;
     esac
     shift
   done
   [ -n "$task" ] || usage 1
   resolve_repo
 
-  # base 省略時は本体 checkout の現在ブランチから分岐する
   if [ -z "$base" ]; then
     base="$(git -C "$MAIN_ROOT" symbolic-ref --short -q HEAD || echo HEAD)"
   fi
   git -C "$MAIN_ROOT" rev-parse --verify --quiet "refs/heads/$task" >/dev/null &&
-    die "ブランチ $task は既に存在する (wt open $task で開き直せる)"
+    die "$(msg branch_exists "$task")"
   git -C "$MAIN_ROOT" rev-parse --verify --quiet "$base^{commit}" >/dev/null ||
-    die "base ref が見つからない: $base"
+    die "$(msg base_not_found "$base")"
 
   local path="$WT_DIR/$task" ws=""
   if herdr_ok; then
@@ -143,9 +220,9 @@ cmd_new() {
       --path "$path" --label "$task" --no-focus --json)"
     ws="$(jq -r '.result.workspace.workspace_id' <<<"$out")"
     path="$(jq -r '.result.worktree.path' <<<"$out")"
-    log "worktree + workspace $ws 作成: $path ($task ← $base)"
+    log "$(msg created_wt_ws "$ws" "$path" "$task" "$base")"
   else
-    log "herdr サーバに接続できないため git worktree のみ作成する"
+    log "$(msg herdr_fallback)"
     git -C "$MAIN_ROOT" worktree add -b "$task" "$path" "$base"
   fi
 
@@ -154,21 +231,21 @@ cmd_new() {
   if [ -n "$ws" ] && [ "$start_claude" -eq 1 ]; then
     herdr agent start "claude-$task" --workspace "$ws" --cwd "$path" --no-focus -- claude
     herdr workspace focus "$ws" >/dev/null
-    log "Claude Code を workspace $ws で起動した"
+    log "$(msg claude_started "$ws")"
   fi
-  log "準備完了: $path"
+  log "$(msg ready "$path")"
 }
 
 cmd_open() {
   local task="${1:-}"
   [ -n "$task" ] || usage 1
   resolve_repo
-  herdr_ok || die "herdr サーバに接続できない"
+  herdr_ok || die "$(msg herdr_unavailable)"
   local out ws
   out="$(herdr worktree open --cwd "$MAIN_ROOT" --branch "$task" --label "$task" --no-focus --json)"
   ws="$(jq -r '.result.workspace.workspace_id' <<<"$out")"
   herdr workspace focus "$ws" >/dev/null
-  log "workspace $ws で開いた: $task"
+  log "$(msg opened_ws "$ws" "$task")"
 }
 
 cmd_list() {
@@ -186,7 +263,7 @@ cmd_rm() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --force) force=1 ;;
-      -*) die "rm: 不明なオプション $1" ;;
+      -*) die "$(msg unknown_option rm "$1")" ;;
       *) task="$1" ;;
     esac
     shift
@@ -197,11 +274,11 @@ cmd_rm() {
   local path
   path="$(git -C "$MAIN_ROOT" worktree list --porcelain |
     awk -v b="refs/heads/$task" '$1=="worktree"{p=$2} $1=="branch" && $2==b{print p}')"
-  [ -n "$path" ] || die "ブランチ $task の worktree が見つからない"
-  [ "$path" != "$MAIN_ROOT" ] || die "本体 checkout は削除できない"
+  [ -n "$path" ] || die "$(msg wt_not_found "$task")"
+  [ "$path" != "$MAIN_ROOT" ] || die "$(msg cannot_rm_main)"
 
   if [ "$force" -eq 0 ] && [ -n "$(git -C "$path" status --porcelain)" ]; then
-    die "$path に未コミットの変更がある (--force で強制削除)"
+    die "$(msg uncommitted "$path")"
   fi
 
   local ws=""
@@ -215,20 +292,20 @@ cmd_rm() {
     else
       herdr worktree remove --workspace "$ws" --json >/dev/null
     fi
-    log "workspace $ws と worktree を削除した"
+    log "$(msg removed_ws_wt "$ws")"
   else
     if [ "$force" -eq 1 ]; then
       git -C "$MAIN_ROOT" worktree remove --force "$path"
     else
       git -C "$MAIN_ROOT" worktree remove "$path"
     fi
-    log "worktree を削除した: $path"
+    log "$(msg removed_wt "$path")"
   fi
 
   local del_flag="-d"
   [ "$force" -eq 1 ] && del_flag="-D"
   git -C "$MAIN_ROOT" branch "$del_flag" "$task" ||
-    log "ブランチ $task は未マージのため残した (git branch -D $task で削除可)"
+    log "$(msg branch_unmerged "$task")"
 }
 
 case "${1:-}" in
@@ -253,5 +330,5 @@ case "${1:-}" in
     cmd_rm "$@"
     ;;
   -h | --help | "") usage ;;
-  *) die "不明なサブコマンド: $1 (--help 参照)" ;;
+  *) die "$(msg unknown_subcmd "$1")" ;;
 esac

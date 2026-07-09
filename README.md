@@ -1,135 +1,149 @@
 # wt
 
-git worktree と [herdr](https://github.com/) workspace を一体で管理し、並列開発セッションをワンコマンドで立ち上げる bash CLI。
+A bash CLI that manages git worktrees and [herdr](https://github.com/) workspaces together, letting you spin up parallel development sessions with a single command.
 
-`wt new <task>` を打つと、worktree を切り、gitignore されて worktree に入らないファイル（`.env` など）を本体から補完し、herdr workspace を開いて Claude Code を起動するところまでを一息で行う。herdr が無い環境では素の `git worktree` 作成だけにフォールバックするので、herdr は必須ではない。
+Run `wt new <task>` and it creates a worktree, fills in gitignored files (like `.env`) from the main checkout, opens a herdr workspace, and launches Claude Code — all in one shot. If herdr isn't available, it falls back to plain `git worktree` creation, so herdr is optional.
 
-## 特徴
+## Features
 
-- **一体管理** — worktree・ブランチ・herdr workspace・エージェント起動を 1 コマンドに集約
-- **欠落ファイルの補完** — 本体の `.env` を symlink、`.claude/settings.local.json` をコピー。fresh checkout ではテストが動かない問題を解消する
-- **repo 固有の準備を委譲** — secrets の symlink や DB コピー、native rebuild などは repo 側の `scripts/worktree-setup` に委ねる契約
-- **graceful fallback** — herdr サーバに接続できなければ `git worktree` の作成だけで続行する
+- **Unified management** — Consolidates worktree, branch, herdr workspace, and agent launch into one command
+- **Missing-file completion** — Symlinks `.env` from the main checkout and copies `.claude/settings.local.json`, so a fresh worktree can run tests immediately
+- **Repo-specific setup delegation** — Secrets symlinking, DB copies, native rebuilds, etc. are delegated to the repo's own `scripts/worktree-setup`
+- **Graceful fallback** — If the herdr server is unreachable, continues with just `git worktree` creation
 
-## 前提
+## Prerequisites
 
-| ツール | 要否 | 用途 |
+| Tool | Required | Purpose |
 | --- | --- | --- |
-| bash 4+ | 必須 | 本体 |
-| git | 必須 | worktree 操作 |
-| [herdr](https://github.com/) | 任意 | workspace / エージェント起動（無ければ git worktree のみ） |
-| jq | herdr 使用時に必須 | herdr の JSON 出力パース |
+| bash 4+ | Yes | Core runtime |
+| git | Yes | Worktree operations |
+| [herdr](https://github.com/) | Optional | Workspace / agent launch (git worktree only without it) |
+| jq | When using herdr | Parsing herdr's JSON output |
 
-## インストール
+## Installation
 
-`wt` は単一ファイル。PATH の通ったディレクトリに置くだけで動く。
-
-```bash
-git clone https://github.com/futa-komori/wt.git
-install -m 755 wt/wt ~/.local/bin/wt   # ~/.local/bin が PATH にある前提
-```
-
-同梱の `install.sh` でも同じことができる。
+`wt` is a single file. Just place it in a directory on your PATH.
 
 ```bash
-./install.sh          # 既定で ~/.local/bin/wt に配置
-PREFIX=~/bin ./install.sh   # 配置先を変える
+git clone https://github.com/kawase1295/wt.git
+install -m 755 wt/wt ~/.local/bin/wt   # assumes ~/.local/bin is in PATH
 ```
 
-## 使い方
+You can also use the included `install.sh`:
 
-対象リポジトリ内の任意の場所から実行する。
+```bash
+./install.sh                # installs to ~/.local/bin/wt by default
+PREFIX=~/bin ./install.sh   # change the install location
+```
+
+## Usage
+
+Run from anywhere inside the target repository.
 
 ```bash
 wt new <task> [--base <ref>] [--no-claude]
-    worktree を ~/.herdr/worktrees/<repo>/<task> に作り、herdr workspace を
-    開き、bootstrap 後に Claude Code を起動する（base 省略時は本体の現在ブランチ）
+    Create a worktree at ~/.herdr/worktrees/<repo>/<task>, open a herdr
+    workspace, bootstrap, and launch Claude Code (defaults to the main
+    checkout's current branch if --base is omitted)
 
 wt bootstrap [<path>]
-    既存 worktree に、gitignore されて入らないファイルを補完する。
-    Claude Code が作る .claude/worktrees/* にも使える
+    Fill in gitignored files missing from an existing worktree.
+    Also works with .claude/worktrees/* created by Claude Code
 
 wt open <task>
-    既存 worktree を herdr workspace として開き直す
+    Reopen an existing worktree as a herdr workspace
 
 wt list
-    worktree と herdr workspace の対応を一覧表示
+    Show worktrees and their corresponding herdr workspaces
 
 wt rm <task> [--force]
-    worktree / workspace / ブランチを削除する（未コミット変更があれば中断）
+    Remove worktree / workspace / branch (aborts if there are uncommitted changes)
 ```
 
-### 例
+### Examples
 
 ```bash
-# main から feature ブランチの worktree を切って作業を始める
+# Create a feature-branch worktree from main and start working
 wt new fix-login
 
-# 特定の base から分岐、Claude Code は起動しない
+# Branch from a specific base, without launching Claude Code
 wt new spike-cache --base release/2.0 --no-claude
 
-# 別の並列作業に切り替える
+# Switch to another parallel session
 wt open fix-login
 
-# 作業一覧を見る
+# List active sessions
 wt list
 
-# 終わった worktree を片付ける（マージ済みブランチも削除）
+# Clean up a finished worktree (also deletes the merged branch)
 wt rm fix-login
 ```
 
-worktree は herdr の標準位置 `~/.herdr/worktrees/<repo名>/<task名>` に作られる。`WT_HOME` 環境変数で変更できる。
+## Configuration
 
-## 仕組み
+| Variable | Default | Description |
+| --- | --- | --- |
+| `WT_HOME` | `~/.herdr/worktrees` | Root directory for worktrees |
+| `WT_LANG` | `en` | UI language (`en` or `ja`) |
 
-### bootstrap の分担
+Set `WT_LANG=ja` in your shell profile to switch all messages to Japanese.
 
-fresh な worktree は本体の gitignore 済みファイルを持たないため、テストやアプリが動かないことがある。`wt` はこれを 2 段で補完する。
+```bash
+export WT_LANG=ja
+```
 
-**共通処理（`wt` 本体）**
+Worktrees are created at herdr's standard location `~/.herdr/worktrees/<repo>/<task>`. Override with the `WT_HOME` environment variable.
 
-1. 本体の `.env` を worktree へ symlink（実体ファイルが既にあれば触らない）
-2. `.claude/settings.local.json` をコピー（Claude Code の許可設定の引き継ぎ）
-3. repo フックがあれば委譲、無ければ lockfile から検出した package manager で依存インストール
-   （npm / pnpm / yarn / bun / uv に対応）
+## How It Works
 
-**repo 固有処理（repo の `scripts/worktree-setup`、実行可能ファイル）**
+### Bootstrap responsibilities
 
-コピーで表せない補完＝依存インストール・環境 symlink 再生成・native rebuild は repo 側に置く。フックは次の環境で呼ばれる。
+A fresh worktree lacks gitignored files from the main checkout, which can break tests or the app. `wt` fills these in with a two-stage approach:
 
-- cwd = worktree
-- `WT_MAIN_ROOT` = 本体 checkout の絶対パス
-- `WT_TARGET` = worktree の絶対パス
+**Common steps (handled by `wt` itself)**
 
-フックが存在すると依存インストールもフック側の責任になる（`wt` は install しない）。
+1. Symlink `.env` from the main checkout into the worktree (skipped if a real file already exists)
+2. Copy `.claude/settings.local.json` (carries over Claude Code permission settings)
+3. If a repo hook exists, delegate to it; otherwise, detect the package manager from lockfiles and install dependencies
+   (supports npm / pnpm / yarn / bun / uv)
 
-### repo フックの例
+**Repo-specific steps (repo's `scripts/worktree-setup`, must be executable)**
+
+Anything beyond simple file copying — dependency installation, secrets symlinking, native rebuilds — goes in the repo's own hook. The hook runs with:
+
+- cwd = the worktree
+- `WT_MAIN_ROOT` = absolute path to the main checkout
+- `WT_TARGET` = absolute path to the worktree
+
+When the hook exists, dependency installation becomes the hook's responsibility (`wt` won't run install).
+
+### Repo hook example
 
 ```bash
 #!/usr/bin/env bash
-# scripts/worktree-setup — worktree に repo 固有の欠落を補完する
+# scripts/worktree-setup — fill in repo-specific missing files for the worktree
 set -euo pipefail
 
-# gitignore された secrets を本体から symlink 共有する
+# Symlink gitignored secrets from the main checkout
 ln -sfn "$WT_MAIN_ROOT/secrets" "$WT_TARGET/secrets"
 
-# 依存インストール（フックがあると wt 本体は install しないので自分でやる）
+# Install dependencies (wt skips install when a hook exists, so do it here)
 npm ci --prefer-offline --no-audit --no-fund
 
-# native addon を含む場合の再ビルド例
+# Rebuild native addons if needed
 # npm rebuild better-sqlite3 --ignore-scripts=false --foreground-scripts
 ```
 
-## Claude Code 連携
+## Claude Code Integration
 
-Claude Code で並列開発するときの `wt` と native worktree（`claude --worktree` / subagent isolation）の使い分け方針を [`docs/claude-code-skill.md`](docs/claude-code-skill.md) にまとめてある。Claude Code の skill（`~/.claude/skills/`）として置くとそのまま使える。
+For parallel development with Claude Code, see [`docs/claude-code-skill.md`](docs/claude-code-skill.md) for guidance on when to use `wt` vs. native worktrees (`claude --worktree` / subagent isolation). The file can also be used directly as a Claude Code skill (`~/.claude/skills/`).
 
-## 既知の注意点
+## Known Caveats
 
-- `~/.npmrc` に `ignore-scripts=true` があると、`npm ci` だけでは native addon（better-sqlite3 等）がビルドされない。フックで rebuild するか、本体のビルド済み `.node` をコピーする。
-- 本体 checkout の未コミット変更は worktree に入らない（worktree はコミット済み ref から分岐する）。
-- gitignore で共有ディレクトリを無視する場合、symlink には末尾スラッシュ付きパターン（`secrets/`）が一致しない。`secrets` のように書く。
+- If `~/.npmrc` has `ignore-scripts=true`, `npm ci` alone won't build native addons (e.g. better-sqlite3). Use the hook to rebuild, or copy the prebuilt `.node` files from the main checkout.
+- Uncommitted changes in the main checkout don't carry over to worktrees (worktrees branch from a committed ref).
+- When gitignoring shared directories, symlinks won't match trailing-slash patterns (`secrets/`). Use `secrets` instead.
 
-## ライセンス
+## License
 
 [MIT](LICENSE)

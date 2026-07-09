@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# wt をインストールする。既定で ~/.local/bin/wt に配置する。
-# 配置先を変えるには PREFIX を渡す: PREFIX=~/bin ./install.sh
+# Install wt. Defaults to ~/.local/bin/wt.
+# To change the location: PREFIX=~/bin ./install.sh
 set -euo pipefail
 
 PREFIX="${PREFIX:-$HOME/.local/bin}"
@@ -8,9 +8,9 @@ src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/wt"
 
 mkdir -p "$PREFIX"
 install -m 755 "$src" "$PREFIX/wt"
-echo "[install] $PREFIX/wt に配置した"
+echo "[install] installed to $PREFIX/wt"
 
 case ":$PATH:" in
   *":$PREFIX:"*) ;;
-  *) echo "[install] 注意: $PREFIX が PATH に無い。シェルの設定に追加してください" ;;
+  *) echo "[install] warning: $PREFIX is not in PATH. Add it to your shell config." ;;
 esac

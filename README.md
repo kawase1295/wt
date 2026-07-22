@@ -42,8 +42,9 @@ PREFIX=~/bin ./install.sh   # 配置先を変える
 
 ```bash
 wt new <task> [--base <ref>] [--no-claude]
-    worktree を ~/.herdr/worktrees/<repo>/<task> に作り、herdr workspace を
-    開き、bootstrap 後に Claude Code を起動する（base 省略時は本体の現在ブランチ）
+    worktree を <repo>/.claude/worktrees/<task>（ブランチ worktree-<task>）に作り、
+    herdr workspace を開き、bootstrap 後に Claude Code を起動する
+    （base 省略時は本体の現在ブランチ）
 
 wt bootstrap [<path>]
     既存 worktree に、gitignore されて入らないファイルを補完する。
@@ -78,7 +79,7 @@ wt list
 wt rm fix-login
 ```
 
-worktree は herdr の標準位置 `~/.herdr/worktrees/<repo名>/<task名>` に作られる。`WT_HOME` 環境変数で変更できる。
+worktree は Claude Code の native worktree と同じ `<repo>/.claude/worktrees/<task名>` に、ブランチ `worktree-<task名>` で作られる。native（`claude --worktree`）と同じ実体を指すので、native で作った worktree も `wt open` / `wt bootstrap` / `wt rm` で扱える。`WT_HOME` を設定すると従来の集約置き場 `$WT_HOME/<repo名>/<task名>` に作る。
 
 ## 仕組み
 
@@ -126,6 +127,7 @@ Claude Code で並列開発するときの `wt` と native worktree（`claude --
 
 ## 既知の注意点
 
+- worktree は `<repo>/.claude/worktrees/` に作られるため、本体 checkout の `git status` に `.claude/` が untracked として現れる（Claude Code の native worktree でも同じ）。`git add .` で worktree の実体を巻き込まないよう注意。気になる場合は本体の `.gitignore` か `.git/info/exclude` に `.claude/worktrees/` を加える。
 - `~/.npmrc` に `ignore-scripts=true` があると、`npm ci` だけでは native addon（better-sqlite3 等）がビルドされない。フックで rebuild するか、本体のビルド済み `.node` をコピーする。
 - 本体 checkout の未コミット変更は worktree に入らない（worktree はコミット済み ref から分岐する）。
 - gitignore で共有ディレクトリを無視する場合、symlink には末尾スラッシュ付きパターン（`secrets/`）が一致しない。`secrets` のように書く。

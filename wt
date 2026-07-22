@@ -3,8 +3,9 @@
 #
 # 使い方 (対象リポジトリ内の任意の場所から実行する):
 #   wt new <task> [--base <ref>] [--no-claude]
-#       worktree を ~/.herdr/worktrees/<repo>/<task> に作り、herdr workspace を
-#       開き、bootstrap 後に Claude Code を起動する (base 省略時は本体の現在ブランチ)
+#       worktree を <repo>/.claude/worktrees/<task> (ブランチ worktree-<task>) に作り、
+#       herdr workspace を開き、bootstrap 後に Claude Code を起動する。
+#       base 省略時は本体の現在ブランチ。WT_HOME を設定すると従来の集約置き場に作る
 #   wt bootstrap [<path>]
 #       既存 worktree に gitignore されて入らないファイルを補完する。
 #       Claude Code が作る .claude/worktrees/* にも使える
@@ -22,7 +23,9 @@
 # 無ければ lockfile から検出した package manager で依存をインストールする。
 set -euo pipefail
 
-WT_HOME="${WT_HOME:-$HOME/.herdr/worktrees}"
+# 既定では worktree を <repo>/.claude/worktrees/<task> に作り、Claude Code の native
+# worktree (ブランチ worktree-<task>) と物理位置・命名を揃える。WT_HOME を設定すると
+# 従来の集約置き場 $WT_HOME/<repo>/<task> に作る (複数 repo を一箇所へ集めたいとき用)。
 
 log() { printf '[wt] %s\n' "$*"; }
 die() {
@@ -38,11 +41,18 @@ usage() {
 # カレント (または引数のパス) が属するリポジトリの本体 checkout を特定する。
 # git-common-dir は linked worktree から呼んでも常に本体の .git を指す。
 resolve_repo() {
-  local from="${1:-$PWD}"
-  MAIN_ROOT="$(dirname "$(git -C "$from" rev-parse --path-format=absolute --git-common-dir)")" ||
+  local from="${1:-$PWD}" common_dir
+  # command substitution をネストすると git の失敗を外側の dirname が握り潰すため、
+  # git の結果を先に受け取り、戻り値を検査してから dirname を適用する。
+  common_dir="$(git -C "$from" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
     die "git リポジトリ内で実行する必要がある: $from"
+  MAIN_ROOT="$(dirname "$common_dir")"
   REPO_NAME="$(basename "$MAIN_ROOT")"
-  WT_DIR="$WT_HOME/$REPO_NAME"
+  if [ -n "${WT_HOME:-}" ]; then
+    WT_DIR="$WT_HOME/$REPO_NAME"
+  else
+    WT_DIR="$MAIN_ROOT/.claude/worktrees"
+  fi
 }
 
 # herdr サーバが起動していて socket API が使えるか
@@ -115,6 +125,7 @@ cmd_new() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --base)
+        [ $# -ge 2 ] || die "new: --base に値が必要"
         base="$2"
         shift
         ;;
@@ -125,28 +136,32 @@ cmd_new() {
     shift
   done
   [ -n "$task" ] || usage 1
+  # ディレクトリ名・ブランチ名に埋め込むので、パスやブランチ参照を壊さない文字に限る。
+  [[ "$task" =~ ^[A-Za-z0-9._-]+$ ]] || die "task 名に使えるのは英数字と . _ - のみ: $task"
   resolve_repo
+  # native worktree と揃えたブランチ名。task はディレクトリ名 / herdr ラベルに使う。
+  local branch="worktree-$task"
 
   # base 省略時は本体 checkout の現在ブランチから分岐する
   if [ -z "$base" ]; then
     base="$(git -C "$MAIN_ROOT" symbolic-ref --short -q HEAD || echo HEAD)"
   fi
-  git -C "$MAIN_ROOT" rev-parse --verify --quiet "refs/heads/$task" >/dev/null &&
-    die "ブランチ $task は既に存在する (wt open $task で開き直せる)"
+  git -C "$MAIN_ROOT" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null &&
+    die "ブランチ $branch は既に存在する (wt open $task で開き直せる)"
   git -C "$MAIN_ROOT" rev-parse --verify --quiet "$base^{commit}" >/dev/null ||
     die "base ref が見つからない: $base"
 
   local path="$WT_DIR/$task" ws=""
   if herdr_ok; then
     local out
-    out="$(herdr worktree create --cwd "$MAIN_ROOT" --branch "$task" --base "$base" \
+    out="$(herdr worktree create --cwd "$MAIN_ROOT" --branch "$branch" --base "$base" \
       --path "$path" --label "$task" --no-focus --json)"
     ws="$(jq -r '.result.workspace.workspace_id' <<<"$out")"
     path="$(jq -r '.result.worktree.path' <<<"$out")"
-    log "worktree + workspace $ws 作成: $path ($task ← $base)"
+    log "worktree + workspace $ws 作成: $path ($branch ← $base)"
   else
     log "herdr サーバに接続できないため git worktree のみ作成する"
-    git -C "$MAIN_ROOT" worktree add -b "$task" "$path" "$base"
+    git -C "$MAIN_ROOT" worktree add -b "$branch" "$path" "$base"
   fi
 
   cmd_bootstrap "$path"
@@ -164,8 +179,8 @@ cmd_open() {
   [ -n "$task" ] || usage 1
   resolve_repo
   herdr_ok || die "herdr サーバに接続できない"
-  local out ws
-  out="$(herdr worktree open --cwd "$MAIN_ROOT" --branch "$task" --label "$task" --no-focus --json)"
+  local out ws branch="worktree-$task"
+  out="$(herdr worktree open --cwd "$MAIN_ROOT" --branch "$branch" --label "$task" --no-focus --json)"
   ws="$(jq -r '.result.workspace.workspace_id' <<<"$out")"
   herdr workspace focus "$ws" >/dev/null
   log "workspace $ws で開いた: $task"
@@ -187,17 +202,17 @@ cmd_rm() {
     case "$1" in
       --force) force=1 ;;
       -*) die "rm: 不明なオプション $1" ;;
-      *) task="$1" ;;
+      *) [ -z "$task" ] && task="$1" || die "rm: 引数が多すぎる" ;;
     esac
     shift
   done
   [ -n "$task" ] || usage 1
   resolve_repo
 
-  local path
+  local branch="worktree-$task" path
   path="$(git -C "$MAIN_ROOT" worktree list --porcelain |
-    awk -v b="refs/heads/$task" '$1=="worktree"{p=$2} $1=="branch" && $2==b{print p}')"
-  [ -n "$path" ] || die "ブランチ $task の worktree が見つからない"
+    awk -v b="refs/heads/$branch" '$1=="worktree"{p=$2} $1=="branch" && $2==b{print p}')"
+  [ -n "$path" ] || die "ブランチ $branch の worktree が見つからない"
   [ "$path" != "$MAIN_ROOT" ] || die "本体 checkout は削除できない"
 
   if [ "$force" -eq 0 ] && [ -n "$(git -C "$path" status --porcelain)" ]; then
@@ -227,8 +242,8 @@ cmd_rm() {
 
   local del_flag="-d"
   [ "$force" -eq 1 ] && del_flag="-D"
-  git -C "$MAIN_ROOT" branch "$del_flag" "$task" ||
-    log "ブランチ $task は未マージのため残した (git branch -D $task で削除可)"
+  git -C "$MAIN_ROOT" branch "$del_flag" "$branch" ||
+    log "ブランチ $branch は未マージのため残した (git branch -D $branch で削除可)"
 }
 
 case "${1:-}" in

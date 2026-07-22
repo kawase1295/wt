@@ -15,20 +15,20 @@ wt list                                      # worktree ↔ workspace の対応�
 wt rm <task> [--force]                       # worktree / workspace / ブランチを削除
 ```
 
-- worktree は `~/.herdr/worktrees/<repo名>/<task名>` に作られる (herdr の標準位置)。`WT_HOME` で変更可。
+- worktree は native と同じ `<repo>/.claude/worktrees/<task名>` に、ブランチ `worktree-<task名>` で作られる (`WT_HOME` を設定すると従来の集約置き場 `$WT_HOME/<repo名>/<task名>`)。
 - `--base` 省略時は本体 checkout の現在ブランチから分岐する。
 - herdr サーバが起動していなければ git worktree の作成だけにフォールバックする。
 
 ## native worktree との使い分け（統一方針）
 
-Claude Code 自身も worktree を作る（`claude --worktree`、subagent の `isolation: worktree`、desktop の並列セッション）。`wt` と native は**別系統**（native は `.claude/worktrees/<name>/`、ブランチ `worktree-<name>`、base 既定は `origin/HEAD`）。単一の補完 hook が両方をまたげないため、**`.worktreeinclude` を「持ち込むファイル一覧の唯一の正」**として 2 系統で共有する。
+Claude Code 自身も worktree を作る（`claude --worktree`、subagent の `isolation: worktree`、desktop の並列セッション）。`wt` と native は**同じ置き場・同じブランチ命名**（`<repo>/.claude/worktrees/<name>/`、ブランチ `worktree-<name>`）を共有し、同じ worktree を指す。違うのは作り方と補完方法で、native は fresh コピー中心・base 既定 `origin/HEAD`、`wt` は herdr workspace 起動と symlink 補完込み・base 既定は本体の現在ブランチ。同じ実体なので native で作った worktree を `wt open` / `wt bootstrap` / `wt rm` でそのまま扱える。単一の補完 hook が両方をまたげないため、**`.worktreeinclude` を「持ち込むファイル一覧の唯一の正」**として両方で共有する。
 
 - **`.worktreeinclude`**（repo root、**要コミット**）: fresh checkout に要る gitignore 済みファイルを `.gitignore` 構文で列挙。native はこれを読んで**自動でコピー**し、`wt` の repo フックはこれを読んで本体から**symlink 共有**する（同じ一覧を 2 通りに消費）。
 - **`scripts/worktree-setup`**（repo フック、**要コミット**）: コピーで表せない補完＝依存インストール・環境 symlink 再生成・native rebuild。`wt` はこれに委譲する。**native はこのフックを呼ばない**ので、依存が要る repo の native worktree は作成後に `wt bootstrap <path>` で仕上げる。
 - base の既定が違う（native=`origin/HEAD` fresh / `wt`=本体の現在ブランチ）。揃えたいときは settings に `"worktree": { "baseRef": "head" }`。
 - `.worktreeinclude` / フックは**コミット必須**。native の fresh base は未コミットファイルを見ない。
 
-使い分け: 軽量・使い捨て・subagent 分離は native、herdr workspace 込みの人手の並列セッションは `wt`。
+使い分け: 軽量・使い捨て・subagent 分離は native（`claude --worktree`）、herdr workspace 起動や欠落補完込みで立ち上げたいときは `wt`。同じ場所を指すので、native で作ったものを後から `wt open` / `wt bootstrap` で仕上げてもよい。
 
 ## bootstrap の分担
 

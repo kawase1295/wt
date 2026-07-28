@@ -2,10 +2,11 @@
 # wt — git worktree + herdr workspace で並列開発セッションを立ち上げる汎用 CLI
 #
 # 使い方 (対象リポジトリ内の任意の場所から実行する):
-#   wt new <task> [--base <ref>] [--no-claude]
+#   wt new <task> [--base <ref>] [--no-claude] [--prompt <text>|--prompt-file <path>]
 #       worktree を <repo>/.claude/worktrees/<task> (ブランチ worktree-<task>) に作り、
 #       herdr workspace を開き、bootstrap 後に Claude Code を起動する。
-#       base 省略時は本体の現在ブランチ。WT_HOME を設定すると従来の集約置き場に作る
+#       base 省略時は本体の現在ブランチ。WT_HOME を設定すると従来の集約置き場に作る。
+#       --prompt / --prompt-file は起動する Claude への初期プロンプト (要 herdr)
 #   wt bootstrap [<path>]
 #       既存 worktree に gitignore されて入らないファイルを補完する。
 #       Claude Code が作る .claude/worktrees/* にも使える
@@ -13,10 +14,16 @@
 #       既存 worktree を herdr workspace として開き直す
 #   wt list
 #       worktree と herdr workspace の対応を一覧表示
-#   wt rm <task> [--force]
-#       worktree / workspace / ブランチを削除 (未コミット変更があれば中断)
+#   wt merge [<task>]
+#       ブランチ worktree-<task> を本体の現在ブランチへマージする。
+#       worktree 内から task 省略で自分を対象にできる。コンフリクトは本体に残す
+#   wt rm [<task>] [--force]
+#       worktree / workspace / ブランチを削除 (未コミット変更があれば中断)。
+#       worktree 内から task 省略で自分を片付けられる (workspace close は最後)
 #
-# bootstrap の共通処理: .env を本体へ symlink、.claude/settings.local.json をコピー。
+# bootstrap の共通処理: .worktreeinclude (gitignore 構文) に列挙されたファイルを
+# 本体から実体コピー (既存は上書きしない)、.env を本体へ symlink、
+# .claude/settings.local.json をコピー。
 # リポジトリ固有の準備 (secrets の symlink、DB コピー、native rebuild 等) は
 # repo 側の scripts/worktree-setup (実行可能ファイル) に書く。存在すれば依存
 # インストール含めそちらに委譲し (cwd=worktree、WT_MAIN_ROOT / WT_TARGET を渡す)、
@@ -60,6 +67,25 @@ herdr_ok() {
   command -v herdr >/dev/null 2>&1 && herdr workspace list >/dev/null 2>&1
 }
 
+# cwd のブランチ worktree-<task> から task を推定する。
+# worktree 側セッションで task 引数を省略したときに使う。
+infer_task() { # cmdname
+  local cur
+  cur="$(git symbolic-ref --short -q HEAD 2>/dev/null || true)"
+  case "$cur" in
+    worktree-*) printf '%s' "${cur#worktree-}" ;;
+    *) die "$1: task を指定する (worktree 外からは wt $1 <task>)" ;;
+  esac
+}
+
+# worktree ブランチを削除する。未マージなら残して案内する (既存挙動)。
+delete_branch() { # branch force
+  local del_flag="-d"
+  [ "$2" -eq 1 ] && del_flag="-D"
+  git -C "$MAIN_ROOT" branch "$del_flag" "$1" ||
+    log "ブランチ $1 は未マージのため残した (git branch -D $1 で削除可)"
+}
+
 # 本体の gitignore 済みファイルを worktree へ symlink する。
 # 実体ファイルが既にある場合は上書きしない (worktree 固有の設定を尊重)。
 link_shared() {
@@ -71,6 +97,26 @@ link_shared() {
   fi
   ln -sfn "$src" "$dst"
   log "link: $dst -> $src"
+}
+
+# .worktreeinclude (repo root、gitignore 構文) に列挙された gitignore 済み
+# ファイルを本体から worktree へ実体コピーする。既存ファイルは上書きしない。
+# ディレクトリパターン (secrets/ 等) は git が中のファイルを個別列挙するので
+# ファイル単位の mkdir -p + cp で済む。linked worktree は走査対象外。
+copy_included() {
+  local target="$1" inc="$MAIN_ROOT/.worktreeinclude"
+  [ -f "$inc" ] || return 0
+  local n=0 f src dst
+  while IFS= read -r -d '' f; do
+    src="$MAIN_ROOT/$f" dst="$target/$f"
+    [ -e "$src" ] || [ -L "$src" ] || continue
+    if [ -e "$dst" ] || [ -L "$dst" ]; then continue; fi
+    mkdir -p "$(dirname "$dst")"
+    cp -a "$src" "$dst"
+    n=$((n + 1))
+  done < <(git -C "$MAIN_ROOT" ls-files -z --others --ignored --exclude-from="$inc")
+  [ "$n" -gt 0 ] && log ".worktreeinclude: $n 件コピーした"
+  return 0
 }
 
 # lockfile から package manager を検出して依存をインストールする
@@ -99,6 +145,10 @@ cmd_bootstrap() {
   [ -f "$target/.git" ] || die "$target は linked worktree ではない"
   [ "$target" != "$MAIN_ROOT" ] || die "本体 checkout に bootstrap は不要"
 
+  # .worktreeinclude の実体コピーを先に行う。.env が列挙されている repo では
+  # コピーが優先され、後続の link_shared は既存ガードで symlink をスキップする。
+  copy_included "$target"
+
   link_shared "$MAIN_ROOT/.env" "$target/.env"
 
   # Claude Code の許可設定を引き継ぐ (無ければ毎回プロンプトからやり直しになる)
@@ -121,7 +171,7 @@ cmd_bootstrap() {
 }
 
 cmd_new() {
-  local task="" base="" start_claude=1
+  local task="" base="" start_claude=1 prompt="" prompt_file=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --base)
@@ -130,6 +180,16 @@ cmd_new() {
         shift
         ;;
       --no-claude) start_claude=0 ;;
+      --prompt)
+        [ $# -ge 2 ] || die "new: --prompt に値が必要"
+        prompt="$2"
+        shift
+        ;;
+      --prompt-file)
+        [ $# -ge 2 ] || die "new: --prompt-file に値が必要"
+        prompt_file="$2"
+        shift
+        ;;
       -*) die "new: 不明なオプション $1" ;;
       *) [ -z "$task" ] && task="$1" || die "new: 引数が多すぎる" ;;
     esac
@@ -138,6 +198,21 @@ cmd_new() {
   [ -n "$task" ] || usage 1
   # ディレクトリ名・ブランチ名に埋め込むので、パスやブランチ参照を壊さない文字に限る。
   [[ "$task" =~ ^[A-Za-z0-9._-]+$ ]] || die "task 名に使えるのは英数字と . _ - のみ: $task"
+
+  # prompt の検証は worktree 作成の副作用が出る前に fail-fast する。
+  # herdr 不可のまま進むと初期プロンプトを黙って取りこぼすため die する。
+  if [ -n "$prompt" ] && [ -n "$prompt_file" ]; then
+    die "new: --prompt と --prompt-file は併用できない"
+  fi
+  if [ -n "$prompt_file" ]; then
+    [ -f "$prompt_file" ] || die "new: prompt ファイルが見つからない: $prompt_file"
+    prompt="$(cat "$prompt_file")"
+    [ -n "$prompt" ] || die "new: prompt ファイルが空: $prompt_file"
+  fi
+  if [ -n "$prompt" ]; then
+    [ "$start_claude" -eq 1 ] || die "new: --prompt は --no-claude と併用できない"
+    herdr_ok || die "new: herdr サーバなしでは Claude にプロンプトを渡せない (herdr を起動するか --prompt を外す)"
+  fi
   resolve_repo
   # native worktree と揃えたブランチ名。task はディレクトリ名 / herdr ラベルに使う。
   local branch="worktree-$task"
@@ -167,7 +242,10 @@ cmd_new() {
   cmd_bootstrap "$path"
 
   if [ -n "$ws" ] && [ "$start_claude" -eq 1 ]; then
-    herdr agent start "claude-$task" --workspace "$ws" --cwd "$path" --no-focus -- claude
+    # prompt は argv 1 要素のまま herdr の -- パススルーで claude に渡る
+    local -a claude_cmd=(claude)
+    [ -n "$prompt" ] && claude_cmd+=("$prompt")
+    herdr agent start "claude-$task" --workspace "$ws" --cwd "$path" --no-focus -- "${claude_cmd[@]}"
     herdr workspace focus "$ws" >/dev/null
     log "Claude Code を workspace $ws で起動した"
   fi
@@ -206,7 +284,9 @@ cmd_rm() {
     esac
     shift
   done
-  [ -n "$task" ] || usage 1
+  if [ -z "$task" ]; then
+    task="$(infer_task rm)"
+  fi
   resolve_repo
 
   local branch="worktree-$task" path
@@ -219,11 +299,37 @@ cmd_rm() {
     die "$path に未コミットの変更がある (--force で強制削除)"
   fi
 
+  # 自己削除 (worktree 側セッションから自分を消す) なら cwd を退避する。
+  # cwd が削除対象の中のままだと git が失敗する。
+  local self=0
+  case "$PWD/" in
+    "$path"/*)
+      self=1
+      cd "$MAIN_ROOT"
+      ;;
+  esac
+
   local ws=""
   if herdr_ok; then
     ws="$(herdr worktree list --cwd "$MAIN_ROOT" --json |
       jq -r --arg p "$path" '.result.worktrees[] | select(.path == $p) | .open_workspace_id // empty')"
   fi
+
+  if [ "$self" -eq 1 ] && [ -n "$ws" ]; then
+    # 自己削除では herdr worktree remove (workspace close 込み) を使わない。
+    # close の時点で自プロセス (claude → wt) が殺され、後続のブランチ削除が
+    # 走らないため、git レベルの削除を先に済ませて close を最後の 1 手にする。
+    if [ "$force" -eq 1 ]; then
+      git -C "$MAIN_ROOT" worktree remove --force "$path"
+    else
+      git -C "$MAIN_ROOT" worktree remove "$path"
+    fi
+    delete_branch "$branch" "$force"
+    log "worktree を削除した: $path (workspace $ws を閉じて終了する)"
+    herdr workspace close "$ws" >/dev/null
+    return 0
+  fi
+
   if [ -n "$ws" ]; then
     if [ "$force" -eq 1 ]; then
       herdr worktree remove --workspace "$ws" --force --json >/dev/null
@@ -240,10 +346,47 @@ cmd_rm() {
     log "worktree を削除した: $path"
   fi
 
-  local del_flag="-d"
-  [ "$force" -eq 1 ] && del_flag="-D"
-  git -C "$MAIN_ROOT" branch "$del_flag" "$branch" ||
-    log "ブランチ $branch は未マージのため残した (git branch -D $branch で削除可)"
+  delete_branch "$branch" "$force"
+}
+
+# worktree ブランチ (worktree-<task>) を本体 checkout の現在ブランチへマージする。
+# 主用途は worktree 内からの実行 (worktree 側の Claude が自分の成果を取り込む)。
+# task 省略時は cwd のブランチから推定する。コンフリクトは本体側の working tree
+# に発生し、auto-abort しない (解決 or merge --abort は呼び出し側が選ぶ)。
+cmd_merge() {
+  local task="${1:-}"
+  [ $# -le 1 ] || die "merge: 引数が多すぎる"
+  resolve_repo
+
+  if [ -z "$task" ]; then
+    task="$(infer_task merge)"
+  fi
+  local branch="worktree-$task"
+  git -C "$MAIN_ROOT" rev-parse --verify -q "refs/heads/$branch" >/dev/null ||
+    die "ブランチ $branch が存在しない (wt list で確認)"
+
+  local main_branch
+  main_branch="$(git -C "$MAIN_ROOT" symbolic-ref --short -q HEAD)" ||
+    die "本体が detached HEAD のためマージできない"
+  [ "$main_branch" != "$branch" ] || die "本体が $branch 自身を checkout している"
+
+  # untracked は許容する (-uno)。worktree が .claude/worktrees に作られるため
+  # 本体には常に untracked が現れ、素の porcelain では毎回中断してしまう。
+  [ -z "$(git -C "$MAIN_ROOT" status --porcelain -uno)" ] ||
+    die "本体 ($MAIN_ROOT) に未コミットの変更がある。commit / stash してから実行する"
+
+  local wt_path
+  wt_path="$(git -C "$MAIN_ROOT" worktree list --porcelain |
+    awk -v b="refs/heads/$branch" '$1=="worktree"{p=$2} $1=="branch" && $2==b{print p}')"
+  if [ -n "$wt_path" ] && [ -n "$(git -C "$wt_path" status --porcelain)" ]; then
+    log "警告: $wt_path に未コミットの変更がある (マージには含まれない)"
+  fi
+
+  if git -C "$MAIN_ROOT" merge --no-edit "$branch"; then
+    log "マージ完了: $branch → $main_branch (片付けは wt rm $task)"
+  else
+    die "マージ失敗。本体のコンフリクトを解決して commit するか 'git -C $MAIN_ROOT merge --abort' で戻す"
+  fi
 }
 
 case "${1:-}" in
@@ -266,6 +409,10 @@ case "${1:-}" in
   rm)
     shift
     cmd_rm "$@"
+    ;;
+  merge)
+    shift
+    cmd_merge "$@"
     ;;
   -h | --help | "") usage ;;
   *) die "不明なサブコマンド: $1 (--help 参照)" ;;

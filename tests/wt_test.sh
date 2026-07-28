@@ -27,6 +27,12 @@ assert_dir() { # path desc
 assert_no_dir() { # path desc
   if [ ! -d "$1" ]; then pass "$2"; else fail "$2 (unexpected: $1)"; fi
 }
+assert_file() { # path desc — symlink でない実体ファイル
+  if [ -f "$1" ] && [ ! -L "$1" ]; then pass "$2"; else fail "$2 (not a regular file: $1)"; fi
+}
+assert_link() { # path desc
+  if [ -L "$1" ]; then pass "$2"; else fail "$2 (not a symlink: $1)"; fi
+}
 branch_of() { git -C "$1" symbolic-ref --short -q HEAD 2>/dev/null; }
 has_branch() { git -C "$1" rev-parse --verify -q "refs/heads/$2" >/dev/null 2>&1; }
 
@@ -113,6 +119,265 @@ wt_local "$R1" rm ok.name-1_2 >/dev/null 2>&1
 out="$(wt_local "$R1" rm aa bb 2>&1)"
 rc=$?
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q '引数が多すぎる'; then pass "rm: 引数が多すぎる場合は中断する"; else fail "rm: 引数が多すぎる場合は中断する (rc=$rc out=$out)"; fi
+
+# --- test 9: .worktreeinclude に列挙した gitignore 済みファイルを実体コピーする ---
+R9="$TMP/repo9"
+new_repo "$R9"
+printf 'config.local.json\n' >"$R9/.gitignore"
+printf 'config.local.json\n' >"$R9/.worktreeinclude"
+git -C "$R9" add .gitignore .worktreeinclude
+git -C "$R9" commit -qm include
+printf '{"secret":1}\n' >"$R9/config.local.json"
+wt_local "$R9" new inc-basic --no-claude >/dev/null 2>&1
+W9="$R9/.claude/worktrees/inc-basic"
+assert_file "$W9/config.local.json" "include: 実体ファイルとしてコピーする"
+assert_eq "include: コピー内容が一致する" '{"secret":1}' "$(cat "$W9/config.local.json" 2>/dev/null)"
+
+# --- test 10: ディレクトリパターン (末尾スラッシュ) はネストしたファイルごとコピーする ---
+R10="$TMP/repo10"
+new_repo "$R10"
+printf 'secrets/\n' >"$R10/.gitignore"
+printf 'secrets/\n' >"$R10/.worktreeinclude"
+git -C "$R10" add .gitignore .worktreeinclude
+git -C "$R10" commit -qm include
+mkdir -p "$R10/secrets/a"
+printf 'key-data\n' >"$R10/secrets/a/b.key"
+wt_local "$R10" new inc-dir --no-claude >/dev/null 2>&1
+assert_file "$R10/.claude/worktrees/inc-dir/secrets/a/b.key" "include: ディレクトリパターンでネストごとコピーする"
+
+# --- test 11: bootstrap 再実行は worktree 側の既存ファイルを上書きしない ---
+printf 'edited-in-worktree\n' >"$W9/config.local.json"
+wt_local "$R9" bootstrap "$W9" >/dev/null 2>&1
+assert_eq "include: 再 bootstrap で既存ファイルを上書きしない" "edited-in-worktree" "$(cat "$W9/config.local.json" 2>/dev/null)"
+
+# --- test 12: .worktreeinclude の .env は実体コピーが symlink に優先する ---
+R12="$TMP/repo12"
+new_repo "$R12"
+printf '.env\n' >"$R12/.gitignore"
+printf '.env\n' >"$R12/.worktreeinclude"
+git -C "$R12" add .gitignore .worktreeinclude
+git -C "$R12" commit -qm include
+printf 'KEY=1\n' >"$R12/.env"
+wt_local "$R12" new inc-env --no-claude >/dev/null 2>&1
+assert_file "$R12/.claude/worktrees/inc-env/.env" "include: .env は実体コピーが symlink に優先する"
+# 回帰: .worktreeinclude が無い repo では .env は従来どおり symlink
+R12B="$TMP/repo12b"
+new_repo "$R12B"
+printf 'KEY=1\n' >"$R12B/.env"
+wt_local "$R12B" new no-inc --no-claude >/dev/null 2>&1
+assert_link "$R12B/.claude/worktrees/no-inc/.env" "include 無し: .env は従来どおり symlink する"
+
+# --- test 13: .worktreeinclude のパターンが何にもマッチしなくてもエラーにしない ---
+R13="$TMP/repo13"
+new_repo "$R13"
+printf 'no-such-file-anywhere\n' >"$R13/.worktreeinclude"
+git -C "$R13" add .worktreeinclude
+git -C "$R13" commit -qm include
+if wt_local "$R13" new inc-empty --no-claude >/dev/null 2>&1; then
+  pass "include: マッチ 0 件でも exit 0"
+else
+  fail "include: マッチ 0 件でも exit 0"
+fi
+
+# --- test 14: prompt の引数エラーは worktree を作る前に fail-fast する ---
+R14="$TMP/repo14"
+new_repo "$R14"
+assert_prompt_err() { # desc pattern args...
+  local desc="$1" pattern="$2"
+  shift 2
+  local out rc
+  out="$(wt_local "$R14" new "$@" 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "$pattern"; then
+    pass "prompt: $desc"
+  else
+    fail "prompt: $desc (rc=$rc out=$out)"
+  fi
+}
+assert_prompt_err "--prompt の値欠落を弾く" '値が必要' p14a --prompt
+assert_prompt_err "--prompt と --prompt-file の併用を弾く" '併用できない' p14b --prompt x --prompt-file "$TMP/nope"
+assert_prompt_err "--prompt-file の不存在を弾く" '見つからない' p14c --prompt-file "$TMP/no-such-file"
+assert_prompt_err "--prompt と --no-claude の併用を弾く" '併用できない' p14d --prompt x --no-claude
+for t in p14a p14b p14c p14d; do
+  if [ -d "$R14/.claude/worktrees/$t" ] || has_branch "$R14" "worktree-$t"; then
+    fail "prompt: エラー時に worktree/ブランチを作らない ($t)"
+  else
+    pass "prompt: エラー時に worktree/ブランチを作らない ($t)"
+  fi
+done
+
+# --- test 15: herdr 不可で --prompt はプロンプトを取りこぼさないよう die する ---
+out="$(wt_local "$R14" new p15 --prompt "hello" 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'herdr'; then
+  pass "prompt: herdr 不可なら die してプロンプトを取りこぼさない"
+else
+  fail "prompt: herdr 不可なら die してプロンプトを取りこぼさない (rc=$rc out=$out)"
+fi
+assert_no_dir "$R14/.claude/worktrees/p15" "prompt: herdr 不可の die でも worktree を作らない"
+
+# --- test 16: merge は worktree 内から task 省略で実行でき、本体に取り込まれる ---
+R16="$TMP/repo16"
+new_repo "$R16"
+wt_local "$R16" new m16 --no-claude >/dev/null 2>&1
+W16="$R16/.claude/worktrees/m16"
+printf 'done\n' >"$W16/result.txt"
+git -C "$W16" add result.txt
+git -C "$W16" commit -qm "add result"
+if wt_local "$W16" merge >/dev/null 2>&1; then
+  pass "merge: worktree 内から task 省略で実行できる"
+else
+  fail "merge: worktree 内から task 省略で実行できる"
+fi
+assert_file "$R16/result.txt" "merge: worktree のコミットが本体に取り込まれる"
+
+# --- test 17: merge のガード ---
+out="$(wt_local "$R16" merge 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'task'; then
+  pass "merge: 本体で task 省略なら die する"
+else
+  fail "merge: 本体で task 省略なら die する (rc=$rc out=$out)"
+fi
+if wt_local "$R16" merge no-such-task >/dev/null 2>&1; then
+  fail "merge: 存在しない task なら die する"
+else
+  pass "merge: 存在しない task なら die する"
+fi
+# 本体の tracked ファイルが dirty なら中断する
+printf 'dirty\n' >>"$R16/result.txt"
+out="$(wt_local "$W16" merge 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q '未コミット'; then
+  pass "merge: 本体の tracked dirty で中断する"
+else
+  fail "merge: 本体の tracked dirty で中断する (rc=$rc out=$out)"
+fi
+git -C "$R16" checkout -q -- result.txt
+# 本体に untracked ファイルがあっても成功する (-uno の検証。.claude/worktrees が常に untracked のため)
+printf 'x\n' >"$R16/untracked.txt"
+if wt_local "$W16" merge >/dev/null 2>&1; then
+  pass "merge: 本体の untracked のみなら成功する"
+else
+  fail "merge: 本体の untracked のみなら成功する"
+fi
+
+# --- test 18: merge のコンフリクトは auto-abort せず本体に残す ---
+R18="$TMP/repo18"
+new_repo "$R18"
+printf 'base\n' >"$R18/f.txt"
+git -C "$R18" add f.txt
+git -C "$R18" commit -qm base
+wt_local "$R18" new m18 --no-claude >/dev/null 2>&1
+W18="$R18/.claude/worktrees/m18"
+printf 'from-worktree\n' >"$W18/f.txt"
+git -C "$W18" commit -qam wt-side
+printf 'from-main\n' >"$R18/f.txt"
+git -C "$R18" commit -qam main-side
+if wt_local "$W18" merge >/dev/null 2>&1; then
+  fail "merge: コンフリクトで非 0 になる"
+else
+  pass "merge: コンフリクトで非 0 になる"
+fi
+conflicts="$(git -C "$R18" diff --name-only --diff-filter=U)"
+assert_eq "merge: コンフリクトを auto-abort せず本体に残す" "f.txt" "$conflicts"
+git -C "$R18" merge --abort >/dev/null 2>&1
+
+# --- test 19: rm は worktree 内から task 省略で自己削除できる (git フォールバック経路) ---
+R19="$TMP/repo19"
+new_repo "$R19"
+wt_local "$R19" new s19 --no-claude >/dev/null 2>&1
+W19="$R19/.claude/worktrees/s19"
+if wt_local "$W19" rm >/dev/null 2>&1; then
+  pass "rm: worktree 内から task 省略で自己削除できる"
+else
+  fail "rm: worktree 内から task 省略で自己削除できる"
+fi
+assert_no_dir "$W19" "rm: 自己削除で worktree が消える"
+if has_branch "$R19" "worktree-s19"; then
+  fail "rm: 自己削除でブランチも消える"
+else
+  pass "rm: 自己削除でブランチも消える"
+fi
+
+# --- test 20: rm は本体で task 省略なら die する ---
+out="$(wt_local "$R19" rm 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'task を指定'; then
+  pass "rm: 本体で task 省略なら die する"
+else
+  fail "rm: 本体で task 省略なら die する (rc=$rc out=$out)"
+fi
+
+# --- test 21: fake herdr で --prompt が argv 1 要素のまま claude に渡る ---
+if [ -x /usr/bin/jq ]; then
+  mkdir -p "$TMP/bin"
+  cat >"$TMP/bin/herdr" <<'STUB'
+#!/usr/bin/env bash
+# テスト用 herdr スタブ。worktree create は実際に git worktree を作り、
+# agent start は -- 以降の argv を 1 行 1 要素で HERDR_ARGV_LOG に記録する。
+set -euo pipefail
+cmd="${1:-} ${2:-}"
+case "$cmd" in
+  "workspace list") exit 0 ;;
+  "worktree create")
+    shift 2
+    cwd="" branch="" base="" path=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --cwd) cwd="$2"; shift ;;
+        --branch) branch="$2"; shift ;;
+        --base) base="$2"; shift ;;
+        --path) path="$2"; shift ;;
+        --label) shift ;;
+      esac
+      shift
+    done
+    git -C "$cwd" worktree add -q -b "$branch" "$path" "$base" >&2
+    printf '{"result":{"workspace":{"workspace_id":"ws-stub"},"worktree":{"path":"%s"}}}\n' "$path"
+    ;;
+  "agent start")
+    shift 2
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done
+    shift
+    : >"$HERDR_ARGV_LOG"
+    for a in "$@"; do printf '%s\n' "$a" >>"$HERDR_ARGV_LOG"; done
+    ;;
+  *) exit 0 ;;
+esac
+STUB
+  chmod +x "$TMP/bin/herdr"
+  R21="$TMP/repo21"
+  new_repo "$R21"
+  LOG21="$TMP/agent-argv.log"
+  (cd "$R21" && env -u WT_HOME HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21" \
+    PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21 --prompt "hello world") >/dev/null 2>&1
+  argc="$(wc -l <"$LOG21" 2>/dev/null | tr -d ' ')"
+  assert_eq "stub: agent start の argv が claude + prompt の 2 要素" "2" "$argc"
+  assert_eq "stub: argv[0] が claude" "claude" "$(sed -n 1p "$LOG21" 2>/dev/null)"
+  assert_eq "stub: argv[1] が prompt 全体 (分割されない)" "hello world" "$(sed -n 2p "$LOG21" 2>/dev/null)"
+else
+  pass "stub: jq が無いためスキップ"
+fi
+
+# --- test 22: install.sh は skills を ~/.claude/skills に配置する ---
+INSTALL="$(dirname "$WT")/install.sh"
+H22="$TMP/home22"
+mkdir -p "$H22"
+env HOME="$H22" PREFIX="$TMP/bin22" PATH="$SAFE_PATH" bash "$INSTALL" >/dev/null 2>&1
+ok22=1
+for s in worktree-parallel wt wt-detail wt-merge wt-clean; do
+  [ -f "$H22/.claude/skills/$s/SKILL.md" ] || ok22=0
+done
+if [ "$ok22" -eq 1 ]; then
+  pass "install: skills 5 個を ~/.claude/skills に配置する"
+else
+  fail "install: skills 5 個を ~/.claude/skills に配置する"
+fi
+H22B="$TMP/home22b"
+mkdir -p "$H22B"
+env HOME="$H22B" PREFIX="$TMP/bin22" PATH="$SAFE_PATH" WT_INSTALL_SKILLS=0 bash "$INSTALL" >/dev/null 2>&1
+assert_no_dir "$H22B/.claude/skills" "install: WT_INSTALL_SKILLS=0 で skills を配置しない"
 
 if [ "$FAILED" -eq 0 ]; then
   printf '\nall tests passed\n'

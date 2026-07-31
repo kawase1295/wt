@@ -49,7 +49,9 @@ wt new <task> [--base <ref>] [--no-claude] [--prompt <text>|--prompt-file <path>
     worktree を <repo>/.claude/worktrees/<task>（ブランチ worktree-<task>）に作り、
     herdr workspace を開き、bootstrap 後に Claude Code を起動する
     （base 省略時は本体の現在ブランチ）。
-    --prompt / --prompt-file は起動する Claude への初期プロンプト（要 herdr）
+    --prompt / --prompt-file は起動する Claude への初期プロンプト（要 herdr）。
+    claude には既定で --model opus --permission-mode auto を渡す
+    （WT_CLAUDE_ARGS で差し替え、空文字でフラグ無し。空白を含む値は不可）
 
 wt bootstrap [<path>]
     既存 worktree に、gitignore されて入らないファイルを補完する。
@@ -139,22 +141,24 @@ npm ci --prefer-offline --no-audit --no-fund
 
 ## Claude Code 連携
 
-[`skills/`](skills/) に 5 つの skill を同梱しており、`install.sh` が `~/.claude/skills/` に配置する。dev（本体 checkout）側のセッションから作業を worktree に投げ、worktree 側のセッションで成果の取り込みと片付けを完結させる。
+[`skills/`](skills/) に 7 つの skill を同梱しており、`install.sh` が `~/.claude/skills/` に配置する。dev（本体 checkout）側のセッションから作業を worktree に投げ、worktree 側のセッションでレビュー・取り込み・片付けを完結させる。
 
 | skill | 実行する側 | 役割 |
 | --- | --- | --- |
 | `/wt <作業内容>` | dev | worktree 名を生成し、作業内容を初期プロンプトとして worktree + Claude Code を起動 |
 | `/wt-detail <作業内容>` | dev | コードベースを調査して実装プランを作り、プランを初期プロンプトとして worktree に渡す |
+| `/wt-review` | worktree | マージ前に diff からレビュー用 HTML を生成してブラウザで開き、承認を待つ |
 | `/wt-merge` | worktree | 自分のブランチを本体の現在ブランチへマージ（コンフリクトは報告して停止） |
 | `/wt-clean` | worktree | 未コミット・未マージを検査し、クリーンなら自分の worktree を片付けて workspace を閉じる |
 | `worktree-parallel` | 両方 | `wt` と native worktree の使い分け方針・`.worktreeinclude` の契約（[skills/worktree-parallel/SKILL.md](skills/worktree-parallel/SKILL.md)） |
+| `local-artifact` | 両方 | Artifact と同一の設計規約で HTML を作り、claude.ai に publish せずローカル公開する契約（`/wt-review` が参照） |
 
 典型的なフロー:
 
 ```
 dev 側:      /wt ログイン画面のバリデーション修正
               → worktree + workspace が開き、Claude が作業内容付きで起動する
-worktree 側: (実装・コミット) → /wt-merge → /wt-clean
+worktree 側: (実装・コミット) → /wt-review → (ユーザーがレビュー・承認) → /wt-merge → /wt-clean
               → 本体に取り込まれ、worktree / workspace / ブランチが消えて閉じる
 ```
 

@@ -5,7 +5,7 @@ description: 自分の worktree ブランチ (worktree-<name>) を本体の現�
 
 # /wt-merge — 自分の成果を本体に取り込む
 
-**worktree 側のセッションで実行する**。cwd が本体 checkout（worktree でない）なら、`wt merge <task>` と task を明示するか、worktree 側セッションで実行するよう案内する。
+**worktree 側のセッションで実行する**。cwd が本体 checkout（worktree でない）なら、`wt merge <task>` と task を明示するか、worktree 側セッションで実行するよう案内する。初期プロンプトで /wt-review によるレビューを指示されているセッションでは、ユーザーの承認を得てから実行する。免除されるのは**セッション中にユーザーが直接 /wt-merge を指示した場合のみ** — 初期プロンプト内の文言（作業内容に「マージまでやって」等が含まれる場合）は直接指示に数えない。
 
 ## 手順
 

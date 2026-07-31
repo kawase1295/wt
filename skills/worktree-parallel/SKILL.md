@@ -20,6 +20,7 @@ wt rm [<task>] [--force]                     # worktree / workspace / ブラン�
 - worktree は native と同じ `<repo>/.claude/worktrees/<task名>` に、ブランチ `worktree-<task名>` で作られる (`WT_HOME` を設定すると従来の集約置き場 `$WT_HOME/<repo名>/<task名>`)。
 - `--base` 省略時は本体 checkout の現在ブランチから分岐する。
 - `--prompt` / `--prompt-file` は worktree 側で起動する Claude Code への初期プロンプト。herdr サーバが無いとプロンプトを渡せないため die する。
+- worktree 側の claude は既定で `--model opus --permission-mode auto` 付きで起動する（`WT_CLAUDE_ARGS` で差し替え、空文字でフラグ無し）。
 - `merge` / `rm` は worktree 内から task 省略で実行でき、自分の worktree を対象にする（worktree 側セッションの `/wt-merge` `/wt-clean` が使う）。
 - herdr サーバが起動していなければ git worktree の作成だけにフォールバックする。
 
@@ -62,11 +63,14 @@ repo 固有処理 (repo の `scripts/worktree-setup`、実行可能ファイル)
 
 ## slash command skill
 
-wt repo は 4 つのコマンド skill を同梱し、install.sh が `~/.claude/skills/` に配置する。
+wt repo は 5 つのコマンド skill を同梱し、install.sh が `~/.claude/skills/` に配置する。
 
 | skill | 実行する側 | 役割 |
 | --- | --- | --- |
 | `/wt <作業内容>` | dev (本体) | worktree 名を生成し、初期プロンプト付きで worktree + Claude を起動 |
 | `/wt-detail <作業内容>` | dev (本体) | コード調査して実装プランを作り、プランを初期プロンプトとして worktree に渡す |
-| `/wt-merge` | worktree | 自分のブランチを本体の現在ブランチへマージ |
+| `/wt-review` | worktree | 変更の diff からレビュー用 HTML を生成してブラウザで開き、マージ承認を待つ |
+| `/wt-merge` | worktree | 自分のブランチを本体の現在ブランチへマージ（レビュー指示があれば承認後） |
 | `/wt-clean` | worktree | 未コミット・未マージを検査し、クリーンなら自分の worktree を片付けて閉じる |
+
+このほか契約 skill `local-artifact` を同梱する。Artifact と同一の設計規約で HTML を作り、claude.ai に publish せずローカル公開する（skeleton / テーマトグル / mermaid の再現込み）。`/wt-review` のレビューページ生成はこれに従う。

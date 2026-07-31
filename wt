@@ -6,7 +6,9 @@
 #       worktree を <repo>/.claude/worktrees/<task> (ブランチ worktree-<task>) に作り、
 #       herdr workspace を開き、bootstrap 後に Claude Code を起動する。
 #       base 省略時は本体の現在ブランチ。WT_HOME を設定すると従来の集約置き場に作る。
-#       --prompt / --prompt-file は起動する Claude への初期プロンプト (要 herdr)
+#       --prompt / --prompt-file は起動する Claude への初期プロンプト (要 herdr)。
+#       claude には既定で --model opus --permission-mode auto を渡す
+#       (WT_CLAUDE_ARGS で差し替え、空文字でフラグ無し。空白を含む値は不可)
 #   wt bootstrap [<path>]
 #       既存 worktree に gitignore されて入らないファイルを補完する。
 #       Claude Code が作る .claude/worktrees/* にも使える
@@ -242,8 +244,12 @@ cmd_new() {
   cmd_bootstrap "$path"
 
   if [ -n "$ws" ] && [ "$start_claude" -eq 1 ]; then
-    # prompt は argv 1 要素のまま herdr の -- パススルーで claude に渡る
-    local -a claude_cmd=(claude)
+    # prompt は argv 1 要素のまま herdr の -- パススルーで claude に渡る。
+    # 起動フラグは WT_CLAUDE_ARGS で差し替え可能。単語分割で argv 化するため、
+    # 空白を含む値 (引用符付きフラグ) はサポートしない。
+    local -a claude_cmd=(claude) claude_flags=()
+    read -r -a claude_flags <<<"${WT_CLAUDE_ARGS---model opus --permission-mode auto}"
+    [ "${#claude_flags[@]}" -gt 0 ] && claude_cmd+=("${claude_flags[@]}")
     [ -n "$prompt" ] && claude_cmd+=("$prompt")
     herdr agent start "claude-$task" --workspace "$ws" --cwd "$path" --no-focus -- "${claude_cmd[@]}"
     herdr workspace focus "$ws" >/dev/null

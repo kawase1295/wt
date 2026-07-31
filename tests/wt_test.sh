@@ -309,7 +309,9 @@ else
   fail "rm: 本体で task 省略なら die する (rc=$rc out=$out)"
 fi
 
-# --- test 21: fake herdr で --prompt が argv 1 要素のまま claude に渡る ---
+# --- test 21: fake herdr で claude の起動 argv を検証する ---
+# 既定で --model opus --permission-mode auto が入り、--prompt は argv 1 要素のまま渡る。
+# WT_CLAUDE_ARGS でフラグを差し替えられ、空文字ならフラグ無しになる。
 if [ -x /usr/bin/jq ]; then
   mkdir -p "$TMP/bin"
   cat >"$TMP/bin/herdr" <<'STUB'
@@ -350,12 +352,28 @@ STUB
   R21="$TMP/repo21"
   new_repo "$R21"
   LOG21="$TMP/agent-argv.log"
-  (cd "$R21" && env -u WT_HOME HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21" \
+  (cd "$R21" && env -u WT_HOME -u WT_CLAUDE_ARGS HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21" \
     PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21 --prompt "hello world") >/dev/null 2>&1
   argc="$(wc -l <"$LOG21" 2>/dev/null | tr -d ' ')"
-  assert_eq "stub: agent start の argv が claude + prompt の 2 要素" "2" "$argc"
+  assert_eq "stub: agent start の argv が claude + 既定フラグ + prompt の 6 要素" "6" "$argc"
   assert_eq "stub: argv[0] が claude" "claude" "$(sed -n 1p "$LOG21" 2>/dev/null)"
-  assert_eq "stub: argv[1] が prompt 全体 (分割されない)" "hello world" "$(sed -n 2p "$LOG21" 2>/dev/null)"
+  assert_eq "stub: 既定フラグが --model opus --permission-mode auto" \
+    "--model opus --permission-mode auto" "$(sed -n 2,5p "$LOG21" 2>/dev/null | paste -sd' ' -)"
+  assert_eq "stub: 末尾 argv が prompt 全体 (分割されない)" "hello world" "$(sed -n 6p "$LOG21" 2>/dev/null)"
+
+  # WT_CLAUDE_ARGS でフラグを差し替える
+  LOG21B="$TMP/agent-argv-b.log"
+  (cd "$R21" && env -u WT_HOME HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21B" WT_CLAUDE_ARGS="--model sonnet" \
+    PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21b --prompt "hi") >/dev/null 2>&1
+  assert_eq "stub: WT_CLAUDE_ARGS でフラグを差し替えられる" \
+    "claude --model sonnet hi" "$(paste -sd' ' - <"$LOG21B" 2>/dev/null)"
+
+  # WT_CLAUDE_ARGS="" (空文字) でフラグ無し
+  LOG21C="$TMP/agent-argv-c.log"
+  (cd "$R21" && env -u WT_HOME HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21C" WT_CLAUDE_ARGS="" \
+    PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21c --prompt "hi") >/dev/null 2>&1
+  assert_eq "stub: WT_CLAUDE_ARGS 空文字でフラグ無し" \
+    "claude hi" "$(paste -sd' ' - <"$LOG21C" 2>/dev/null)"
 else
   pass "stub: jq が無いためスキップ"
 fi
@@ -366,13 +384,13 @@ H22="$TMP/home22"
 mkdir -p "$H22"
 env HOME="$H22" PREFIX="$TMP/bin22" PATH="$SAFE_PATH" bash "$INSTALL" >/dev/null 2>&1
 ok22=1
-for s in worktree-parallel wt wt-detail wt-merge wt-clean; do
+for s in worktree-parallel wt wt-detail wt-review wt-merge wt-clean local-artifact; do
   [ -f "$H22/.claude/skills/$s/SKILL.md" ] || ok22=0
 done
 if [ "$ok22" -eq 1 ]; then
-  pass "install: skills 5 個を ~/.claude/skills に配置する"
+  pass "install: skills 7 個を ~/.claude/skills に配置する"
 else
-  fail "install: skills 5 個を ~/.claude/skills に配置する"
+  fail "install: skills 7 個を ~/.claude/skills に配置する"
 fi
 H22B="$TMP/home22b"
 mkdir -p "$H22B"

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# wt の検査エントリポイント。wt merge のマージ前ゲートと CI (GitHub Actions) が
+# 共通で叩くコントラクト。静的検査 (shellcheck) とテストをまとめて実行する。
+# ローカルに shellcheck が無ければ警告してテストのみ実行する (CI では必須)。
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck wt install.sh scripts/check tests/wt_test.sh
+elif [ -n "${CI:-}" ]; then
+  echo "[check] ERROR: CI では shellcheck が必須" >&2
+  exit 1
+else
+  echo "[check] shellcheck が無いため静的検査をスキップした (導入: sudo apt install shellcheck)" >&2
+fi
+
+tests/wt_test.sh

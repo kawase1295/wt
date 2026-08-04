@@ -16,9 +16,11 @@
 #       既存 worktree を herdr workspace として開き直す
 #   wt list
 #       worktree と herdr workspace の対応を一覧表示
-#   wt merge [<task>]
+#   wt merge [<task>] [--no-check]
 #       ブランチ worktree-<task> を本体の現在ブランチへマージする。
-#       worktree 内から task 省略で自分を対象にできる。コンフリクトは本体に残す
+#       worktree 内から task 省略で自分を対象にできる。コンフリクトは本体に残す。
+#       worktree に scripts/check (実行可能) があればマージ前に実行し、
+#       失敗したらマージしない (--no-check で省略)
 #   wt rm [<task>] [--force]
 #       worktree / workspace / ブランチを削除 (未コミット変更があれば中断)。
 #       worktree 内から task 省略で自分を片付けられる (workspace close は最後)
@@ -193,7 +195,10 @@ cmd_new() {
         shift
         ;;
       -*) die "new: 不明なオプション $1" ;;
-      *) [ -z "$task" ] && task="$1" || die "new: 引数が多すぎる" ;;
+      *)
+        [ -n "$task" ] && die "new: 引数が多すぎる"
+        task="$1"
+        ;;
     esac
     shift
   done
@@ -286,7 +291,10 @@ cmd_rm() {
     case "$1" in
       --force) force=1 ;;
       -*) die "rm: 不明なオプション $1" ;;
-      *) [ -z "$task" ] && task="$1" || die "rm: 引数が多すぎる" ;;
+      *)
+        [ -n "$task" ] && die "rm: 引数が多すぎる"
+        task="$1"
+        ;;
     esac
     shift
   done
@@ -296,8 +304,10 @@ cmd_rm() {
   resolve_repo
 
   local branch="worktree-$task" path
+  # porcelain の worktree 行は "worktree <path>"。パスは空白を含み得るため
+  # 列分割 ($2) ではなくプレフィックス長で切り出す。
   path="$(git -C "$MAIN_ROOT" worktree list --porcelain |
-    awk -v b="refs/heads/$branch" '$1=="worktree"{p=$2} $1=="branch" && $2==b{print p}')"
+    awk -v b="refs/heads/$branch" '$1=="worktree"{p=substr($0,10)} $1=="branch" && $2==b{print p}')"
   [ -n "$path" ] || die "ブランチ $branch の worktree が見つからない"
   [ "$path" != "$MAIN_ROOT" ] || die "本体 checkout は削除できない"
 
@@ -359,9 +369,21 @@ cmd_rm() {
 # 主用途は worktree 内からの実行 (worktree 側の Claude が自分の成果を取り込む)。
 # task 省略時は cwd のブランチから推定する。コンフリクトは本体側の working tree
 # に発生し、auto-abort しない (解決 or merge --abort は呼び出し側が選ぶ)。
+# マージ前に worktree の scripts/check (実行可能ファイル) を実行し、失敗したら
+# マージしない。check は working tree に対して走る (未コミット変更も見える)。
 cmd_merge() {
-  local task="${1:-}"
-  [ $# -le 1 ] || die "merge: 引数が多すぎる"
+  local task="" run_check=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-check) run_check=0 ;;
+      -*) die "merge: 不明なオプション $1" ;;
+      *)
+        [ -n "$task" ] && die "merge: 引数が多すぎる"
+        task="$1"
+        ;;
+    esac
+    shift
+  done
   resolve_repo
 
   if [ -z "$task" ]; then
@@ -382,10 +404,25 @@ cmd_merge() {
     die "本体 ($MAIN_ROOT) に未コミットの変更がある。commit / stash してから実行する"
 
   local wt_path
+  # cmd_rm と同じく、空白を含み得るパスをプレフィックス長で切り出す
   wt_path="$(git -C "$MAIN_ROOT" worktree list --porcelain |
-    awk -v b="refs/heads/$branch" '$1=="worktree"{p=$2} $1=="branch" && $2==b{print p}')"
+    awk -v b="refs/heads/$branch" '$1=="worktree"{p=substr($0,10)} $1=="branch" && $2==b{print p}')"
   if [ -n "$wt_path" ] && [ -n "$(git -C "$wt_path" status --porcelain)" ]; then
     log "警告: $wt_path に未コミットの変更がある (マージには含まれない)"
+  fi
+
+  if [ "$run_check" -eq 1 ]; then
+    if [ -z "$wt_path" ]; then
+      log "警告: worktree が無いため scripts/check をスキップした"
+    elif [ -x "$wt_path/scripts/check" ]; then
+      log "マージ前チェック実行中: scripts/check ($wt_path)"
+      (cd "$wt_path" && scripts/check) ||
+        die "scripts/check が失敗した。worktree 側で修正してから再実行する (wt merge --no-check で省略可)"
+    elif [ -e "$wt_path/scripts/check" ]; then
+      log "警告: scripts/check が実行可能でないためスキップした (chmod +x scripts/check)"
+    else
+      log "警告: scripts/check が無いためマージ前チェックをスキップした"
+    fi
   fi
 
   if git -C "$MAIN_ROOT" merge --no-edit "$branch"; then

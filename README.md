@@ -10,6 +10,7 @@ git worktree と [herdr](https://github.com/) workspace を一体で管理し、
 - **欠落ファイルの補完** — `.worktreeinclude` に列挙した gitignore 済みファイルを実体コピー、本体の `.env` を symlink、`.claude/settings.local.json` をコピー。fresh checkout ではテストが動かない問題を解消する
 - **作業の受け渡し** — `--prompt` / `--prompt-file` で worktree 側の Claude Code に初期プロンプトを渡す。`/wt` などの slash command skill を同梱
 - **repo 固有の準備を委譲** — DB コピーや native rebuild などは repo 側の `scripts/worktree-setup` に委ねる契約
+- **マージ前チェック** — repo 側の `scripts/check` をマージ前に worktree で実行し、失敗したら取り込まない。CI と同一のエントリポイントを共有する契約
 - **graceful fallback** — herdr サーバに接続できなければ `git worktree` の作成だけで続行する
 
 ## 前提
@@ -63,9 +64,11 @@ wt open <task>
 wt list
     worktree と herdr workspace の対応を一覧表示
 
-wt merge [<task>]
+wt merge [<task>] [--no-check]
     ブランチ worktree-<task> を本体の現在ブランチへマージする。
-    worktree 内から task 省略で自分を対象にできる。コンフリクトは本体に残して中断
+    worktree 内から task 省略で自分を対象にできる。コンフリクトは本体に残して中断。
+    worktree に scripts/check（実行可能ファイル）があればマージ前に実行し、
+    失敗したらマージしない（--no-check で省略）
 
 wt rm [<task>] [--force]
     worktree / workspace / ブランチを削除する（未コミット変更があれば中断）。
@@ -92,7 +95,7 @@ wt open fix-login
 wt list
 
 # worktree の中から: 成果を本体に取り込み、自分を片付ける
-wt merge   # ブランチを本体の現在ブランチへマージ
+wt merge   # scripts/check があれば実行してから本体の現在ブランチへマージ
 wt rm      # worktree / workspace / ブランチを削除して workspace を閉じる
 ```
 
@@ -139,6 +142,23 @@ npm ci --prefer-offline --no-audit --no-fund
 # npm rebuild better-sqlite3 --ignore-scripts=false --foreground-scripts
 ```
 
+### マージ前チェック（repo の `scripts/check`）
+
+`wt merge` はマージの直前に worktree の `scripts/check`（実行可能ファイル、cwd = worktree）を実行し、非 0 で終わったらマージしない。テスト・型チェック・lint など「取り込み条件」をここに 1 本化する。
+
+- `scripts/check` が無い repo では警告だけ出してマージを通す（段階導入できる）
+- `--no-check` で省略できる
+- check は working tree に対して走るため、未コミット変更も見える（未コミット変更はマージには含まれない。`wt merge` が警告を出す）
+- CI（GitHub Actions 等）からも同じ `scripts/check` を叩くと、ローカルゲートと CI の検査内容が乖離しない。wt 自身の [.github/workflows/ci.yml](.github/workflows/ci.yml) と [scripts/check](scripts/check) が実例
+
+```bash
+#!/usr/bin/env bash
+# scripts/check — 取り込み条件をまとめて検査する（例: TypeScript repo）
+set -euo pipefail
+npx tsc --noEmit
+npm test
+```
+
 ## Claude Code 連携
 
 [`skills/`](skills/) に 7 つの skill を同梱しており、`install.sh` が `~/.claude/skills/` に配置する。dev（本体 checkout）側のセッションから作業を worktree に投げ、worktree 側のセッションでレビュー・取り込み・片付けを完結させる。
@@ -148,7 +168,7 @@ npm ci --prefer-offline --no-audit --no-fund
 | `/wt <作業内容>` | dev | worktree 名を生成し、作業内容を初期プロンプトとして worktree + Claude Code を起動 |
 | `/wt-detail <作業内容>` | dev | コードベースを調査して実装プランを作り、プランを初期プロンプトとして worktree に渡す |
 | `/wt-review` | worktree | マージ前に diff からレビュー用 HTML を生成してブラウザで開き、承認を待つ |
-| `/wt-merge` | worktree | 自分のブランチを本体の現在ブランチへマージ（コンフリクトは報告して停止） |
+| `/wt-merge` | worktree | 自分のブランチを本体の現在ブランチへマージ（`scripts/check` があればマージ前に実行。コンフリクトは報告して停止） |
 | `/wt-clean` | worktree | 未コミット・未マージを検査し、クリーンなら自分の worktree を片付けて workspace を閉じる |
 | `worktree-parallel` | 両方 | `wt` と native worktree の使い分け方針・`.worktreeinclude` の契約（[skills/worktree-parallel/SKILL.md](skills/worktree-parallel/SKILL.md)） |
 | `local-artifact` | 両方 | Artifact と同一の設計規約で HTML を作り、claude.ai に publish せずローカル公開する契約（`/wt-review` が参照） |

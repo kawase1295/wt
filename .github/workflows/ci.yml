@@ -1,0 +1,15 @@
+# wt の CI。scripts/check (wt merge のマージ前ゲートと同一コントラクト) を叩くだけ。
+# 検査内容の追加・変更は scripts/check 側で行い、この workflow は触らない。
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/check

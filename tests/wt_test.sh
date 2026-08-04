@@ -397,6 +397,178 @@ mkdir -p "$H22B"
 env HOME="$H22B" PREFIX="$TMP/bin22" PATH="$SAFE_PATH" WT_INSTALL_SKILLS=0 bash "$INSTALL" >/dev/null 2>&1
 assert_no_dir "$H22B/.claude/skills" "install: WT_INSTALL_SKILLS=0 で skills を配置しない"
 
+# --- test 23: merge は worktree の scripts/check を実行してからマージする ---
+R23="$TMP/repo23"
+new_repo "$R23"
+mkdir -p "$R23/scripts"
+cat >"$R23/scripts/check" <<CHK
+#!/usr/bin/env bash
+pwd -P >"$TMP/check23.log"
+CHK
+chmod +x "$R23/scripts/check"
+git -C "$R23" add scripts/check
+git -C "$R23" commit -qm check
+wt_local "$R23" new g23 --no-claude >/dev/null 2>&1
+W23="$R23/.claude/worktrees/g23"
+printf 'done\n' >"$W23/result.txt"
+git -C "$W23" add result.txt
+git -C "$W23" commit -qm result
+if wt_local "$W23" merge >/dev/null 2>&1; then
+  pass "merge: scripts/check 成功でマージする"
+else
+  fail "merge: scripts/check 成功でマージする"
+fi
+assert_file "$R23/result.txt" "merge: check 成功後にコミットが本体へ入る"
+assert_eq "merge: check は worktree を cwd に実行される" \
+  "$(cd "$W23" && pwd -P)" "$(cat "$TMP/check23.log" 2>/dev/null)"
+
+# --- test 24: scripts/check が失敗したらマージしない ---
+R24="$TMP/repo24"
+new_repo "$R24"
+mkdir -p "$R24/scripts"
+cat >"$R24/scripts/check" <<CHK
+#!/usr/bin/env bash
+: >"$TMP/check24.log"
+exit 1
+CHK
+chmod +x "$R24/scripts/check"
+git -C "$R24" add scripts/check
+git -C "$R24" commit -qm check
+wt_local "$R24" new g24 --no-claude >/dev/null 2>&1
+W24="$R24/.claude/worktrees/g24"
+printf 'x\n' >"$W24/f.txt"
+git -C "$W24" add f.txt
+git -C "$W24" commit -qm add-f
+out="$(wt_local "$W24" merge 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'check'; then
+  pass "merge: check 失敗で中断する"
+else
+  fail "merge: check 失敗で中断する (rc=$rc out=$out)"
+fi
+if [ -f "$R24/f.txt" ]; then
+  fail "merge: check 失敗ではマージ自体を開始しない"
+else
+  pass "merge: check 失敗ではマージ自体を開始しない"
+fi
+if git -C "$R24" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+  fail "merge: check 失敗で merge in progress を残さない"
+else
+  pass "merge: check 失敗で merge in progress を残さない"
+fi
+
+# --- test 25: --no-check は check を実行せずマージする ---
+rm -f "$TMP/check24.log"
+if wt_local "$W24" merge --no-check >/dev/null 2>&1; then
+  pass "merge: --no-check でマージできる"
+else
+  fail "merge: --no-check でマージできる"
+fi
+assert_file "$R24/f.txt" "merge: --no-check でコミットが本体へ入る"
+if [ -e "$TMP/check24.log" ]; then
+  fail "merge: --no-check では check を実行しない"
+else
+  pass "merge: --no-check では check を実行しない"
+fi
+
+# --- test 26: scripts/check が無ければ警告してマージは通す ---
+R26="$TMP/repo26"
+new_repo "$R26"
+wt_local "$R26" new g26 --no-claude >/dev/null 2>&1
+W26="$R26/.claude/worktrees/g26"
+printf 'y\n' >"$W26/g.txt"
+git -C "$W26" add g.txt
+git -C "$W26" commit -qm add-g
+out="$(wt_local "$W26" merge 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'スキップ'; then
+  pass "merge: check 無しは警告してマージを通す"
+else
+  fail "merge: check 無しは警告してマージを通す (rc=$rc out=$out)"
+fi
+# ブランチだけ残して worktree が無い場合もスキップ扱いで通す
+R26B="$TMP/repo26b"
+new_repo "$R26B"
+wt_local "$R26B" new g26b --no-claude >/dev/null 2>&1
+W26B="$R26B/.claude/worktrees/g26b"
+printf 'z\n' >"$W26B/h.txt"
+git -C "$W26B" add h.txt
+git -C "$W26B" commit -qm add-h
+git -C "$R26B" worktree remove --force "$W26B" >/dev/null 2>&1
+out="$(wt_local "$R26B" merge g26b 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'worktree が無いため'; then
+  pass "merge: worktree 無し (ブランチのみ) もスキップ警告で通す"
+else
+  fail "merge: worktree 無し (ブランチのみ) もスキップ警告で通す (rc=$rc out=$out)"
+fi
+# 実行 bit の無い scripts/check は専用の警告でスキップして通す
+R26C="$TMP/repo26c"
+new_repo "$R26C"
+mkdir -p "$R26C/scripts"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$R26C/scripts/check"
+git -C "$R26C" add scripts/check
+git -C "$R26C" commit -qm check
+wt_local "$R26C" new g26c --no-claude >/dev/null 2>&1
+W26C="$R26C/.claude/worktrees/g26c"
+printf 'w\n' >"$W26C/i.txt"
+git -C "$W26C" add i.txt
+git -C "$W26C" commit -qm add-i
+chmod -x "$W26C/scripts/check"
+out="$(wt_local "$W26C" merge 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '実行可能でない'; then
+  pass "merge: 非実行可能な check は専用警告でスキップして通す"
+else
+  fail "merge: 非実行可能な check は専用警告でスキップして通す (rc=$rc out=$out)"
+fi
+
+# --- test 27: パスに空白を含む repo でもゲートと rm が機能する (fail-open 回帰防止) ---
+R27="$TMP/repo 27"
+new_repo "$R27"
+mkdir -p "$R27/scripts"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$R27/scripts/check"
+chmod +x "$R27/scripts/check"
+git -C "$R27" add scripts/check
+git -C "$R27" commit -qm check
+wt_local "$R27" new g27 --no-claude >/dev/null 2>&1
+W27="$R27/.claude/worktrees/g27"
+printf 'x\n' >"$W27/f.txt"
+git -C "$W27" add f.txt
+git -C "$W27" commit -qm add-f
+if wt_local "$W27" merge >/dev/null 2>&1; then
+  fail "merge: 空白入りパスでも check 失敗で中断する"
+else
+  pass "merge: 空白入りパスでも check 失敗で中断する"
+fi
+if [ -f "$R27/f.txt" ]; then
+  fail "merge: 空白入りパスでマージ自体を開始しない"
+else
+  pass "merge: 空白入りパスでマージ自体を開始しない"
+fi
+if wt_local "$R27" rm g27 --force >/dev/null 2>&1; then
+  pass "rm: 空白入りパスの worktree を削除できる"
+else
+  fail "rm: 空白入りパスの worktree を削除できる"
+fi
+assert_no_dir "$W27" "rm: 空白入りパスで worktree が消える"
+
+# --- test 28: merge のオプションエラー ---
+out="$(wt_local "$R26" merge --bogus 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q '不明なオプション'; then
+  pass "merge: 不明なオプションを弾く"
+else
+  fail "merge: 不明なオプションを弾く (rc=$rc out=$out)"
+fi
+out="$(wt_local "$R26" merge aa bb 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q '引数が多すぎる'; then
+  pass "merge: 引数が多すぎる場合は中断する"
+else
+  fail "merge: 引数が多すぎる場合は中断する (rc=$rc out=$out)"
+fi
+
 if [ "$FAILED" -eq 0 ]; then
   printf '\nall tests passed\n'
 else

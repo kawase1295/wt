@@ -9,6 +9,7 @@ git worktree と [herdr](https://github.com/) workspace を一体で管理し、
 - **一体管理** — worktree・ブランチ・herdr workspace・エージェント起動を 1 コマンドに集約
 - **欠落ファイルの補完** — `.worktreeinclude` に列挙した gitignore 済みファイルを実体コピー、本体の `.env` を symlink、`.claude/settings.local.json` をコピー。fresh checkout ではテストが動かない問題を解消する
 - **作業の受け渡し** — `--prompt` / `--prompt-file` で worktree 側の Claude Code に初期プロンプトを渡す。`/wt` などの slash command skill を同梱
+- **セッション間の会話** — worktree 側と dev 側の Claude Code セッションが直接やり取りできる。`wt new` が worktree 側のセッション名を `wt-<task>` に固定し、`wt peers` が宛先を一覧する
 - **repo 固有の準備を委譲** — DB コピーや native rebuild などは repo 側の `scripts/worktree-setup` に委ねる契約
 - **マージ前チェック** — repo 側の `scripts/check` をマージ前に worktree で実行し、失敗したら取り込まない。CI と同一のエントリポイントを共有する契約
 - **graceful fallback** — herdr サーバに接続できなければ `git worktree` の作成だけで続行する
@@ -20,7 +21,7 @@ git worktree と [herdr](https://github.com/) workspace を一体で管理し、
 | bash 4+ | 必須 | 本体 |
 | git | 必須 | worktree 操作 |
 | [herdr](https://github.com/) | 任意 | workspace / エージェント起動（無ければ git worktree のみ） |
-| jq | herdr 使用時に必須 | herdr の JSON 出力パース |
+| jq | herdr 使用時と `wt peers` で必須 | herdr の JSON 出力とセッションレジストリのパース |
 
 ## インストール
 
@@ -64,6 +65,11 @@ wt open <task>
 wt list
     worktree と herdr workspace の対応を一覧表示
 
+wt peers [--json]
+    この repo の Claude Code セッション（本体 / 各 worktree）を一覧表示する。
+    name 列がセッション間メッセージ（SendMessage）の宛先。(self) は自分。
+    worktree 側は wt new が付ける固定名 wt-<task> になる
+
 wt merge [<task>] [--no-check]
     ブランチ worktree-<task> を本体の現在ブランチへマージする。
     worktree 内から task 省略で自分を対象にできる。コンフリクトは本体に残して中断。
@@ -93,6 +99,9 @@ wt new spike-cache --base release/2.0 --no-claude
 # 別の並列作業に切り替える / 作業一覧を見る
 wt open fix-login
 wt list
+
+# dev ↔ worktree のセッションの宛先を確認する（会話の相手を探す）
+wt peers
 
 # worktree の中から: 成果を本体に取り込み、自分を片付ける
 wt merge   # scripts/check があれば実行してから本体の現在ブランチへマージ
@@ -161,7 +170,7 @@ npm test
 
 ## Claude Code 連携
 
-[`skills/`](skills/) に 7 つの skill を同梱しており、`install.sh` が `~/.claude/skills/` に配置する。dev（本体 checkout）側のセッションから作業を worktree に投げ、worktree 側のセッションでレビュー・取り込み・片付けを完結させる。
+[`skills/`](skills/) に 8 つの skill を同梱しており、`install.sh` が `~/.claude/skills/` に配置する。dev（本体 checkout）側のセッションから作業を worktree に投げ、worktree 側のセッションでレビュー・取り込み・片付けを完結させる。作業中は両者が直接会話できる。
 
 | skill | 実行する側 | 役割 |
 | --- | --- | --- |
@@ -170,6 +179,7 @@ npm test
 | `/wt-review` | worktree | マージ前に diff からレビュー用 HTML を生成してブラウザで開き、承認を待つ |
 | `/wt-merge` | worktree | 自分のブランチを本体の現在ブランチへマージ（`scripts/check` があればマージ前に実行。コンフリクトは報告して停止） |
 | `/wt-clean` | worktree | 未コミット・未マージを検査し、クリーンなら自分の worktree を片付けて workspace を閉じる |
+| `/wt-ask <内容>` | 両方 | `wt peers` で相手セッションの宛先を解決し、質問・報告を送って返答を受ける |
 | `worktree-parallel` | 両方 | `wt` と native worktree の使い分け方針・`.worktreeinclude` の契約（[skills/worktree-parallel/SKILL.md](skills/worktree-parallel/SKILL.md)） |
 | `local-artifact` | 両方 | Artifact と同一の設計規約で HTML を作り、claude.ai に publish せずローカル公開する契約（`/wt-review` が参照） |
 
@@ -181,6 +191,25 @@ dev 側:      /wt ログイン画面のバリデーション修正
 worktree 側: (実装・コミット) → /wt-review → (ユーザーがレビュー・承認) → /wt-merge → /wt-clean
               → 本体に取り込まれ、worktree / workspace / ブランチが消えて閉じる
 ```
+
+### セッション間の会話（dev ↔ worktree）
+
+worktree 側と dev 側のセッションは、Claude Code のセッション間メッセージ（`ListAgents` / `SendMessage`）で直接会話できる。仕組み自体は Claude Code 側にあり（レジストリは `<config>/sessions/<pid>.json`、その `name` が宛先）、`wt` が担うのは**宛先の決定**だけ。
+
+- `wt new` は `claude -n wt-<task>` で起動するので、**worktree 側の宛先名は `wt-<task>` に固定**される。dev 側は task 名だけで宛先を決められる
+- dev 側の名前は Claude Code の自動命名（`<ディレクトリ名>-<2 文字>`）。`wt peers` の `role=dev` 行で引く
+- `wt peers` はこの repo（本体 + 全 worktree）に属する**生存中の**セッションだけを role 付きで一覧する（死んだセッションのレジストリファイルは残るため）
+
+```
+$ wt peers
+ROLE                 NAME                     KIND         STATUS   SELF   CWD
+dev                  wt-92                    interactive  busy     (self) /home/you/projects/wt
+fix-login            wt-fix-login             interactive  idle            /home/you/projects/wt/.claude/worktrees/fix-login
+```
+
+想定する使い方は「worktree 側が仕様の判断を dev 側に仰ぐ」「dev 側が方針変更や追加情報を伝える」。`/wt` と `/wt-detail` は初期プロンプトに「判断に迷ったら勝手に決めず dev 側に聞く」を含めるため、worktree 側は独断で進める代わりに聞いてくる。送受信の作法は `/wt-ask` に集約している。
+
+古い Claude Code で起動されたセッションは peer レジストリに載らないため会話できない（`wt peers` にも `ListAgents` にも出てこない）。
 
 ## 既知の注意点
 

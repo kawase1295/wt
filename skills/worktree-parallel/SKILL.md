@@ -13,6 +13,7 @@ wt new <task> [--base <ref>] [--no-claude] [--prompt <text>|--prompt-file <path>
 wt bootstrap [<path>]                        # 既存 worktree に欠落ファイルを補完
 wt open <task>                               # 既存 worktree を workspace として開き直す
 wt list                                      # worktree ↔ workspace の対応一覧
+wt peers [--json]                            # この repo の Claude Code セッション一覧 (会話の宛先)
 wt merge [<task>]                            # worktree ブランチを本体の現在ブランチへマージ
 wt rm [<task>] [--force]                     # worktree / workspace / ブランチを削除
 ```
@@ -20,7 +21,7 @@ wt rm [<task>] [--force]                     # worktree / workspace / ブラン�
 - worktree は native と同じ `<repo>/.claude/worktrees/<task名>` に、ブランチ `worktree-<task名>` で作られる (`WT_HOME` を設定すると従来の集約置き場 `$WT_HOME/<repo名>/<task名>`)。
 - `--base` 省略時は本体 checkout の現在ブランチから分岐する。
 - `--prompt` / `--prompt-file` は worktree 側で起動する Claude Code への初期プロンプト。herdr サーバが無いとプロンプトを渡せないため die する。
-- worktree 側の claude は既定で `--model opus --permission-mode auto` 付きで起動する（`WT_CLAUDE_ARGS` で差し替え、空文字でフラグ無し）。
+- worktree 側の claude は既定で `-n wt-<task> --model opus --permission-mode auto` 付きで起動する（`WT_CLAUDE_ARGS` で差し替え、空文字でフラグ無し。`-n` は常に付き、`WT_CLAUDE_ARGS` 側の `-n` が後勝ちで上書きする）。
 - `merge` / `rm` は worktree 内から task 省略で実行でき、自分の worktree を対象にする（worktree 側セッションの `/wt-merge` `/wt-clean` が使う）。
 - herdr サーバが起動していなければ git worktree の作成だけにフォールバックする。
 
@@ -52,6 +53,17 @@ repo 固有処理 (repo の `scripts/worktree-setup`、実行可能ファイル)
 - 典型的な内容: gitignore された secrets/credentials の symlink 共有、ローカル DB のコピー独立、native addon の補完
 - monorepo での参照実装イメージ: gitignore された config の symlink・環境固有ファイルの symlink 再生成・各パッケージ (`client` / `infra` 等) の `npm ci`・Python パッケージの `uv sync` を 1 つのフックにまとめる
 
+## セッション間の会話 (dev ↔ worktree)
+
+worktree 側セッションと dev 側セッションは、Claude Code のセッション間メッセージ (`ListAgents` / `SendMessage`) で直接会話できる。仕組みは Claude Code 側にあり (レジストリは `<config>/sessions/<pid>.json`、`name` が宛先)、wt が担うのは**宛先の決定**だけ。
+
+- `wt new` は `claude -n wt-<task>` で起動するので、**worktree 側セッションの宛先名は `wt-<task>` に固定**される。dev 側は task 名から宛先を決められる。
+- dev 側セッションの名前は Claude Code の自動命名（`<ディレクトリ名>-<2 文字>`）。`wt peers` の `role=dev` 行で引く。
+- `wt peers` はこの repo（本体 + 全 worktree）に属する**生存中の**セッションを role (`dev` / task 名) 付きで一覧する。死んだセッションのレジストリファイルは残るので生存を確認し、cwd が worktree のサブディレクトリでも正しく分類する。`--json` で機械可読。
+- 送受信の作法（宛先解決、初回の `[ref]` 再送、返信は `from` を使う、権限の回し合いをしない）は skill `/wt-ask` に集約する。
+
+peer レジストリに載らないセッション（古い Claude Code で起動したもの、既に終了したもの）とは会話できない。`wt peers` にも `ListAgents` にも出てこなければ宛先にできないので、レビューページやコミットメッセージ経由の受け渡しに切り替える。
+
 ## 既知の注意点
 
 - `~/.npmrc` に `ignore-scripts=true` があると、`npm ci` だけでは native addon (better-sqlite3 等) がビルドされない。フックで `npm rebuild <pkg> --ignore-scripts=false --foreground-scripts` するか、本体のビルド済み `.node` をコピーする。
@@ -63,12 +75,13 @@ repo 固有処理 (repo の `scripts/worktree-setup`、実行可能ファイル)
 
 ## slash command skill
 
-wt repo は 5 つのコマンド skill を同梱し、install.sh が `~/.claude/skills/` に配置する。
+wt repo は 6 つのコマンド skill を同梱し、install.sh が `~/.claude/skills/` に配置する。
 
 | skill | 実行する側 | 役割 |
 | --- | --- | --- |
 | `/wt <作業内容>` | dev (本体) | worktree 名を生成し、初期プロンプト付きで worktree + Claude を起動 |
 | `/wt-detail <作業内容>` | dev (本体) | コード調査して実装プランを作り、プランを初期プロンプトとして worktree に渡す |
+| `/wt-ask <内容>` | 両方 | `wt peers` で宛先を解決し、相手セッションに質問・報告を送る |
 | `/wt-review` | worktree | 変更の diff からレビュー用 HTML を生成してブラウザで開き、マージ承認を待つ |
 | `/wt-merge` | worktree | 自分のブランチを本体の現在ブランチへマージ（レビュー指示があれば承認後） |
 | `/wt-clean` | worktree | 未コミット・未マージを検査し、クリーンなら自分の worktree を片付けて閉じる |

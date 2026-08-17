@@ -16,6 +16,10 @@
 #       既存 worktree を herdr workspace として開き直す
 #   wt list
 #       worktree と herdr workspace の対応を一覧表示
+#   wt peers [--json]
+#       この repo の Claude Code セッション (本体 / 各 worktree) を一覧表示する。
+#       name 列がセッション間メッセージ (SendMessage) の宛先。(self) は自分。
+#       worktree 側は wt new が付ける固定名 wt-<task> になる (要 jq)
 #   wt merge [<task>] [--no-check]
 #       ブランチ worktree-<task> を本体の現在ブランチへマージする。
 #       worktree 内から task 省略で自分を対象にできる。コンフリクトは本体に残す。
@@ -80,6 +84,107 @@ infer_task() { # cmdname
     worktree-*) printf '%s' "${cur#worktree-}" ;;
     *) die "$1: task を指定する (worktree 外からは wt $1 <task>)" ;;
   esac
+}
+
+# Claude Code のセッションレジストリ (<config>/sessions/<pid>.json) の置き場。
+# 各ファイルに cwd / name (セッション名) / kind / status が入っており、
+# name がセッション間メッセージ (SendMessage) の宛先になる。
+sessions_dir() {
+  printf '%s/sessions' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+}
+
+# 自分の祖先 pid を列挙する。wt を呼んだ Claude Code セッション本体を
+# 特定して (self) を付けるために使う。ps が無ければ空を返し self 判定を諦める。
+ancestor_pids() {
+  local pid="${PPID:-0}" depth=0
+  while [ "$depth" -lt 20 ]; do
+    case "$pid" in '' | *[!0-9]*) return 0 ;; esac
+    [ "$pid" -gt 1 ] || return 0
+    printf '%s\n' "$pid"
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" || return 0
+    depth=$((depth + 1))
+  done
+}
+
+# この repo に属する生存中の Claude Code セッションを列挙する。
+# 本体 checkout は role=dev、worktree は role=<task>。cwd が worktree の
+# サブディレクトリでも分類できるよう、パスは長い順の前方一致で照合する。
+# 死んだセッションのレジストリファイルは残るため kill -0 で生存を確かめる。
+cmd_peers() {
+  local as_json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1 ;;
+      -*) die "peers: 不明なオプション $1" ;;
+      *) die "peers: 位置引数は取らない: $1" ;;
+    esac
+    shift
+  done
+  resolve_repo
+  command -v jq >/dev/null 2>&1 || die "peers には jq が必要"
+
+  local dir
+  dir="$(sessions_dir)"
+  [ -d "$dir" ] || die "Claude Code のセッションレジストリが無い: $dir"
+
+  local pathmap
+  pathmap="$(git -C "$MAIN_ROOT" worktree list --porcelain | awk -v main="$MAIN_ROOT" '
+    function flush() {
+      if (p == "") return
+      role = (p == main) ? "dev" : (b ~ /^worktree-/ ? substr(b, 10) : "")
+      if (role == "") { n = split(p, a, "/"); role = a[n] }
+      printf "%d\t%s\t%s\n", length(p), p, role
+    }
+    /^worktree / { flush(); p = substr($0, 10); b = ""; next }
+    /^branch /   { b = $2; sub(/^refs\/heads\//, "", b); next }
+    END          { flush() }
+  ' | sort -rn | cut -f2-)"
+
+  local self_pids
+  self_pids=" $(ancestor_pids | tr '\n' ' ') "
+
+  local rows="" f pid meta cwd name kind status role selfmark p r
+  for f in "$dir"/*.json; do
+    [ -f "$f" ] || continue
+    pid="${f##*/}"
+    pid="${pid%.json}"
+    case "$pid" in '' | *[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null || continue
+    meta="$(jq -r '[.cwd // "", .name // "", .kind // "", .status // ""] | @tsv' "$f" 2>/dev/null)" || continue
+    IFS=$'\t' read -r cwd name kind status <<<"$meta" || continue
+    [ -n "$cwd" ] || continue
+    role=""
+    while IFS=$'\t' read -r p r; do
+      [ -n "$p" ] || continue
+      case "$cwd/" in "$p"/*)
+        role="$r"
+        break
+        ;;
+      esac
+    done <<<"$pathmap"
+    [ -n "$role" ] || continue
+    selfmark=no
+    case "$self_pids" in *" $pid "*) selfmark=yes ;; esac
+    rows="$rows$role	${name:--}	${kind:--}	${status:--}	$selfmark	$pid	$cwd
+"
+  done
+
+  if [ "$as_json" -eq 1 ]; then
+    printf '%s' "$rows" | jq -R -s 'split("\n") | map(select(length > 0) | split("\t")) |
+      map({role: .[0], name: (if .[1] == "-" then null else .[1] end), kind: .[2],
+           status: .[3], self: (.[4] == "yes"), pid: (.[5] | tonumber), cwd: .[6]})'
+    return 0
+  fi
+
+  if [ -z "$rows" ]; then
+    log "この repo の Claude Code セッションは見つからなかった"
+    return 0
+  fi
+  printf '%-20s %-24s %-12s %-8s %-6s %s\n' ROLE NAME KIND STATUS SELF CWD
+  printf '%s' "$rows" | while IFS=$'\t' read -r role name kind status selfmark _ cwd; do
+    printf '%-20s %-24s %-12s %-8s %-6s %s\n' \
+      "$role" "$name" "$kind" "$status" "$(if [ "$selfmark" = yes ]; then printf '(self)'; fi)" "$cwd"
+  done
 }
 
 # worktree ブランチを削除する。未マージなら残して案内する (既存挙動)。
@@ -252,7 +357,11 @@ cmd_new() {
     # prompt は argv 1 要素のまま herdr の -- パススルーで claude に渡る。
     # 起動フラグは WT_CLAUDE_ARGS で差し替え可能。単語分割で argv 化するため、
     # 空白を含む値 (引用符付きフラグ) はサポートしない。
-    local -a claude_cmd=(claude) claude_flags=()
+    # -n はセッション名を wt-<task> に固定する。この名前が Claude Code の
+    # セッション間メッセージ (SendMessage) の宛先になるため、dev 側は worktree の
+    # task 名から宛先を決定できる (wt peers 参照)。WT_CLAUDE_ARGS に -n を
+    # 含めれば後勝ちで上書きされる。
+    local -a claude_cmd=(claude -n "wt-$task") claude_flags=()
     read -r -a claude_flags <<<"${WT_CLAUDE_ARGS---model opus --permission-mode auto}"
     [ "${#claude_flags[@]}" -gt 0 ] && claude_cmd+=("${claude_flags[@]}")
     [ -n "$prompt" ] && claude_cmd+=("$prompt")
@@ -448,6 +557,10 @@ case "${1:-}" in
   list)
     shift
     cmd_list "$@"
+    ;;
+  peers)
+    shift
+    cmd_peers "$@"
     ;;
   rm)
     shift

@@ -355,25 +355,34 @@ STUB
   (cd "$R21" && env -u WT_HOME -u WT_CLAUDE_ARGS HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21" \
     PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21 --prompt "hello world") >/dev/null 2>&1
   argc="$(wc -l <"$LOG21" 2>/dev/null | tr -d ' ')"
-  assert_eq "stub: agent start の argv が claude + 既定フラグ + prompt の 6 要素" "6" "$argc"
+  assert_eq "stub: agent start の argv が claude + -n + 既定フラグ + prompt の 8 要素" "8" "$argc"
   assert_eq "stub: argv[0] が claude" "claude" "$(sed -n 1p "$LOG21" 2>/dev/null)"
+  assert_eq "stub: セッション名を -n wt-<task> に固定する" \
+    "-n wt-p21" "$(sed -n 2,3p "$LOG21" 2>/dev/null | paste -sd' ' -)"
   assert_eq "stub: 既定フラグが --model opus --permission-mode auto" \
-    "--model opus --permission-mode auto" "$(sed -n 2,5p "$LOG21" 2>/dev/null | paste -sd' ' -)"
-  assert_eq "stub: 末尾 argv が prompt 全体 (分割されない)" "hello world" "$(sed -n 6p "$LOG21" 2>/dev/null)"
+    "--model opus --permission-mode auto" "$(sed -n 4,7p "$LOG21" 2>/dev/null | paste -sd' ' -)"
+  assert_eq "stub: 末尾 argv が prompt 全体 (分割されない)" "hello world" "$(sed -n 8p "$LOG21" 2>/dev/null)"
 
-  # WT_CLAUDE_ARGS でフラグを差し替える
+  # WT_CLAUDE_ARGS でフラグを差し替える (-n は残る)
   LOG21B="$TMP/agent-argv-b.log"
   (cd "$R21" && env -u WT_HOME HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21B" WT_CLAUDE_ARGS="--model sonnet" \
     PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21b --prompt "hi") >/dev/null 2>&1
   assert_eq "stub: WT_CLAUDE_ARGS でフラグを差し替えられる" \
-    "claude --model sonnet hi" "$(paste -sd' ' - <"$LOG21B" 2>/dev/null)"
+    "claude -n wt-p21b --model sonnet hi" "$(paste -sd' ' - <"$LOG21B" 2>/dev/null)"
 
-  # WT_CLAUDE_ARGS="" (空文字) でフラグ無し
+  # WT_CLAUDE_ARGS="" (空文字) でフラグ無し (-n は残る)
   LOG21C="$TMP/agent-argv-c.log"
   (cd "$R21" && env -u WT_HOME HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21C" WT_CLAUDE_ARGS="" \
     PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21c --prompt "hi") >/dev/null 2>&1
-  assert_eq "stub: WT_CLAUDE_ARGS 空文字でフラグ無し" \
-    "claude hi" "$(paste -sd' ' - <"$LOG21C" 2>/dev/null)"
+  assert_eq "stub: WT_CLAUDE_ARGS 空文字でもセッション名は付く" \
+    "claude -n wt-p21c hi" "$(paste -sd' ' - <"$LOG21C" 2>/dev/null)"
+
+  # WT_CLAUDE_ARGS の -n は既定名より後ろに置かれ、claude 側で後勝ちになる
+  LOG21D="$TMP/agent-argv-d.log"
+  (cd "$R21" && env -u WT_HOME HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21D" WT_CLAUDE_ARGS="-n custom" \
+    PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21d --prompt "hi") >/dev/null 2>&1
+  assert_eq "stub: WT_CLAUDE_ARGS の -n が既定名より後に来る" \
+    "claude -n wt-p21d -n custom hi" "$(paste -sd' ' - <"$LOG21D" 2>/dev/null)"
 else
   pass "stub: jq が無いためスキップ"
 fi
@@ -384,13 +393,13 @@ H22="$TMP/home22"
 mkdir -p "$H22"
 env HOME="$H22" PREFIX="$TMP/bin22" PATH="$SAFE_PATH" bash "$INSTALL" >/dev/null 2>&1
 ok22=1
-for s in worktree-parallel wt wt-detail wt-review wt-merge wt-clean local-artifact; do
+for s in worktree-parallel wt wt-detail wt-review wt-merge wt-clean wt-ask local-artifact; do
   [ -f "$H22/.claude/skills/$s/SKILL.md" ] || ok22=0
 done
 if [ "$ok22" -eq 1 ]; then
-  pass "install: skills 7 個を ~/.claude/skills に配置する"
+  pass "install: skills 8 個を ~/.claude/skills に配置する"
 else
-  fail "install: skills 7 個を ~/.claude/skills に配置する"
+  fail "install: skills 8 個を ~/.claude/skills に配置する"
 fi
 H22B="$TMP/home22b"
 mkdir -p "$H22B"
@@ -567,6 +576,104 @@ if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q '引数が多すぎる'; then
   pass "merge: 引数が多すぎる場合は中断する"
 else
   fail "merge: 引数が多すぎる場合は中断する (rc=$rc out=$out)"
+fi
+
+# --- test 29: peers は repo 内の生存セッションを role 付きで列挙する ---
+# Claude Code のセッションレジストリ (<config>/sessions/<pid>.json) を偽装して検証する。
+if [ -x /usr/bin/jq ]; then
+  R29="$TMP/repo29"
+  new_repo "$R29"
+  wt_local "$R29" new p29 --no-claude >/dev/null 2>&1
+  W29="$R29/.claude/worktrees/p29"
+  mkdir -p "$W29/sub" "$TMP/home/.claude/sessions" "$TMP/outside"
+
+  # 生存 pid を確保する (他セッションの見立て)
+  sleep 300 &
+  A29=$!
+  sleep 300 &
+  B29=$!
+  sleep 300 &
+  C29=$!
+  # 確実に死んでいる pid
+  sleep 0 &
+  D29=$!
+  wait "$D29" 2>/dev/null
+
+  reg29() { # pid cwd name
+    printf '{"pid":%s,"cwd":"%s","name":"%s","kind":"interactive","status":"idle"}\n' \
+      "$1" "$2" "$3" >"$TMP/home/.claude/sessions/$1.json"
+  }
+  reg29 "$$" "$R29" "dev-session"        # テスト自身は wt の祖先 → (self) が付く
+  reg29 "$A29" "$W29" "wt-p29"
+  reg29 "$B29" "$W29/sub" "wt-p29-deep"  # worktree のサブディレクトリ
+  reg29 "$C29" "$TMP/outside" "outsider" # repo 外
+  reg29 "$D29" "$R29" "dead-session"     # 死んだ pid
+
+  peers29() { # cwd args...
+    local d="$1"
+    shift
+    (cd "$d" && env -u WT_HOME -u CLAUDE_CONFIG_DIR HOME="$TMP/home" PATH="$SAFE_PATH" "$WT" peers "$@")
+  }
+  out29="$(peers29 "$R29" --json 2>/dev/null)"
+  peer_field() { printf '%s' "$out29" | jq -r ".[] | select(.name==\"$1\") | .$2"; }
+  assert_eq "peers: repo 内の生存セッションだけを返す" "3" "$(printf '%s' "$out29" | jq 'length')"
+  assert_eq "peers: 本体 checkout は role=dev" "dev" "$(peer_field dev-session role)"
+  assert_eq "peers: worktree は role=<task>" "p29" "$(peer_field wt-p29 role)"
+  assert_eq "peers: worktree のサブディレクトリも worktree に分類する" "p29" "$(peer_field wt-p29-deep role)"
+  assert_eq "peers: 自分の行は self=true" "true" "$(peer_field dev-session self)"
+  assert_eq "peers: 他セッションは self=false" "false" "$(peer_field wt-p29 self)"
+  assert_eq "peers: 死んだセッションを除外する" "" "$(peer_field dead-session name)"
+  assert_eq "peers: repo 外のセッションを除外する" "" "$(peer_field outsider name)"
+  assert_eq "peers: worktree 内から実行しても本体セッションが見える" "dev" \
+    "$(peers29 "$W29" --json 2>/dev/null | jq -r '.[] | select(.name=="dev-session") | .role')"
+
+  # pipefail 下で `peers29 | grep -q` は grep の早期終了で wt が SIGPIPE を受け、
+  # パイプライン全体が非 0 になる。判定は変数に取ってから行う。
+  txt29="$(peers29 "$R29" 2>&1)"
+  if printf '%s' "$txt29" | grep -q '(self)'; then
+    pass "peers: テキスト出力に (self) を付ける"
+  else
+    fail "peers: テキスト出力に (self) を付ける (out=$txt29)"
+  fi
+
+  # CLAUDE_CONFIG_DIR を優先する
+  mkdir -p "$TMP/altconfig/sessions"
+  printf '{"pid":%s,"cwd":"%s","name":"alt-session","kind":"interactive","status":"idle"}\n' \
+    "$$" "$R29" >"$TMP/altconfig/sessions/$$.json"
+  alt29="$(cd "$R29" && env -u WT_HOME HOME="$TMP/home" CLAUDE_CONFIG_DIR="$TMP/altconfig" \
+    PATH="$SAFE_PATH" "$WT" peers --json 2>/dev/null)"
+  assert_eq "peers: CLAUDE_CONFIG_DIR のレジストリを見る" "alt-session" \
+    "$(printf '%s' "$alt29" | jq -r '.[0].name')"
+
+  # レジストリが無ければ中断する
+  H29="$TMP/home29"
+  mkdir -p "$H29"
+  out="$(cd "$R29" && env -u WT_HOME -u CLAUDE_CONFIG_DIR HOME="$H29" PATH="$SAFE_PATH" "$WT" peers 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'レジストリ'; then
+    pass "peers: セッションレジストリが無ければ中断する"
+  else
+    fail "peers: セッションレジストリが無ければ中断する (rc=$rc out=$out)"
+  fi
+
+  out="$(peers29 "$R29" --bogus 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q '不明なオプション'; then
+    pass "peers: 不明なオプションを弾く"
+  else
+    fail "peers: 不明なオプションを弾く (rc=$rc out=$out)"
+  fi
+  out="$(peers29 "$R29" extra 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q '位置引数'; then
+    pass "peers: 位置引数を弾く"
+  else
+    fail "peers: 位置引数を弾く (rc=$rc out=$out)"
+  fi
+
+  kill "$A29" "$B29" "$C29" 2>/dev/null
+else
+  pass "peers: jq が無いためスキップ"
 fi
 
 if [ "$FAILED" -eq 0 ]; then

@@ -175,7 +175,7 @@ npm test
 | skill | 実行する側 | 役割 |
 | --- | --- | --- |
 | `/wt <作業内容>` | dev | worktree 名を生成し、作業内容を初期プロンプトとして worktree + Claude Code を起動 |
-| `/wt-detail <作業内容>` | dev | コードベースを調査して実装プランを作り、プランを初期プロンプトとして worktree に渡す |
+| `/wt-detail <作業内容>` | dev | コードベースを調査し、仕様の不明点をユーザーに確認してから実装プランを作り、初期プロンプトとして worktree に渡す |
 | `/wt-review` | worktree | マージ前に diff からレビュー用 HTML を生成してブラウザで開き、承認を待つ |
 | `/wt-merge` | worktree | 自分のブランチを本体の現在ブランチへマージ（`scripts/check` があればマージ前に実行。コンフリクトは報告して停止） |
 | `/wt-clean` | worktree | 未コミット・未マージを検査し、クリーンなら自分の worktree を片付けて workspace を閉じる |

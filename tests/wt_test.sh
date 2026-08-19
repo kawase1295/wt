@@ -310,6 +310,8 @@ else
 fi
 
 # --- test 21: fake herdr で claude の起動 argv を検証する ---
+# 新しい herdr API では実行ファイルを argv で渡さず、agent start <name>
+# --kind claude --pane <root pane> -- <claude の引数> で起動する。
 # 既定で --model opus --permission-mode auto が入り、--prompt は argv 1 要素のまま渡る。
 # WT_CLAUDE_ARGS でフラグを差し替えられ、空文字ならフラグ無しになる。
 if [ -x /usr/bin/jq ]; then
@@ -317,7 +319,8 @@ if [ -x /usr/bin/jq ]; then
   cat >"$TMP/bin/herdr" <<'STUB'
 #!/usr/bin/env bash
 # テスト用 herdr スタブ。worktree create は実際に git worktree を作り、
-# agent start は -- 以降の argv を 1 行 1 要素で HERDR_ARGV_LOG に記録する。
+# workspace / root pane を返す。agent start は受け取った argv 全体を
+# 1 行 1 要素で HERDR_ARGV_LOG に記録する。
 set -euo pipefail
 cmd="${1:-} ${2:-}"
 case "$cmd" in
@@ -336,12 +339,10 @@ case "$cmd" in
       shift
     done
     git -C "$cwd" worktree add -q -b "$branch" "$path" "$base" >&2
-    printf '{"result":{"workspace":{"workspace_id":"ws-stub"},"worktree":{"path":"%s"}}}\n' "$path"
+    printf '{"result":{"workspace":{"workspace_id":"ws-stub"},"root_pane":{"pane_id":"ws-stub:p1"},"worktree":{"path":"%s"}}}\n' "$path"
     ;;
   "agent start")
     shift 2
-    while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done
-    shift
     : >"$HERDR_ARGV_LOG"
     for a in "$@"; do printf '%s\n' "$a" >>"$HERDR_ARGV_LOG"; done
     ;;
@@ -349,40 +350,48 @@ case "$cmd" in
 esac
 STUB
   chmod +x "$TMP/bin/herdr"
+  # ログから herdr agent start のオプション部 / -- 以降の claude 引数を取り出す
+  herdr_opts_of() { awk '$0=="--"{exit} {print}' "$1" 2>/dev/null; }
+  claude_args_of() { awk 'f{print} $0=="--"{f=1}' "$1" 2>/dev/null; }
+
   R21="$TMP/repo21"
   new_repo "$R21"
   LOG21="$TMP/agent-argv.log"
   (cd "$R21" && env -u WT_HOME -u WT_CLAUDE_ARGS HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21" \
     PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21 --prompt "hello world") >/dev/null 2>&1
-  argc="$(wc -l <"$LOG21" 2>/dev/null | tr -d ' ')"
-  assert_eq "stub: agent start の argv が claude + -n + 既定フラグ + prompt の 8 要素" "8" "$argc"
-  assert_eq "stub: argv[0] が claude" "claude" "$(sed -n 1p "$LOG21" 2>/dev/null)"
+  assert_eq "stub: agent start は名前 + --kind claude + worktree の root pane を渡す" \
+    "claude-p21 --kind claude --pane ws-stub:p1" "$(herdr_opts_of "$LOG21" | paste -sd' ' -)"
+  argc="$(claude_args_of "$LOG21" | wc -l | tr -d ' ')"
+  assert_eq "stub: claude 引数が -n + 既定フラグ + prompt の 7 要素" "7" "$argc"
+  assert_eq "stub: 実行ファイル名は argv に含めず --kind に委ねる" \
+    "0" "$(claude_args_of "$LOG21" | grep -c '^claude$')"
   assert_eq "stub: セッション名を -n wt-<task> に固定する" \
-    "-n wt-p21" "$(sed -n 2,3p "$LOG21" 2>/dev/null | paste -sd' ' -)"
+    "-n wt-p21" "$(claude_args_of "$LOG21" | sed -n 1,2p | paste -sd' ' -)"
   assert_eq "stub: 既定フラグが --model opus --permission-mode auto" \
-    "--model opus --permission-mode auto" "$(sed -n 4,7p "$LOG21" 2>/dev/null | paste -sd' ' -)"
-  assert_eq "stub: 末尾 argv が prompt 全体 (分割されない)" "hello world" "$(sed -n 8p "$LOG21" 2>/dev/null)"
+    "--model opus --permission-mode auto" "$(claude_args_of "$LOG21" | sed -n 3,6p | paste -sd' ' -)"
+  assert_eq "stub: 末尾 argv が prompt 全体 (分割されない)" \
+    "hello world" "$(claude_args_of "$LOG21" | sed -n 7p)"
 
   # WT_CLAUDE_ARGS でフラグを差し替える (-n は残る)
   LOG21B="$TMP/agent-argv-b.log"
   (cd "$R21" && env -u WT_HOME HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21B" WT_CLAUDE_ARGS="--model sonnet" \
     PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21b --prompt "hi") >/dev/null 2>&1
   assert_eq "stub: WT_CLAUDE_ARGS でフラグを差し替えられる" \
-    "claude -n wt-p21b --model sonnet hi" "$(paste -sd' ' - <"$LOG21B" 2>/dev/null)"
+    "-n wt-p21b --model sonnet hi" "$(claude_args_of "$LOG21B" | paste -sd' ' -)"
 
   # WT_CLAUDE_ARGS="" (空文字) でフラグ無し (-n は残る)
   LOG21C="$TMP/agent-argv-c.log"
   (cd "$R21" && env -u WT_HOME HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21C" WT_CLAUDE_ARGS="" \
     PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21c --prompt "hi") >/dev/null 2>&1
   assert_eq "stub: WT_CLAUDE_ARGS 空文字でもセッション名は付く" \
-    "claude -n wt-p21c hi" "$(paste -sd' ' - <"$LOG21C" 2>/dev/null)"
+    "-n wt-p21c hi" "$(claude_args_of "$LOG21C" | paste -sd' ' -)"
 
   # WT_CLAUDE_ARGS の -n は既定名より後ろに置かれ、claude 側で後勝ちになる
   LOG21D="$TMP/agent-argv-d.log"
   (cd "$R21" && env -u WT_HOME HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21D" WT_CLAUDE_ARGS="-n custom" \
     PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21d --prompt "hi") >/dev/null 2>&1
   assert_eq "stub: WT_CLAUDE_ARGS の -n が既定名より後に来る" \
-    "claude -n wt-p21d -n custom hi" "$(paste -sd' ' - <"$LOG21D" 2>/dev/null)"
+    "-n wt-p21d -n custom hi" "$(claude_args_of "$LOG21D" | paste -sd' ' -)"
 else
   pass "stub: jq が無いためスキップ"
 fi

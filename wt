@@ -338,12 +338,14 @@ cmd_new() {
   git -C "$MAIN_ROOT" rev-parse --verify --quiet "$base^{commit}" >/dev/null ||
     die "base ref が見つからない: $base"
 
-  local path="$WT_DIR/$task" ws=""
+  local path="$WT_DIR/$task" ws="" pane=""
   if herdr_ok; then
     local out
     out="$(herdr worktree create --cwd "$MAIN_ROOT" --branch "$branch" --base "$base" \
-      --path "$path" --label "$task" --no-focus --json)"
+      --path "$path" --label "$task" --no-focus)"
     ws="$(jq -r '.result.workspace.workspace_id' <<<"$out")"
+    # agent start は既存 pane を要求するため、workspace の root pane を押さえておく
+    pane="$(jq -r '.result.root_pane.pane_id // empty' <<<"$out")"
     path="$(jq -r '.result.worktree.path' <<<"$out")"
     log "worktree + workspace $ws 作成: $path ($branch ← $base)"
   else
@@ -354,18 +356,22 @@ cmd_new() {
   cmd_bootstrap "$path"
 
   if [ -n "$ws" ] && [ "$start_claude" -eq 1 ]; then
-    # prompt は argv 1 要素のまま herdr の -- パススルーで claude に渡る。
+    [ -n "$pane" ] ||
+      die "new: workspace $ws の root pane を特定できなかった (herdr agent start に渡す pane が必要)"
+    # 実行ファイルは --kind が決めるので argv には渡さない。-- 以降が claude の
+    # 引数になり、prompt は argv 1 要素のまま渡る。
     # 起動フラグは WT_CLAUDE_ARGS で差し替え可能。単語分割で argv 化するため、
     # 空白を含む値 (引用符付きフラグ) はサポートしない。
     # -n はセッション名を wt-<task> に固定する。この名前が Claude Code の
     # セッション間メッセージ (SendMessage) の宛先になるため、dev 側は worktree の
     # task 名から宛先を決定できる (wt peers 参照)。WT_CLAUDE_ARGS に -n を
     # 含めれば後勝ちで上書きされる。
-    local -a claude_cmd=(claude -n "wt-$task") claude_flags=()
+    local -a claude_args=(-n "wt-$task") claude_flags=()
     read -r -a claude_flags <<<"${WT_CLAUDE_ARGS---model opus --permission-mode auto}"
-    [ "${#claude_flags[@]}" -gt 0 ] && claude_cmd+=("${claude_flags[@]}")
-    [ -n "$prompt" ] && claude_cmd+=("$prompt")
-    herdr agent start "claude-$task" --workspace "$ws" --cwd "$path" --no-focus -- "${claude_cmd[@]}"
+    [ "${#claude_flags[@]}" -gt 0 ] && claude_args+=("${claude_flags[@]}")
+    [ -n "$prompt" ] && claude_args+=("$prompt")
+    herdr agent start "claude-$task" --kind claude --pane "$pane" -- "${claude_args[@]}" >/dev/null ||
+      die "new: Claude Code の起動に失敗した (herdr が古い場合は herdr update)"
     herdr workspace focus "$ws" >/dev/null
     log "Claude Code を workspace $ws で起動した"
   fi
@@ -378,7 +384,7 @@ cmd_open() {
   resolve_repo
   herdr_ok || die "herdr サーバに接続できない"
   local out ws branch="worktree-$task"
-  out="$(herdr worktree open --cwd "$MAIN_ROOT" --branch "$branch" --label "$task" --no-focus --json)"
+  out="$(herdr worktree open --cwd "$MAIN_ROOT" --branch "$branch" --label "$task" --no-focus)"
   ws="$(jq -r '.result.workspace.workspace_id' <<<"$out")"
   herdr workspace focus "$ws" >/dev/null
   log "workspace $ws で開いた: $task"
@@ -389,7 +395,7 @@ cmd_list() {
   git -C "$MAIN_ROOT" worktree list
   if herdr_ok; then
     echo "--- herdr workspaces ---"
-    herdr worktree list --cwd "$MAIN_ROOT" --json |
+    herdr worktree list --cwd "$MAIN_ROOT" |
       jq -r '.result.worktrees[] | select(.open_workspace_id) | "\(.open_workspace_id)\t\(.branch)\t\(.path)"'
   fi
 }
@@ -436,7 +442,7 @@ cmd_rm() {
 
   local ws=""
   if herdr_ok; then
-    ws="$(herdr worktree list --cwd "$MAIN_ROOT" --json |
+    ws="$(herdr worktree list --cwd "$MAIN_ROOT" |
       jq -r --arg p "$path" '.result.worktrees[] | select(.path == $p) | .open_workspace_id // empty')"
   fi
 
@@ -457,9 +463,9 @@ cmd_rm() {
 
   if [ -n "$ws" ]; then
     if [ "$force" -eq 1 ]; then
-      herdr worktree remove --workspace "$ws" --force --json >/dev/null
+      herdr worktree remove --workspace "$ws" --force >/dev/null
     else
-      herdr worktree remove --workspace "$ws" --json >/dev/null
+      herdr worktree remove --workspace "$ws" >/dev/null
     fi
     log "workspace $ws と worktree を削除した"
   else

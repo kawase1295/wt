@@ -20,7 +20,7 @@ git worktree と [herdr](https://github.com/) workspace を一体で管理し、
 | --- | --- | --- |
 | bash 4+ | 必須 | 本体 |
 | git | 必須 | worktree 操作 |
-| [herdr](https://github.com/) | 任意 | workspace / エージェント起動（無ければ git worktree のみ） |
+| [herdr](https://github.com/) | 任意 | workspace / エージェント起動（無ければ git worktree のみ）。socket API の `worktree` / `agent start` を使うため herdr 0.8（socket API protocol 19）で検証している |
 | jq | herdr 使用時と `wt peers` で必須 | herdr の JSON 出力とセッションレジストリのパース |
 
 ## インストール

@@ -70,9 +70,35 @@ resolve_repo() {
   fi
 }
 
-# herdr サーバが起動していて socket API が使えるか
+# wt が検証済みの herdr CLI 系列。herdr は 0.x の間、マイナー更新で CLI 契約が
+# 変わる (0.7→0.8 で worktree create / agent start が非互換になった実績)。
+# 系列外の herdr では途中で黙って壊れる代わりに herdr_ok で fail-fast する。
+# herdr に追随したら tests/wt_test.sh の stub と一緒にこの値を上げる。
+HERDR_SERIES="0.8"
+
+# herdr のバージョンが検証済み系列か確かめる。バージョンを報告しない herdr は
+# 判定しない (stub や旧版を殺さない)。WT_HERDR_SKIP_CHECK=1 で警告に緩和する
+# (herdr 更新直後、wt の追随前に一時的に使うための逃げ道)。
+check_herdr_series() {
+  local v
+  v="$(herdr --version 2>/dev/null | awk 'NR==1{print $NF}')" || true
+  case "$v" in
+    "" | "$HERDR_SERIES" | "$HERDR_SERIES".*) return 0 ;;
+  esac
+  if [ "${WT_HERDR_SKIP_CHECK:-0}" = "1" ]; then
+    log "警告: herdr $v は未検証 (検証済み: $HERDR_SERIES 系)。CLI 契約が変わっていると壊れる"
+    return 0
+  fi
+  die "herdr $v は wt の未検証バージョン (検証済み: $HERDR_SERIES 系)。herdr のマイナー更新は CLI 契約を壊すことがあるため中断する。wt を追随させて HERDR_SERIES を上げるか、一時的に WT_HERDR_SKIP_CHECK=1 で実行する"
+}
+
+# herdr サーバが起動していて socket API が使えるか。
+# herdr が居るのに系列外なら false ではなく die する (silent fallback で
+# git worktree だけ作られると、失敗と誤認した作り直しでブランチが衝突する)。
 herdr_ok() {
-  command -v herdr >/dev/null 2>&1 && herdr workspace list >/dev/null 2>&1
+  command -v herdr >/dev/null 2>&1 || return 1
+  check_herdr_series
+  herdr workspace list >/dev/null 2>&1
 }
 
 # cwd のブランチ worktree-<task> から task を推定する。

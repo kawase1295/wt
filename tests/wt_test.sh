@@ -324,6 +324,10 @@ if [ -x /usr/bin/jq ]; then
 set -euo pipefail
 cmd="${1:-} ${2:-}"
 case "$cmd" in
+  "--version"*)
+    printf 'herdr %s\n' "${HERDR_STUB_VERSION:-0.8.0}"
+    exit 0
+    ;;
   "workspace list") exit 0 ;;
   "worktree create")
     shift 2
@@ -683,6 +687,50 @@ if [ -x /usr/bin/jq ]; then
   kill "$A29" "$B29" "$C29" 2>/dev/null
 else
   pass "peers: jq が無いためスキップ"
+fi
+
+# --- test 30: herdr バージョン契約 (系列外は fail-fast、スキップ可、不明は通す) ---
+# herdr は 0.x の間マイナー更新で CLI 契約が変わる実績があるため、wt は検証済み
+# 系列 (HERDR_SERIES) 以外の herdr では黙って壊れる代わりに die する。
+if [ -x /usr/bin/jq ] && [ -x "$TMP/bin/herdr" ]; then
+  R30="$TMP/repo30"
+  new_repo "$R30"
+  out="$(cd "$R30" && env -u WT_HOME HOME="$TMP/home" HERDR_STUB_VERSION=0.9.0 \
+    PATH="$TMP/bin:$SAFE_PATH" "$WT" new v30 --no-claude 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q '未検証'; then
+    pass "herdr契約: 系列外バージョンで die する"
+  else
+    fail "herdr契約: 系列外バージョンで die する (rc=$rc out=$out)"
+  fi
+  assert_no_dir "$R30/.claude/worktrees/v30" "herdr契約: die 時は worktree を作らない"
+  if has_branch "$R30" "worktree-v30"; then
+    fail "herdr契約: die 時はブランチも作らない"
+  else
+    pass "herdr契約: die 時はブランチも作らない"
+  fi
+
+  out="$(cd "$R30" && env -u WT_HOME HOME="$TMP/home" HERDR_STUB_VERSION=0.9.0 WT_HERDR_SKIP_CHECK=1 \
+    PATH="$TMP/bin:$SAFE_PATH" "$WT" new v30b --no-claude 2>&1)"
+  rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '警告.*未検証'; then
+    pass "herdr契約: WT_HERDR_SKIP_CHECK=1 で警告して続行する"
+  else
+    fail "herdr契約: WT_HERDR_SKIP_CHECK=1 で警告して続行する (rc=$rc out=$out)"
+  fi
+  assert_dir "$R30/.claude/worktrees/v30b" "herdr契約: スキップ時は worktree を作る"
+
+  # バージョンを報告しない herdr は判定せず通す (fail-open。stub や旧版を殺さない)
+  mkdir -p "$TMP/bin30c"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$TMP/bin30c/herdr"
+  chmod +x "$TMP/bin30c/herdr"
+  if (cd "$R30" && env -u WT_HOME HOME="$TMP/home" PATH="$TMP/bin30c:$SAFE_PATH" "$WT" list) >/dev/null 2>&1; then
+    pass "herdr契約: バージョン不明の herdr は判定せず通す"
+  else
+    fail "herdr契約: バージョン不明の herdr は判定せず通す"
+  fi
+else
+  pass "herdr契約: jq が無いためスキップ"
 fi
 
 if [ "$FAILED" -eq 0 ]; then

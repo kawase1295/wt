@@ -30,6 +30,8 @@ git worktree と [herdr](https://herdr.dev) workspace を一体で管理し、�
 | git | 必須 | worktree 操作 |
 | [herdr](https://herdr.dev) | 任意 | workspace / エージェント起動（無ければ git worktree のみ）。socket API の `worktree` / `agent start` を使うため herdr 0.8（socket API protocol 19）で検証している |
 | jq | herdr 使用時と `wt peers` で必須 | herdr の JSON 出力とセッションレジストリのパース |
+| python3 | `/wt-review` で必須 | `skills/wt-review/assets/render.py` がレビューページを組み立てる（標準ライブラリのみ） |
+| curl | レビューページで mermaid を使うとき | `mermaid.min.js` を一度だけ `~/.cache/wt/` に取得する |
 
 ## インストール
 
@@ -67,7 +69,7 @@ WT_SKILLS_DIR=~/.claude/skills ./install.sh  # skill の配置先を変える
 WT_INSTALL_SKILLS=0 ./install.sh # skill を配置しない
 ```
 
-skill は wt の管理物として毎回上書きされる。ローカルで skill を改変している場合は `WT_INSTALL_SKILLS=0` で守る。
+skill は wt の管理物として扱う。install のたびに skill ディレクトリを作り直すため、repo から消えたファイルは配置先にも残らない — ローカルの改変も残らない。改変している場合は `WT_INSTALL_SKILLS=0` で守る。
 
 ## 使い方
 
@@ -88,6 +90,11 @@ wt bootstrap [<path>]
 
 wt open <task>
     既存 worktree を herdr workspace として開き直す
+
+wt browse <path>
+    ローカルファイルをそのプラットフォームの既定の手段で開く（WSL は explorer.exe、
+    macOS は open、Linux は xdg-open）。skill が生成した HTML を開くのに使う。
+    開く手段が無ければパスを表示して失敗する
 
 wt list
     worktree と herdr workspace の対応を一覧表示
@@ -198,16 +205,18 @@ npm test
 
 [`skills/`](skills/) に 8 つの skill を同梱しており、`install.sh` が `~/.claude/skills/` に配置する（[plugin](#plugin-マーケットプレイス経由claude-code) 経由なら plugin 側が供給し、名前は `/wt:wt-review` のようにプレフィックスが付く）。dev（本体 checkout）側のセッションから作業を worktree に投げ、worktree 側のセッションでレビュー・取り込み・片付けを完結させる。作業中は両者が直接会話できる。
 
+skill は `SKILL.md` 1 枚に限らない。`/wt-review` はレビューページの HTML テンプレートと生成スクリプトを [`skills/wt-review/assets/`](skills/wt-review/assets/) に同梱している。`install.sh` が skill ディレクトリごとコピーするのはこのため。
+
 | skill | 実行する側 | 役割 |
 | --- | --- | --- |
 | `/wt <作業内容>` | dev | worktree 名を生成し、作業内容を初期プロンプトとして worktree + Claude Code を起動 |
 | `/wt-detail <作業内容>` | dev | コードベースを調査し、仕様の不明点をユーザーに確認してから実装プランを作り、初期プロンプトとして worktree に渡す |
-| `/wt-review` | worktree | マージ前に diff からレビュー用 HTML を生成してブラウザで開き、承認を待つ |
+| `/wt-review` | worktree | 同梱テンプレートに diff を `assets/render.py` で差し込んでレビュー用 HTML を作り、ブラウザで開いて承認を待つ |
 | `/wt-merge` | worktree | 自分のブランチを本体の現在ブランチへマージ（`scripts/check` があればマージ前に実行。コンフリクトは報告して停止） |
 | `/wt-clean` | worktree | 未コミット・未マージを検査し、クリーンなら自分の worktree を片付けて workspace を閉じる |
 | `/wt-ask <内容>` | 両方 | `wt peers` で相手セッションの宛先を解決し、質問・報告を送って返答を受ける |
 | `worktree-parallel` | 両方 | `wt` と native worktree の使い分け方針・`.worktreeinclude` の契約（[skills/worktree-parallel/SKILL.md](skills/worktree-parallel/SKILL.md)） |
-| `local-artifact` | 両方 | Artifact と同一の設計規約で HTML を作り、claude.ai に publish せずローカル公開する契約（`/wt-review` が参照） |
+| `local-artifact` | 両方 | Artifact と同一の設計規約で HTML を作り、claude.ai に publish せずローカル公開する契約。`/wt-review` はもうロードしない（skeleton・テーマトグル・mermaid をテンプレートが内包しているため） |
 
 典型的なフロー:
 
@@ -251,10 +260,10 @@ fix-login            wt-fix-login             interactive  idle            /home
 
 ```bash
 scripts/check     # shellcheck + マニフェスト検査 + テスト。wt merge のゲートと CI が叩くのと同じ入口
-tests/wt_test.sh  # 31 ケース。依存は git と coreutils のみ（bats 不要）
+tests/wt_test.sh  # 33 ケース。依存は git と coreutils のみ（bats 不要）
 ```
 
-`scripts/check` は `claude` CLI があれば `claude plugin validate .` も走らせるので、`.claude-plugin/` のマニフェストが壊れた状態はマーケットプレイスに出る前に落ちる。plugin エントリに `version` を意図的に持たせていない点に注意する。付けると値を上げるまでその版に固定され、`main` に push したコミットがユーザーへ届かなくなる。
+`scripts/check` は `claude` CLI があれば `claude plugin validate .` も走らせるので、`.claude-plugin/` のマニフェストが壊れた状態はマーケットプレイスに出る前に落ちる。`python3` があれば `skills/wt-review/assets/render.py` の構文検査も走らせる。生成スクリプトは標準ライブラリだけで書いてあるので linter は入れない。plugin エントリに `version` を意図的に持たせていない点に注意する。付けると値を上げるまでその版に固定され、`main` に push したコミットがユーザーへ届かなくなる。
 
 テストは `herdr` を PATH から隠して git worktree フォールバック経路を強制し、herdr 経路自体の検証では fake herdr を差し込む。`HOME` は temp に差し替えるため実ホームを汚さない。
 

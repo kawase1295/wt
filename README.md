@@ -30,6 +30,8 @@
 | git | yes | worktree operations |
 | [herdr](https://herdr.dev) | optional | workspace / agent launch (without it, git worktree only). Verified against herdr 0.8 (socket API protocol 19), which the `worktree` and `agent start` calls target |
 | jq | when using herdr, and for `wt peers` | parsing herdr JSON output and the Claude Code session registry |
+| python3 | for `/wt-review` | `skills/wt-review/assets/render.py` builds the review page (standard library only) |
+| curl | for mermaid diagrams in a review page | fetching `mermaid.min.js` once into `~/.cache/wt/` |
 
 ## Install
 
@@ -67,7 +69,7 @@ WT_SKILLS_DIR=~/.claude/skills ./install.sh  # change the skill destination
 WT_INSTALL_SKILLS=0 ./install.sh # skip the skills
 ```
 
-Skills are owned by `wt` and overwritten on every install. If you have edited them locally, protect them with `WT_INSTALL_SKILLS=0`.
+Skills are owned by `wt`: every install recreates each skill directory, so files dropped upstream do not linger — and neither do local edits. If you have edited them locally, protect them with `WT_INSTALL_SKILLS=0`.
 
 ## Usage
 
@@ -89,6 +91,11 @@ wt bootstrap [<path>]
 
 wt open <task>
     Reopen an existing worktree as a herdr workspace
+
+wt browse <path>
+    Open a local file with the platform's default handler — WSL's explorer.exe,
+    macOS's open, Linux's xdg-open. The skills use it to show the HTML they
+    generate; it fails with the path printed when no handler is available
 
 wt list
     List worktrees and their herdr workspaces
@@ -201,16 +208,18 @@ npm test
 
 [`skills/`](skills/) ships 8 skills, installed into `~/.claude/skills/` by `install.sh` or supplied by the [plugin](#from-the-plugin-marketplace-claude-code) (where they are namespaced: `/wt:wt-review`). They let a session in the dev (main) checkout throw work at a worktree, and let the worktree session review, land and clean up on its own. The two sides can talk while the work is in flight.
 
+A skill is not always a lone `SKILL.md`. `/wt-review` bundles the review page's HTML template and its renderer under [`skills/wt-review/assets/`](skills/wt-review/assets/), which is why `install.sh` copies each skill directory whole.
+
 | Skill | Runs on | Role |
 | --- | --- | --- |
 | `/wt <task description>` | dev | Derives a worktree name and launches the worktree + Claude Code with the description as the initial prompt |
 | `/wt-detail <task description>` | dev | Explores the codebase, asks you about anything underspecified, builds an implementation plan, and passes it to the worktree as the initial prompt |
-| `/wt-review` | worktree | Builds an HTML review page from the diff, opens it in the browser, and waits for approval before merging |
+| `/wt-review` | worktree | Fills the bundled page template from the diff with `assets/render.py`, opens the result in the browser, and waits for approval before merging |
 | `/wt-merge` | worktree | Merges its own branch into the main checkout's current branch (runs `scripts/check` first if present; reports conflicts and stops) |
 | `/wt-clean` | worktree | Verifies nothing is uncommitted or unmerged, then removes its own worktree and closes the workspace |
 | `/wt-ask <message>` | both | Resolves the other session's address via `wt peers`, sends a question or status report, and waits for the reply |
 | `worktree-parallel` | both | Policy for choosing between `wt` and native worktrees, plus the `.worktreeinclude` contract ([skills/worktree-parallel/SKILL.md](skills/worktree-parallel/SKILL.md)) |
-| `local-artifact` | both | Contract for building HTML with the same design rules as Artifacts but publishing locally instead of to claude.ai (used by `/wt-review`) |
+| `local-artifact` | both | Contract for building HTML with the same design rules as Artifacts but publishing locally instead of to claude.ai. `/wt-review` no longer loads it — its template already carries the skeleton, theme toggle and mermaid |
 
 A typical flow:
 
@@ -254,10 +263,10 @@ Sessions started by older versions of Claude Code do not appear in the peer regi
 
 ```bash
 scripts/check     # shellcheck + manifest validation + tests — the same gate wt merge and CI run
-tests/wt_test.sh  # 31 tests; needs only git and coreutils (no bats)
+tests/wt_test.sh  # 33 tests; needs only git and coreutils (no bats)
 ```
 
-`scripts/check` runs `claude plugin validate .` when the `claude` CLI is around, so a broken `.claude-plugin/` manifest fails before it reaches the marketplace. The plugin entries deliberately carry no `version`: setting one pins the plugin until you bump the string, and users would stop receiving commits pushed to `main`.
+`scripts/check` runs `claude plugin validate .` when the `claude` CLI is around, so a broken `.claude-plugin/` manifest fails before it reaches the marketplace. It also byte-compiles `skills/wt-review/assets/render.py` when `python3` is present; the renderer sticks to the standard library, so there is no linter to add. The plugin entries deliberately carry no `version`: setting one pins the plugin until you bump the string, and users would stop receiving commits pushed to `main`.
 
 The tests hide `herdr` from `PATH` to force the git-worktree fallback path, stub it where the herdr path itself is under test, and point `HOME` at a temp directory so your real home is never touched.
 

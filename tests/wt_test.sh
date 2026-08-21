@@ -414,6 +414,19 @@ if [ "$ok22" -eq 1 ]; then
 else
   fail "install: skills 8 個を ~/.claude/skills に配置する"
 fi
+# SKILL.md 以外の同梱物も配置される (wt-review はテンプレートと render.py が無いと動かない)。
+assert_file "$H22/.claude/skills/wt-review/assets/render.py" \
+  "install: wt-review の assets も配置する"
+assert_file "$H22/.claude/skills/wt-review/assets/wt-review-template.html" \
+  "install: wt-review のテンプレートも配置する"
+# repo から消えたファイルが残らないよう skill ディレクトリは毎回作り直す。
+: > "$H22/.claude/skills/wt-review/stale.md"
+env HOME="$H22" PREFIX="$TMP/bin22" PATH="$SAFE_PATH" bash "$INSTALL" >/dev/null 2>&1
+if [ -e "$H22/.claude/skills/wt-review/stale.md" ]; then
+  fail "install: 再実行で古いファイルを残さない"
+else
+  pass "install: 再実行で古いファイルを残さない"
+fi
 H22B="$TMP/home22b"
 mkdir -p "$H22B"
 env HOME="$H22B" PREFIX="$TMP/bin22" PATH="$SAFE_PATH" WT_INSTALL_SKILLS=0 bash "$INSTALL" >/dev/null 2>&1
@@ -784,6 +797,199 @@ for d in "$REPO_ROOT/skills"/*/; do
   [ "$fm" = "$n" ] || skill_name_mismatch="$skill_name_mismatch $n(=$fm)"
 done
 assert_eq "plugin: 全 skill の frontmatter name がディレクトリ名と一致" "" "$skill_name_mismatch"
+
+# --- test 32: render.py がレビューページを組み立てる ---
+# /wt-review の生成資産。テンプレートのプレースホルダーが全部埋まること、
+# 折りたたみ判定、節の出し分けを固定する。python3 が無い環境ではスキップする。
+ASSETS="$REPO_ROOT/skills/wt-review/assets"
+assert_file "$ASSETS/render.py" "render: render.py がある"
+assert_file "$ASSETS/wt-review-template.html" "render: テンプレートがある"
+assert_file "$ASSETS/sample-net.diff" "render: サンプル diff がある"
+assert_file "$ASSETS/sample-summary.html" "render: サンプル要約断片がある"
+
+if command -v python3 >/dev/null 2>&1; then
+  R32="$TMP/render32"
+  H32="$TMP/home32"
+  mkdir -p "$R32" "$H32"
+  # HOME を temp に向ける。mermaid キャッシュ (~/.cache/wt) を実ホームに作らせない。
+  render32() { # out args...
+    local out="$1"
+    shift
+    env HOME="$H32" python3 "$ASSETS/render.py" \
+      --diff "$ASSETS/sample-net.diff" --out "$out" \
+      --title "サンプル" --summary "$ASSETS/sample-summary.html" "$@" 2>"$R32/err.log"
+  }
+
+  out32="$R32/plain.html"
+  log32="$(render32 "$out32")"
+  assert_eq "render: 統計行がサンプルの実数と一致する" "files=4 +342 -3" \
+    "$(printf '%s\n' "$log32" | head -1)"
+  assert_file "$out32" "render: HTML を出力する"
+  # プレースホルダーとマーカーは全部消費される (断片由来の HTML コメントは許す)。
+  assert_eq "render: プレースホルダーを残さない" "0" "$(grep -c '<!--[A-Z]' "$out32")"
+  assert_eq "render: --tests 省略なら「テスト結果」節を出さない" "0" \
+    "$(grep -c 'テスト結果' "$out32")"
+  assert_eq "render: 断片に mermaid が無ければ描画スクリプトを入れない" "0" \
+    "$(grep -c 'mermaid' "$out32")"
+  # 既定の閾値 200 行。print.css (+213/-0) だけが折りたたまれる。
+  assert_eq "render: 既定は 200 行超だけ折りたたむ" "3" \
+    "$(grep -c 'class="diff-file" open' "$out32")"
+
+  # --collapse-threshold を下げると全ファイルが折りたたまれる (最小は README.md の 14 行)。
+  render32 "$R32/tight.html" --collapse-threshold 10 >/dev/null
+  assert_eq "render: --collapse-threshold で閾値を変えられる" "0" \
+    "$(grep -c 'class="diff-file" open' "$R32/tight.html")"
+
+  # 明示指定は閾値より強い。
+  render32 "$R32/opened.html" --open styles/print.css >/dev/null
+  assert_eq "render: --open は閾値超のファイルも開く" "4" \
+    "$(grep -c 'class="diff-file" open' "$R32/opened.html")"
+  render32 "$R32/collapsed.html" --collapse README.md >/dev/null
+  assert_eq "render: --collapse は閾値内のファイルも折りたたむ" "2" \
+    "$(grep -c 'class="diff-file" open' "$R32/collapsed.html")"
+
+  # diff に無いパスを指定したら警告する (タイポ検知)。
+  render32 "$R32/warn.html" --open no/such/path >/dev/null
+  if grep -q 'no/such/path' "$R32/err.log"; then
+    pass "render: diff に無いパスを --open したら警告する"
+  else
+    fail "render: diff に無いパスを --open したら警告する"
+  fi
+
+  # --tests を渡すと「テスト結果」節が出る。
+  cat > "$R32/tests.html" <<'EOF'
+<div class="test-stats">
+  <div class="test-stat test-stat-done"><span class="num">1</span><span class="lbl">実施</span></div>
+</div>
+EOF
+  render32 "$R32/withtests.html" --tests "$R32/tests.html" >/dev/null
+  if grep -q 'テスト結果' "$R32/withtests.html"; then
+    pass "render: --tests を渡すと「テスト結果」節が出る"
+  else
+    fail "render: --tests を渡すと「テスト結果」節が出る"
+  fi
+  assert_eq "render: --tests 指定でもプレースホルダーを残さない" "0" \
+    "$(grep -c '<!--[A-Z]' "$R32/withtests.html")"
+
+  # 断片に mermaid があればキャッシュから mermaid.min.js を置く (ネットワークに出ない)。
+  mkdir -p "$H32/.cache/wt" "$R32/mm"
+  printf '/* stub */\n' > "$H32/.cache/wt/mermaid.min.js"
+  printf '<pre class="mermaid">graph LR; A-->B;</pre>\n' > "$R32/summary-mm.html"
+  env HOME="$H32" python3 "$ASSETS/render.py" \
+    --diff "$ASSETS/sample-net.diff" --out "$R32/mm/out.html" \
+    --title "サンプル" --summary "$R32/summary-mm.html" >/dev/null 2>&1
+  assert_file "$R32/mm/mermaid.min.js" "render: mermaid.min.js を出力先へ置く"
+  if grep -q 'mermaid.min.js' "$R32/mm/out.html"; then
+    pass "render: mermaid の描画スクリプトを入れる"
+  else
+    fail "render: mermaid の描画スクリプトを入れる"
+  fi
+  mkdir -p "$R32/nomm"
+  env HOME="$H32" python3 "$ASSETS/render.py" --no-mermaid \
+    --diff "$ASSETS/sample-net.diff" --out "$R32/nomm/out.html" \
+    --title "サンプル" --summary "$R32/summary-mm.html" >/dev/null 2>&1
+  assert_eq "render: --no-mermaid なら描画スクリプトを入れない" "0" \
+    "$(grep -c 'mermaid.min.js' "$R32/nomm/out.html")"
+  # キャッシュの中身がそのまま複製されている = 取得に出ていない。
+  assert_eq "render: mermaid はキャッシュから複製する" "/* stub */" \
+    "$(cat "$R32/mm/mermaid.min.js")"
+
+  # 入力が無ければ書き込まずに落ちる。
+  env HOME="$H32" python3 "$ASSETS/render.py" --diff "$R32/nope.diff" \
+    --out "$R32/never.html" --title x --summary "$ASSETS/sample-summary.html" >/dev/null 2>&1
+  assert_eq "render: 入力が無ければ exit 2" "2" "$?"
+  if [ -f "$R32/never.html" ]; then
+    fail "render: 失敗時は出力を書かない"
+  else
+    pass "render: 失敗時は出力を書かない"
+  fi
+
+  # git メタ情報とコミット一覧。--base を渡した経路。
+  R32G="$TMP/repo32"
+  new_repo "$R32G"
+  git -C "$R32G" commit -q --allow-empty -m "レビュー対象のコミット"
+  base32="$(git -C "$R32G" rev-parse HEAD~1)"
+  (cd "$R32G" && env HOME="$H32" python3 "$ASSETS/render.py" \
+    --diff "$ASSETS/sample-net.diff" --out "$R32/git.html" \
+    --title "サンプル" --summary "$ASSETS/sample-summary.html" --base "$base32") >/dev/null 2>&1
+  assert_eq "render: --base でメタ情報とコミット一覧を埋める" "0" \
+    "$(grep -c '<!--[A-Z]' "$R32/git.html")"
+  if grep -q 'Base SHA' "$R32/git.html" && grep -q 'レビュー対象のコミット' "$R32/git.html"; then
+    pass "render: Base SHA とコミット件名を出す"
+  else
+    fail "render: Base SHA とコミット件名を出す"
+  fi
+  assert_eq "render: --base 省略時はコミット節を出さない" "0" \
+    "$(grep -c 'class="commits"' "$out32")"
+
+  if python3 -m py_compile "$ASSETS/render.py" >/dev/null 2>&1; then
+    pass "render: render.py が構文エラー無くコンパイルできる"
+  else
+    fail "render: render.py が構文エラー無くコンパイルできる"
+  fi
+  rm -rf "$ASSETS/__pycache__"
+else
+  pass "render: python3 が無いためスキップ"
+fi
+
+# --- test 33: browse はプラットフォームごとの開き方を吸収する ---
+# skill 側に explorer.exe を直書きしないための入口。stub を PATH の先頭に置いて
+# 優先順・渡す引数 (絶対パスに正規化) ・手段が無いときの失敗を固定する。
+B33="$TMP/browse33"
+mkdir -p "$B33/bin"
+printf 'hello\n' >"$B33/page.html"
+make_stub() { # name body
+  cat >"$B33/bin/$1" <<EOF
+#!/usr/bin/env bash
+$2
+EOF
+  chmod +x "$B33/bin/$1"
+}
+browse33() { # args...
+  (cd "$B33" && env HOME="$TMP/home" WT_TEST_LOG="$B33/log" \
+    PATH="$B33/bin:$SAFE_PATH" "$WT" browse "$@")
+}
+
+# stub の本体は生成先で展開させるため、ここでは展開させない (単一引用符は意図的)。
+# shellcheck disable=SC2016
+make_stub wslview 'printf "wslview %s\n" "$1" >"$WT_TEST_LOG"'
+# shellcheck disable=SC2016
+make_stub xdg-open 'printf "xdg-open %s\n" "$1" >"$WT_TEST_LOG"'
+browse33 page.html >/dev/null 2>&1
+assert_eq "browse: wslview を優先し絶対パスを渡す" "wslview $B33/page.html" \
+  "$(cat "$B33/log" 2>/dev/null)"
+
+# wslview が使えなければ次の手段に落ちる。
+rm -f "$B33/bin/wslview" "$B33/log"
+browse33 page.html >/dev/null 2>&1
+assert_eq "browse: wslview が無ければ xdg-open に落ちる" "xdg-open $B33/page.html" \
+  "$(cat "$B33/log" 2>/dev/null)"
+
+# どの手段も失敗したらパスを添えて die する (勝手に成功扱いしない)。
+make_stub wslview 'exit 4'
+make_stub open 'exit 5'
+make_stub xdg-open 'exit 3'
+out33="$(browse33 page.html 2>&1)"
+rc33=$?
+if [ "$rc33" -ne 0 ] && printf '%s' "$out33" | grep -q '開く手段が見つからない'; then
+  pass "browse: 開く手段が無ければパスを添えて中断する"
+else
+  fail "browse: 開く手段が無ければパスを添えて中断する (rc=$rc33 out=$out33)"
+fi
+
+# 引数の検査。
+out33="$(browse33 no-such-file.html 2>&1)"
+rc33=$?
+if [ "$rc33" -ne 0 ] && printf '%s' "$out33" | grep -q 'ファイルが無い'; then
+  pass "browse: 存在しないパスを弾く"
+else
+  fail "browse: 存在しないパスを弾く (rc=$rc33 out=$out33)"
+fi
+if browse33 >/dev/null 2>&1; then
+  fail "browse: パス省略は usage で中断する"
+else
+  pass "browse: パス省略は usage で中断する"
+fi
 
 if [ "$FAILED" -eq 0 ]; then
   printf '\nall tests passed\n'

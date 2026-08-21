@@ -4,3 +4,6 @@
 
 # local scratch
 *.log
+
+# python
+__pycache__/

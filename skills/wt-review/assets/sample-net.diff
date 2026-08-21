@@ -1,0 +1,394 @@
+diff --git a/README.md b/README.md
+index 9e59ebc3..976ce73c 100644
+--- a/README.md
++++ b/README.md
+@@ -16,3 +16,17 @@ npm test
+ | --- | --- |
+ | `/` | レシピ一覧 |
+ | `/recipes/:id` | レシピ詳細 |
++| `/recipes/:id/print` | 印刷用ビュー |
++
++## 印刷用ビュー
++
++`/recipes/:id/print` は A4 1 枚に収まる縦組みのレシピを返す。ナビゲーションと
++操作ボタンは `@media print` で落としてある。
++
++| クエリ | 既定 | 内容 |
++| --- | --- | --- |
++| `servings` | レシピの既定人数 | 材料の分量をこの人数分にスケールする |
++| `notes` | なし | 末尾に手書き用のメモ欄を付ける |
++
++ブラウザの印刷プレビューで確認する。ヘッダー・フッターは
++ブラウザ側の設定なので、こちらからは制御しない。
+diff --git a/src/print-view.ts b/src/print-view.ts
+new file mode 100644
+index 00000000..0fcdcf18
+--- /dev/null
++++ b/src/print-view.ts
+@@ -0,0 +1,90 @@
++import type { Recipe, Ingredient, Step } from "./types";
++
++/** 1 ページに収める手順の目安。これを超えたら改ページのヒントを入れる。 */
++const STEPS_PER_PAGE = 8;
++
++export type PrintOptions = {
++  /** 材料の分量を人数分でスケールする。既定はレシピの既定人数。 */
++  servings?: number;
++  /** メモ欄を末尾に付ける。 */
++  withNotes?: boolean;
++};
++
++function escapeHtml(value: string): string {
++  return value
++    .replace(/&/g, "&amp;")
++    .replace(/</g, "&lt;")
++    .replace(/>/g, "&gt;");
++}
++
++/**
++ * 分量をスケールする。1/3 のような分数表記はそのまま返す
++ * (印刷では「適量」「少々」と同じく人間が読む前提)。
++ */
++export function scaleAmount(amount: string, factor: number): string {
++  if (factor === 1) {
++    return amount;
++  }
++  const match = /^(\d+(?:\.\d+)?)\s*(.*)$/.exec(amount);
++  if (!match) {
++    return amount;
++  }
++  const scaled = Number(match[1]) * factor;
++  const rounded = Math.round(scaled * 10) / 10;
++  return `${rounded}${match[2] ? ` ${match[2]}` : ""}`;
++}
++
++function renderIngredients(items: Ingredient[], factor: number): string {
++  const rows = items
++    .map(
++      (item) => `
++      <tr>
++        <th scope="row">${escapeHtml(item.name)}</th>
++        <td>${escapeHtml(scaleAmount(item.amount, factor))}</td>
++      </tr>`,
++    )
++    .join("");
++  return `
++    <table class="print-ingredients">
++      <caption>材料</caption>
++      <tbody>${rows}
++      </tbody>
++    </table>`;
++}
++
++function renderSteps(steps: Step[]): string {
++  const items = steps
++    .map((step, index) => {
++      const breakBefore = index > 0 && index % STEPS_PER_PAGE === 0;
++      const cls = breakBefore ? ' class="print-step print-break"' : ' class="print-step"';
++      const timer = step.minutes ? `<span class="print-timer">${step.minutes} 分</span>` : "";
++      return `
++        <li${cls}>
++          <p class="print-step-body">${escapeHtml(step.body)}</p>
++          ${timer}
++        </li>`;
++    })
++    .join("");
++  return `
++    <ol class="print-steps">${items}
++    </ol>`;
++}
++
++export function renderPrintView(recipe: Recipe, options: PrintOptions = {}): string {
++  const servings = options.servings ?? recipe.servings;
++  const factor = servings / recipe.servings;
++  const notes = options.withNotes
++    ? '<section class="print-notes"><h2>メモ</h2><div class="print-notes-lines"></div></section>'
++    : "";
++  return `
++    <article class="print-recipe">
++      <header class="print-head">
++        <h1>${escapeHtml(recipe.title)}</h1>
++        <p class="print-meta">${servings} 人分 · 調理 ${recipe.totalMinutes} 分</p>
++      </header>
++      ${renderIngredients(recipe.ingredients, factor)}
++      <h2>手順</h2>
++      ${renderSteps(recipe.steps)}
++      ${notes}
++    </article>`;
++}
+diff --git a/src/router.ts b/src/router.ts
+index 6be82b8d..8b75b324 100644
+--- a/src/router.ts
++++ b/src/router.ts
+@@ -1,13 +1,23 @@
+ import { renderList } from "./views/list";
+ import { renderDetail } from "./views/detail";
+ import { NotFound } from "./views/not-found";
++import { renderPrintView } from "./print-view";
+ import type { Recipe } from "./types";
+ 
+ type Route = {
+   pattern: RegExp;
+-  render: (recipes: Recipe[], params: string[]) => string;
++  render: (recipes: Recipe[], params: string[], query: URLSearchParams) => string;
+ };
+ 
++function printOptions(query: URLSearchParams, recipe: Recipe) {
++  const raw = query.get("servings");
++  const parsed = raw === null ? Number.NaN : Number(raw);
++  return {
++    servings: Number.isFinite(parsed) && parsed > 0 ? parsed : recipe.servings,
++    withNotes: query.has("notes"),
++  };
++}
++
+ const ROUTES: Route[] = [
+   {
+     pattern: /^\/$/,
+@@ -20,13 +30,25 @@ const ROUTES: Route[] = [
+       return recipe ? renderDetail(recipe) : NotFound(`レシピが見つかりません: ${id}`);
+     },
+   },
++  {
++    pattern: /^\/recipes\/([\w-]+)\/print$/,
++    render: (recipes, [id], query) => {
++      const recipe = recipes.find((r) => r.id === id);
++      if (!recipe) {
++        return NotFound(`レシピが見つかりません: ${id}`);
++      }
++      return renderPrintView(recipe, printOptions(query, recipe));
++    },
++  },
+ ];
+ 
+-export function resolve(path: string, recipes: Recipe[]): string {
++export function resolve(url: string, recipes: Recipe[]): string {
++  const [path, search = ""] = url.split("?");
++  const query = new URLSearchParams(search);
+   for (const route of ROUTES) {
+     const match = route.pattern.exec(path);
+     if (match) {
+-      return route.render(recipes, match.slice(1));
++      return route.render(recipes, match.slice(1), query);
+     }
+   }
+   return NotFound(`ページがありません: ${path}`);
+diff --git a/styles/print.css b/styles/print.css
+new file mode 100644
+index 00000000..e2ee05ba
+--- /dev/null
++++ b/styles/print.css
+@@ -0,0 +1,213 @@
++/* 印刷専用のスタイル。画面表示には読み込まない。 */
++
++@page {
++  size: A4;
++  margin: 18mm 16mm 20mm;
++}
++
++@page :first {
++  margin-top: 14mm;
++}
++
++:root {
++  --print-ink: #111111;
++  --print-muted: #555555;
++  --print-rule: #cccccc;
++  --print-accent: #7a3b12;
++}
++
++.print-recipe {
++  max-width: 170mm;
++  margin: 0 auto;
++  color: var(--print-ink);
++  font-family: "Hiragino Mincho ProN", "Yu Mincho", serif;
++  font-size: 10.5pt;
++  line-height: 1.7;
++}
++
++.print-recipe * {
++  box-sizing: border-box;
++}
++
++.print-head {
++  padding-bottom: 6mm;
++  margin-bottom: 8mm;
++  border-bottom: 1.5pt solid var(--print-ink);
++}
++
++.print-head h1 {
++  margin: 0;
++  font-size: 20pt;
++  font-weight: 600;
++  line-height: 1.35;
++  letter-spacing: 0.01em;
++}
++
++.print-meta {
++  margin: 2mm 0 0;
++  color: var(--print-muted);
++  font-size: 9pt;
++  letter-spacing: 0.04em;
++}
++
++.print-recipe h2 {
++  margin: 8mm 0 3mm;
++  font-size: 12pt;
++  font-weight: 600;
++  letter-spacing: 0.02em;
++}
++
++.print-recipe h2::after {
++  display: block;
++  width: 12mm;
++  height: 1pt;
++  margin-top: 1.5mm;
++  background: var(--print-accent);
++  content: "";
++}
++
++/* ---------- 材料 ---------- */
++
++.print-ingredients {
++  width: 100%;
++  margin: 0 0 6mm;
++  border-collapse: collapse;
++  page-break-inside: avoid;
++  break-inside: avoid;
++}
++
++.print-ingredients caption {
++  margin-bottom: 3mm;
++  font-size: 12pt;
++  font-weight: 600;
++  text-align: left;
++  letter-spacing: 0.02em;
++}
++
++.print-ingredients tr {
++  border-bottom: 0.5pt dotted var(--print-rule);
++}
++
++.print-ingredients tr:last-child {
++  border-bottom: none;
++}
++
++.print-ingredients th {
++  padding: 1.6mm 2mm 1.6mm 0;
++  font-weight: 400;
++  text-align: left;
++  vertical-align: baseline;
++}
++
++.print-ingredients td {
++  width: 32mm;
++  padding: 1.6mm 0;
++  text-align: right;
++  vertical-align: baseline;
++  font-variant-numeric: tabular-nums;
++  white-space: nowrap;
++}
++
++/* ---------- 手順 ---------- */
++
++.print-steps {
++  margin: 0;
++  padding: 0;
++  list-style: none;
++  counter-reset: print-step;
++}
++
++.print-step {
++  position: relative;
++  padding: 0 0 4mm 10mm;
++  counter-increment: print-step;
++  page-break-inside: avoid;
++  break-inside: avoid;
++}
++
++.print-step::before {
++  position: absolute;
++  top: 0.4mm;
++  left: 0;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  width: 6.5mm;
++  height: 6.5mm;
++  border: 0.8pt solid var(--print-ink);
++  border-radius: 50%;
++  font-size: 8.5pt;
++  font-variant-numeric: tabular-nums;
++  content: counter(print-step);
++}
++
++.print-step:last-child {
++  padding-bottom: 0;
++}
++
++.print-step-body {
++  margin: 0;
++  text-align: justify;
++  text-justify: inter-ideograph;
++}
++
++.print-timer {
++  display: inline-block;
++  margin-top: 1.2mm;
++  padding: 0.4mm 2mm;
++  border: 0.5pt solid var(--print-rule);
++  color: var(--print-muted);
++  font-size: 8.5pt;
++  letter-spacing: 0.04em;
++  white-space: nowrap;
++}
++
++.print-break {
++  page-break-before: always;
++  break-before: page;
++}
++
++/* ---------- メモ欄 ---------- */
++
++.print-notes {
++  margin-top: 10mm;
++  page-break-inside: avoid;
++  break-inside: avoid;
++}
++
++.print-notes-lines {
++  height: 32mm;
++  background-image: repeating-linear-gradient(
++    to bottom,
++    transparent 0,
++    transparent 7mm,
++    var(--print-rule) 7mm,
++    var(--print-rule) calc(7mm + 0.4pt)
++  );
++}
++
++/* ---------- 画面には出さない ---------- */
++
++@media screen {
++  .print-recipe {
++    display: none;
++  }
++}
++
++@media print {
++  nav,
++  footer,
++  .app-header,
++  .recipe-actions,
++  .toast {
++    display: none !important;
++  }
++
++  a[href]::after {
++    content: "";
++  }
++
++  .print-recipe {
++    display: block;
++  }
++}

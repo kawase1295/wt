@@ -1,0 +1,46 @@
+<!-- sample-net.diff (架空の recipe-box というレシピ管理アプリ) に対応するサンプルの要約断片。
+     render.py の動作確認用と、テンプレートで使えるクラスの見本を兼ねる。
+     使えるクラスの一覧は README.md の「summary / tests 断片で使えるクラス」を参照。 -->
+<div class="stack-lg">
+
+  <p class="lede">
+    レシピを A4 1 枚に収めて印刷できるようにしました。人数を指定すると材料の分量が
+    その人数分にスケールされ、手書き用のメモ欄も付けられます。
+  </p>
+
+  <div class="card">
+    <h3>背景</h3>
+    <p>
+      キッチンでは<strong>画面よりも紙のほうが扱いやすい</strong>という要望が続いていました。
+      ブラウザの印刷機能だとナビゲーションや操作ボタンまで出てしまい、
+      手順が 2 ページに割れて読みづらくなります。
+    </p>
+  </div>
+
+  <div class="grid-2">
+    <div class="card card-compact">
+      <h3>最終実装</h3>
+      <ul class="bullets">
+        <li><code>src/print-view.ts</code> を新規追加。印刷用の HTML を組み立てる</li>
+        <li><code>/recipes/:id/print</code> をルーターに追加</li>
+        <li><code>styles/print.css</code> で <code>@page</code> と改ページを制御</li>
+      </ul>
+    </div>
+    <div class="card card-compact">
+      <h3>採らなかった案</h3>
+      <ul class="bullets">
+        <li>サーバー側で PDF を生成する案。<span class="chip">取りやめ</span> 依存が増えるため</li>
+        <li>既存の詳細ページに <code>@media print</code> を足す案。DOM が印刷向きでない</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout callout-amber">
+    <p class="callout-title">分数表記の分量はスケールしません</p>
+    <p>
+      <code>scaleAmount()</code> は先頭が数値の分量だけを掛け算します。
+      「1/3 カップ」「少々」はそのまま出力します。印刷して人が読む前提の割り切りです。
+    </p>
+  </div>
+
+</div>

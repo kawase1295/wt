@@ -254,7 +254,7 @@ fix-login            wt-fix-login             interactive  idle            /home
 
 ## 既知の注意点
 
-- worktree は `<repo>/.claude/worktrees/` に作られるため、本体 checkout の `git status` に `.claude/` が untracked として現れる（Claude Code の native worktree でも同じ）。`git add .` で worktree の実体を巻き込まないよう注意。気になる場合は本体の `.gitignore` か `.git/info/exclude` に `.claude/worktrees/` を加える。
+- worktree は `<repo>/.claude/worktrees/` に作られるため、本体 checkout の `git status` に `.claude/` が untracked として現れる（Claude Code の native worktree でも同じ）。無視設定が無いかぎり `wt new` が毎回案内する。本体の `.gitignore` か `.git/info/exclude` に `.claude/worktrees/` を加えれば案内は止まる。それまでは `git add .` で worktree の実体を巻き込まないよう注意。
 - `~/.npmrc` に `ignore-scripts=true` があると、`npm ci` だけでは native addon（better-sqlite3 等）がビルドされない。フックで rebuild するか、本体のビルド済み `.node` をコピーする。
 - 本体 checkout の未コミット変更は worktree に入らない（worktree はコミット済み ref から分岐する）。
 - `.worktreeinclude` のコピーではディレクトリパターン（`secrets/`）がそのまま使える。フックで symlink する場合のみ末尾スラッシュ無し（`secrets`）で書く。
@@ -266,7 +266,7 @@ fix-login            wt-fix-login             interactive  idle            /home
 
 ```bash
 scripts/check     # shellcheck + マニフェスト検査 + テスト。wt merge のゲートと CI が叩くのと同じ入口
-tests/wt_test.sh  # 33 ケース。依存は git と coreutils のみ（bats 不要）
+tests/wt_test.sh  # 34 ケース。依存は git と coreutils のみ（bats 不要）
 ```
 
 `scripts/check` は `claude` CLI があれば `claude plugin validate .` も走らせるので、`.claude-plugin/` のマニフェストが壊れた状態はマーケットプレイスに出る前に落ちる。`python3` があれば `skills/wt-review/assets/render.py` の構文検査も走らせる。生成スクリプトは標準ライブラリだけで書いてあるので linter は入れない。plugin エントリに `version` を意図的に持たせていない点に注意する。付けると値を上げるまでその版に固定され、`main` に push したコミットがユーザーへ届かなくなる。

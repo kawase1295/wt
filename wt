@@ -74,6 +74,17 @@ resolve_repo() {
   fi
 }
 
+# worktree の置き場が repo 内 (WT_HOME 未設定) だと、本体の git status に未追跡で出る。
+# git add . で worktree を巻き込む事故を避けるため一度案内する。対象は利用者の repo
+# なので .gitignore は書き換えず、無視されていないときだけ知らせる。
+warn_untracked_wt_dir() {
+  case "$WT_DIR" in "$MAIN_ROOT"/*) ;; *) return 0 ;; esac
+  git -C "$MAIN_ROOT" check-ignore -q "$WT_DIR" && return 0
+  local rel="${WT_DIR#"$MAIN_ROOT"/}"
+  log "注意: $rel/ は本体の git status に未追跡で出る。git add . で巻き込まないよう、"
+  log "      本体の .gitignore か .git/info/exclude に '$rel/' を足しておく"
+}
+
 # wt が検証済みの herdr CLI 系列。herdr は 0.x の間、マイナー更新で CLI 契約が
 # 変わる (0.7→0.8 で worktree create / agent start が非互換になった実績)。
 # 系列外の herdr では途中で黙って壊れる代わりに herdr_ok で fail-fast する。
@@ -405,6 +416,7 @@ cmd_new() {
     herdr workspace focus "$ws" >/dev/null
     log "Claude Code を workspace $ws で起動した"
   fi
+  warn_untracked_wt_dir
   log "準備完了: $path"
 }
 

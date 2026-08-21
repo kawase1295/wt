@@ -991,6 +991,38 @@ else
   pass "browse: パス省略は usage で中断する"
 fi
 
+# --- test 34: repo 内に worktree を作る構成では .gitignore の案内を出す ---
+# 置き場は本体の git status に未追跡として出る。README の既知の注意点にも書いてあるが、
+# 実行時に案内しないと気づかれないため wt new が知らせる。書き換えは利用者に委ねる。
+R34="$TMP/repo34"
+new_repo "$R34"
+out34="$(wt_local "$R34" new g1 --no-claude 2>&1)"
+if printf '%s' "$out34" | grep -q 'gitignore'; then
+  pass "gitignore案内: 未追跡のままなら案内する"
+else
+  fail "gitignore案内: 未追跡のままなら案内する (out=$out34)"
+fi
+
+printf '.claude/worktrees/\n' >"$R34/.gitignore"
+git -C "$R34" add .gitignore
+git -C "$R34" commit -q -m "ignore worktrees"
+out34b="$(wt_local "$R34" new g2 --no-claude 2>&1)"
+if printf '%s' "$out34b" | grep -q 'gitignore'; then
+  fail "gitignore案内: 無視済みなら案内しない (out=$out34b)"
+else
+  pass "gitignore案内: 無視済みなら案内しない"
+fi
+
+# WT_HOME で repo 外に作る構成では未追跡にならないので案内しない。
+R34C="$TMP/repo34c"
+new_repo "$R34C"
+out34c="$(cd "$R34C" && HOME="$TMP/home" PATH="$SAFE_PATH" WT_HOME="$TMP/wthome34" "$WT" new g3 --no-claude 2>&1)"
+if printf '%s' "$out34c" | grep -q 'gitignore'; then
+  fail "gitignore案内: repo 外に作る構成では案内しない (out=$out34c)"
+else
+  pass "gitignore案内: repo 外に作る構成では案内しない"
+fi
+
 if [ "$FAILED" -eq 0 ]; then
   printf '\nall tests passed\n'
 else

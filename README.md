@@ -257,7 +257,7 @@ Sessions started by older versions of Claude Code do not appear in the peer regi
 
 ## Known caveats
 
-- Worktrees live under `<repo>/.claude/worktrees/`, so `.claude/` shows up as untracked in the main checkout's `git status` (same as Claude Code's native worktrees). Be careful not to sweep a worktree into a `git add .`. If it bothers you, add `.claude/worktrees/` to the main checkout's `.gitignore` or `.git/info/exclude`.
+- Worktrees live under `<repo>/.claude/worktrees/`, so `.claude/` shows up as untracked in the main checkout's `git status` (same as Claude Code's native worktrees). `wt new` says so every time the directory is still not ignored; add `.claude/worktrees/` to the main checkout's `.gitignore` or `.git/info/exclude` and the notice stops. Until you do, be careful not to sweep a worktree into a `git add .`.
 - With `ignore-scripts=true` in `~/.npmrc`, `npm ci` alone will not build native addons (better-sqlite3 and friends). Rebuild them in the hook, or copy the prebuilt `.node` from the main checkout.
 - Uncommitted changes in the main checkout do not reach the worktree (a worktree branches off a committed ref).
 - Directory patterns (`secrets/`) work as-is for `.worktreeinclude` copies. Only drop the trailing slash (`secrets`) when you symlink them from the hook.
@@ -269,7 +269,7 @@ Sessions started by older versions of Claude Code do not appear in the peer regi
 
 ```bash
 scripts/check     # shellcheck + manifest validation + tests — the same gate wt merge and CI run
-tests/wt_test.sh  # 33 tests; needs only git and coreutils (no bats)
+tests/wt_test.sh  # 34 tests; needs only git and coreutils (no bats)
 ```
 
 `scripts/check` runs `claude plugin validate .` when the `claude` CLI is around, so a broken `.claude-plugin/` manifest fails before it reaches the marketplace. It also byte-compiles `skills/wt-review/assets/render.py` when `python3` is present; the renderer sticks to the standard library, so there is no linter to add. The plugin entries deliberately carry no `version`: setting one pins the plugin until you bump the string, and users would stop receiving commits pushed to `main`.

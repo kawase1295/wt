@@ -33,6 +33,24 @@ git worktree と [herdr](https://herdr.dev) workspace を一体で管理し、�
 
 ## インストール
 
+### plugin マーケットプレイス経由（Claude Code）
+
+このリポジトリは Claude Code の plugin マーケットプレイスも兼ねており、`/plugin` で本体と skill がまとめて入る。
+
+```
+/plugin marketplace add kawase1295/wt
+/plugin install wt@wt
+```
+
+plugin は `wt` を Bash tool の `PATH` に載せ、skill を plugin の名前空間に登録する。呼び出しは `/wt:wt`、`/wt:wt-review` のようにプレフィックスが付く。更新の取り込みは `/plugin marketplace update wt`。
+
+plugin がやらないことが 2 つある。
+
+- **自分のシェルからは `wt` が見えない。** `PATH` に載るのは Claude Code の Bash tool の中だけ。ターミナルで自分で `wt` を打つなら、下の手動配置も併せて行う。
+- **`install.sh` の後片付けはしない。** `~/.claude/skills/` に既にある skill は plugin 側のコピーと並んで読み込まれ、同じものが 2 つ入る。どちらか一方に寄せる（`~/.claude/skills/` から wt の skill を消すか、plugin を入れない）。
+
+### 手動配置
+
 `wt` は単一ファイル。PATH の通ったディレクトリに置くだけで動く。
 
 ```bash
@@ -178,7 +196,7 @@ npm test
 
 ## Claude Code 連携
 
-[`skills/`](skills/) に 8 つの skill を同梱しており、`install.sh` が `~/.claude/skills/` に配置する。dev（本体 checkout）側のセッションから作業を worktree に投げ、worktree 側のセッションでレビュー・取り込み・片付けを完結させる。作業中は両者が直接会話できる。
+[`skills/`](skills/) に 8 つの skill を同梱しており、`install.sh` が `~/.claude/skills/` に配置する（[plugin](#plugin-マーケットプレイス経由claude-code) 経由なら plugin 側が供給し、名前は `/wt:wt-review` のようにプレフィックスが付く）。dev（本体 checkout）側のセッションから作業を worktree に投げ、worktree 側のセッションでレビュー・取り込み・片付けを完結させる。作業中は両者が直接会話できる。
 
 | skill | 実行する側 | 役割 |
 | --- | --- | --- |
@@ -232,9 +250,11 @@ fix-login            wt-fix-login             interactive  idle            /home
 ## 開発
 
 ```bash
-scripts/check     # shellcheck + テスト。wt merge のゲートと CI が叩くのと同じ入口
-tests/wt_test.sh  # 29 ケース。依存は git と coreutils のみ（bats 不要）
+scripts/check     # shellcheck + マニフェスト検査 + テスト。wt merge のゲートと CI が叩くのと同じ入口
+tests/wt_test.sh  # 31 ケース。依存は git と coreutils のみ（bats 不要）
 ```
+
+`scripts/check` は `claude` CLI があれば `claude plugin validate .` も走らせるので、`.claude-plugin/` のマニフェストが壊れた状態はマーケットプレイスに出る前に落ちる。plugin エントリに `version` を意図的に持たせていない点に注意する。付けると値を上げるまでその版に固定され、`main` に push したコミットがユーザーへ届かなくなる。
 
 テストは `herdr` を PATH から隠して git worktree フォールバック経路を強制し、herdr 経路自体の検証では fake herdr を差し込む。`HOME` は temp に差し替えるため実ホームを汚さない。
 

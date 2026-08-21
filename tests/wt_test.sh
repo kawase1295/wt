@@ -733,6 +733,58 @@ else
   pass "herdr契約: jq が無いためスキップ"
 fi
 
+# --- test 31: Claude Code plugin / marketplace の契約 ---
+# マーケットプレイス配布の入口。壊れると /plugin marketplace add が黙って失敗するため、
+# マニフェストの必須フィールドと、skill 名の安定性 (frontmatter name == ディレクトリ名) を固定する。
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MKT="$REPO_ROOT/.claude-plugin/marketplace.json"
+PLG="$REPO_ROOT/.claude-plugin/plugin.json"
+
+assert_file "$MKT" "plugin: marketplace.json がある"
+assert_file "$PLG" "plugin: plugin.json がある"
+
+if command -v jq >/dev/null 2>&1; then
+  if jq -e . "$MKT" >/dev/null 2>&1 && jq -e . "$PLG" >/dev/null 2>&1; then
+    pass "plugin: マニフェストが妥当な JSON"
+  else
+    fail "plugin: マニフェストが妥当な JSON"
+  fi
+  assert_eq "plugin: marketplace 名は wt" "wt" "$(jq -r '.name // ""' "$MKT")"
+  if [ -n "$(jq -r '.owner.name // ""' "$MKT")" ]; then
+    pass "plugin: marketplace に owner.name がある"
+  else
+    fail "plugin: marketplace に owner.name がある"
+  fi
+  assert_eq "plugin: エントリは 1 件" "1" "$(jq -r '.plugins | length' "$MKT")"
+  # source は marketplace root (= repo root) 自身。skills/ と bin/ をそのまま配る前提。
+  assert_eq "plugin: source は repo root" "./" "$(jq -r '.plugins[0].source // ""' "$MKT")"
+  # 名前が食い違うと install 後の skill namespace (/wt:wt-merge) がずれる。
+  assert_eq "plugin: エントリ名と plugin.json の name が一致" \
+    "$(jq -r '.name // ""' "$PLG")" "$(jq -r '.plugins[0].name // ""' "$MKT")"
+  assert_eq "plugin: plugin 名は wt" "wt" "$(jq -r '.name // ""' "$PLG")"
+else
+  pass "plugin: jq が無いためマニフェスト検査をスキップ"
+fi
+
+# bin/ は plugin 有効時に Bash tool の PATH へ入る。本体へ委譲するだけの薄い wrapper。
+if [ -x "$REPO_ROOT/bin/wt" ]; then
+  pass "plugin: bin/wt が実行可能"
+else
+  fail "plugin: bin/wt が実行可能"
+fi
+assert_eq "plugin: bin/wt は本体と同じ usage を出す" \
+  "$(env -u WT_HOME HOME="$TMP/home" PATH="$SAFE_PATH" "$WT" 2>&1 | head -1)" \
+  "$(env -u WT_HOME HOME="$TMP/home" PATH="$SAFE_PATH" "$REPO_ROOT/bin/wt" 2>&1 | head -1)"
+
+# plugin 更新でディレクトリ名が変わっても skill 名が動かないよう frontmatter name を正とする。
+skill_name_mismatch=""
+for d in "$REPO_ROOT/skills"/*/; do
+  n="$(basename "$d")"
+  fm="$(sed -n '/^name:[[:space:]]*/{s/^name:[[:space:]]*//p;q}' "$d/SKILL.md")"
+  [ "$fm" = "$n" ] || skill_name_mismatch="$skill_name_mismatch $n(=$fm)"
+done
+assert_eq "plugin: 全 skill の frontmatter name がディレクトリ名と一致" "" "$skill_name_mismatch"
+
 if [ "$FAILED" -eq 0 ]; then
   printf '\nall tests passed\n'
 else

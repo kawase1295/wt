@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Claude Code plugin 経由の wt エントリポイント。
+# plugin の bin/ は Bash tool の PATH に自動で入るため、ここから同梱の本体に委譲する。
+# 本体はリポジトリ (= plugin) ルートの wt 一枚であり、実装をここに複製しない。
+set -euo pipefail
+exec "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/wt" "$@"

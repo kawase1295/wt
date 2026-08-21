@@ -6,12 +6,22 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck wt install.sh scripts/check tests/wt_test.sh
+  shellcheck wt bin/wt install.sh scripts/check tests/wt_test.sh
 elif [ -n "${CI:-}" ]; then
   echo "[check] ERROR: CI では shellcheck が必須" >&2
   exit 1
 else
   echo "[check] shellcheck が無いため静的検査をスキップした (導入: sudo apt install shellcheck)" >&2
+fi
+
+# Claude Code plugin / marketplace マニフェストの検査。claude CLI があるときだけ実行する
+# (CI には無いので、そこでは tests 側の jq 検査が受け持つ)。
+# --strict は使わない: 唯一の warning は version 未設定で、これは意図した選択
+# (version を書くと値を変えるまでユーザーへ更新が届かず、git の sha 追従が効かなくなる)。
+if command -v claude >/dev/null 2>&1; then
+  claude plugin validate .
+else
+  echo "[check] claude が無いため plugin マニフェスト検査をスキップした" >&2
 fi
 
 tests/wt_test.sh

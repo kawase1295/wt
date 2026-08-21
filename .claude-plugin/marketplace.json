@@ -1,0 +1,32 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "wt",
+  "description": "Parallel development with git worktrees, herdr workspaces and Claude Code sessions",
+  "owner": {
+    "name": "kawase1295",
+    "url": "https://github.com/kawase1295"
+  },
+  "plugins": [
+    {
+      "name": "wt",
+      "source": "./",
+      "description": "git worktree + herdr workspace + Claude Code session as one unit. Ships the wt CLI on the Bash tool's PATH plus the /wt slash-command skills for handing work to a worktree session and landing it back.",
+      "category": "development",
+      "author": {
+        "name": "kawase1295",
+        "url": "https://github.com/kawase1295"
+      },
+      "homepage": "https://github.com/kawase1295/wt",
+      "repository": "https://github.com/kawase1295/wt",
+      "license": "MIT",
+      "keywords": [
+        "git",
+        "worktree",
+        "parallel-development",
+        "herdr",
+        "workflow",
+        "code-review"
+      ]
+    }
+  ]
+}

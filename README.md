@@ -33,6 +33,24 @@
 
 ## Install
 
+### From the plugin marketplace (Claude Code)
+
+This repository is also a Claude Code plugin marketplace, so `/plugin` installs the CLI and the skills in one step.
+
+```
+/plugin marketplace add kawase1295/wt
+/plugin install wt@wt
+```
+
+The plugin puts `wt` on the Bash tool's `PATH` and registers the skills under the plugin's namespace, so you invoke them as `/wt:wt`, `/wt:wt-review` and so on. Pick up later changes with `/plugin marketplace update wt`.
+
+Two things it does not do:
+
+- **Your own shell won't see `wt`.** That `PATH` entry belongs to Claude Code's Bash tool. To type `wt` in a terminal yourself, install the binary manually as well (below).
+- **It won't clean up after `install.sh`.** Skills already sitting in `~/.claude/skills/` keep loading next to the plugin's copies, so you get two of each. Pick one route: either delete the wt skills from `~/.claude/skills/`, or don't install the plugin.
+
+### Manually
+
 `wt` is a single file. Drop it anywhere on your `PATH`.
 
 ```bash
@@ -181,7 +199,7 @@ npm test
 
 ## Claude Code integration
 
-[`skills/`](skills/) ships 8 skills, installed into `~/.claude/skills/` by `install.sh`. They let a session in the dev (main) checkout throw work at a worktree, and let the worktree session review, land and clean up on its own. The two sides can talk while the work is in flight.
+[`skills/`](skills/) ships 8 skills, installed into `~/.claude/skills/` by `install.sh` or supplied by the [plugin](#from-the-plugin-marketplace-claude-code) (where they are namespaced: `/wt:wt-review`). They let a session in the dev (main) checkout throw work at a worktree, and let the worktree session review, land and clean up on its own. The two sides can talk while the work is in flight.
 
 | Skill | Runs on | Role |
 | --- | --- | --- |
@@ -235,9 +253,11 @@ Sessions started by older versions of Claude Code do not appear in the peer regi
 ## Development
 
 ```bash
-scripts/check     # shellcheck + tests — the same gate wt merge and CI run
-tests/wt_test.sh  # 29 tests; needs only git and coreutils (no bats)
+scripts/check     # shellcheck + manifest validation + tests — the same gate wt merge and CI run
+tests/wt_test.sh  # 31 tests; needs only git and coreutils (no bats)
 ```
+
+`scripts/check` runs `claude plugin validate .` when the `claude` CLI is around, so a broken `.claude-plugin/` manifest fails before it reaches the marketplace. The plugin entries deliberately carry no `version`: setting one pins the plugin until you bump the string, and users would stop receiving commits pushed to `main`.
 
 The tests hide `herdr` from `PATH` to force the git-worktree fallback path, stub it where the herdr path itself is under test, and point `HOME` at a temp directory so your real home is never touched.
 

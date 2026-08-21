@@ -44,11 +44,17 @@ This repository is also a Claude Code plugin marketplace, so `/plugin` installs 
 /plugin install wt@wt
 ```
 
-The plugin puts `wt` on the Bash tool's `PATH` and registers the skills under the plugin's namespace, so you invoke them as `/wt:wt`, `/wt:wt-review` and so on. Pick up later changes with `/plugin marketplace update wt`.
+The plugin puts `wt` on the Bash tool's `PATH` and registers the skills under the plugin's namespace, so you invoke them as `/wt:wt`, `/wt:wt-review` and so on.
 
-Two things it does not do:
+How later changes reach you depends on how the marketplace was added:
 
-- **Your own shell won't see `wt`.** That `PATH` entry belongs to Claude Code's Bash tool. To type `wt` in a terminal yourself, install the binary manually as well (below).
+- **GitHub source** (`/plugin marketplace add kawase1295/wt`) — the commit is snapshotted into `~/.claude/plugins/cache/`. Run `/plugin marketplace update wt` to move to a newer one.
+- **Local directory source** (`/plugin marketplace add /path/to/wt`, handy while developing) — the plugin root resolves to that checkout, so the CLI and the skills track it live. Nothing to update; a new session picks up whatever is committed there.
+
+Three things to know:
+
+- **Your own shell won't see `wt`.** That `PATH` entry belongs to Claude Code's Bash tool. You can install the binary manually as well (below) to type `wt` in a terminal — but read the next point first.
+- **A manual copy always beats the plugin's.** The plugin's `bin/` is appended at the *end* of the Bash tool's `PATH`, so a `~/.local/bin/wt` left by `install.sh` wins every lookup. If it is older than the plugin's, Claude Code silently keeps running the stale CLI — and you find out the day an upstream dependency changes its interface and `wt new` stops working. Either keep the manual copy deliberately in sync, or go plugin-only and delete it.
 - **It won't clean up after `install.sh`.** Skills already sitting in `~/.claude/skills/` keep loading next to the plugin's copies, so you get two of each. Pick one route: either delete the wt skills from `~/.claude/skills/`, or don't install the plugin.
 
 ### Manually

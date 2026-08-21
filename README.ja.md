@@ -44,11 +44,17 @@ git worktree と [herdr](https://herdr.dev) workspace を一体で管理し、�
 /plugin install wt@wt
 ```
 
-plugin は `wt` を Bash tool の `PATH` に載せ、skill を plugin の名前空間に登録する。呼び出しは `/wt:wt`、`/wt:wt-review` のようにプレフィックスが付く。更新の取り込みは `/plugin marketplace update wt`。
+plugin は `wt` を Bash tool の `PATH` に載せ、skill を plugin の名前空間に登録する。呼び出しは `/wt:wt`、`/wt:wt-review` のようにプレフィックスが付く。
 
-plugin がやらないことが 2 つある。
+更新の届き方は、マーケットプレイスの登録方法で変わる。
 
-- **自分のシェルからは `wt` が見えない。** `PATH` に載るのは Claude Code の Bash tool の中だけ。ターミナルで自分で `wt` を打つなら、下の手動配置も併せて行う。
+- **GitHub source**（`/plugin marketplace add kawase1295/wt`）— そのコミットが `~/.claude/plugins/cache/` にスナップショットされる。新しいコミットに移るには `/plugin marketplace update wt` を実行する。
+- **ローカルディレクトリ source**（`/plugin marketplace add /path/to/wt`。開発中はこちらが便利）— plugin root がその checkout に解決されるため、CLI と skill は checkout に live で追従する。更新操作は要らない。新しいセッションはそこにコミットされている内容をそのまま読む。
+
+知っておくことが 3 つある。
+
+- **自分のシェルからは `wt` が見えない。** `PATH` に載るのは Claude Code の Bash tool の中だけ。ターミナルで `wt` を打ちたいなら下の手動配置も併せて行えるが、次の項目を先に読む。
+- **手動配置は必ず plugin 版に勝つ。** plugin の `bin/` は Bash tool の `PATH` の**末尾**に足されるため、`install.sh` が置いた `~/.local/bin/wt` があればそちらが常に選ばれる。それが plugin 版より古いと、Claude Code は黙って古い CLI を使い続ける。気づくのは依存側のインターフェースが変わって `wt new` が壊れた日になる。手動配置を意識して同期し続けるか、plugin に寄せて手動配置を削除する。
 - **`install.sh` の後片付けはしない。** `~/.claude/skills/` に既にある skill は plugin 側のコピーと並んで読み込まれ、同じものが 2 つ入る。どちらか一方に寄せる（`~/.claude/skills/` から wt の skill を消すか、plugin を入れない）。
 
 ### 手動配置

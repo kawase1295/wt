@@ -13,7 +13,7 @@ description: Artifact と同一の設計規約（artifact-design）で HTML ペ�
 2. Artifact と違い自動ラップが無いので、**完全な HTML 文書**として書く。下のランタイム再現テンプレートを土台にする。
 3. 外部リソース参照は禁止（CDN・webfont・fetch）。唯一の例外は同ディレクトリに同梱する `./mermaid.min.js`。
 4. 出力先は呼び出し元の指定パス。指定が無ければ scratchpad に書く。
-5. 呼び出し元が開く手はずになっていなければ、ブラウザで開く: `explorer.exe "$(wslpath -w <path>)" || true`（explorer.exe は成功時も非 0 を返すことがあるため失敗扱いしない。wslview は未導入）。
+5. 呼び出し元が開く手はずになっていなければ、ブラウザで開く: `wt browse <path>`。プラットフォームごとの開き方（WSL の `explorer.exe` / macOS の `open` / Linux の `xdg-open`）は `wt` が吸収する。`wt` が無い環境なら、開かずにパスを報告してユーザーに開いてもらう。
 
 ## ランタイム再現テンプレート
 

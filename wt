@@ -14,6 +14,10 @@
 #       Claude Code が作る .claude/worktrees/* にも使える
 #   wt open <task>
 #       既存 worktree を herdr workspace として開き直す
+#   wt browse <path>
+#       ローカルファイルを既定のアプリ (HTML ならブラウザ) で開く。
+#       WSL / macOS / Linux の差を吸収する。skill が生成したレビューページを
+#       開くのに使う。開く手段が無ければパスを表示して失敗する
 #   wt list
 #       worktree と herdr workspace の対応を一覧表示
 #   wt peers [--json]
@@ -416,6 +420,33 @@ cmd_open() {
   log "workspace $ws で開いた: $task"
 }
 
+# ローカルファイルを既定のアプリで開く。開く手段はプラットフォームで違うので、
+# skill 側に explorer.exe を直書きせずここに閉じ込める (WSL 専用にしない)。
+cmd_browse() {
+  local target="${1:-}"
+  [ -n "$target" ] || usage 1
+  [ -e "$target" ] || die "browse: ファイルが無い: $target"
+  local abs
+  abs="$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+
+  if command -v wslview >/dev/null 2>&1; then
+    wslview "$abs" && return 0
+  fi
+  if command -v explorer.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; then
+    # explorer.exe は成功時も非 0 を返すことがあるため終了状態を見ない。
+    explorer.exe "$(wslpath -w "$abs")" >/dev/null 2>&1 || true
+    return 0
+  fi
+  # Linux の open(1) は仮想端末の切り替えで別物なので、open は Darwin 限定で使う。
+  if [ "$(uname -s)" = "Darwin" ] && command -v open >/dev/null 2>&1; then
+    open "$abs" && return 0
+  fi
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$abs" >/dev/null 2>&1 && return 0
+  fi
+  die "browse: 開く手段が見つからない (wslview / explorer.exe / open / xdg-open)。手動で開いてください: $abs"
+}
+
 cmd_list() {
   resolve_repo
   git -C "$MAIN_ROOT" worktree list
@@ -585,6 +616,10 @@ case "${1:-}" in
   open)
     shift
     cmd_open "$@"
+    ;;
+  browse)
+    shift
+    cmd_browse "$@"
     ;;
   list)
     shift

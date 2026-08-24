@@ -7,6 +7,8 @@
 #       herdr workspace を開き、bootstrap 後に Claude Code を起動する。
 #       base 省略時は本体の現在ブランチ。WT_HOME を設定すると従来の集約置き場に作る。
 #       --prompt / --prompt-file は起動する Claude への初期プロンプト (要 herdr)。
+#       プロンプトは起動 argv ではなく起動後の herdr agent prompt で投入するため、
+#       改行を含む長文もそのまま 1 ターンとして届く
 #       claude には既定で --model opus --permission-mode auto を渡す
 #       (WT_CLAUDE_ARGS で差し替え、空文字でフラグ無し。空白を含む値は不可)
 #   wt bootstrap [<path>]
@@ -320,6 +322,16 @@ cmd_bootstrap() {
   log "bootstrap 完了: $target"
 }
 
+# 初期プロンプトの投入に失敗したときに案内する再投入コマンドの引数部。
+# --prompt-file 経路ならファイルから読み直す形にして、長文を再入力させない。
+prompt_retry_arg() { # prompt_file
+  if [ -n "${1:-}" ]; then
+    printf '"$(cat %s)"' "$1"
+  else
+    printf '<プロンプト>'
+  fi
+}
+
 cmd_new() {
   local task="" base="" start_claude=1 prompt="" prompt_file=""
   while [ $# -gt 0 ]; do
@@ -400,7 +412,7 @@ cmd_new() {
     [ -n "$pane" ] ||
       die "new: workspace $ws の root pane を特定できなかった (herdr agent start に渡す pane が必要)"
     # 実行ファイルは --kind が決めるので argv には渡さない。-- 以降が claude の
-    # 引数になり、prompt は argv 1 要素のまま渡る。
+    # 引数になる。
     # 起動フラグは WT_CLAUDE_ARGS で差し替え可能。単語分割で argv 化するため、
     # 空白を含む値 (引用符付きフラグ) はサポートしない。
     # -n はセッション名を wt-<task> に固定する。この名前が Claude Code の
@@ -410,9 +422,19 @@ cmd_new() {
     local -a claude_args=(-n "wt-$task") claude_flags=()
     read -r -a claude_flags <<<"${WT_CLAUDE_ARGS---model opus --permission-mode auto}"
     [ "${#claude_flags[@]}" -gt 0 ] && claude_args+=("${claude_flags[@]}")
-    [ -n "$prompt" ] && claude_args+=("$prompt")
     herdr agent start "claude-$task" --kind claude --pane "$pane" -- "${claude_args[@]}" >/dev/null ||
       die "new: Claude Code の起動に失敗した (herdr が古い場合は herdr update)"
+    # prompt は argv ではなく agent prompt で投げる。herdr 0.8 は agent 引数を
+    # target shell 向けにエンコードするため、改行を含む argv を
+    # invalid_agent_argument で拒む。agent prompt は本文をそのまま提出でき、
+    # 複数行のプロンプトも 1 ターンとして届く。
+    # agent start の成功は「agent が入力待ちになった」ことを意味するので、
+    # 追加の待機なしにそのまま投げてよい。--wait は状態遷移の観測に依存して
+    # 誤って timeout することがあるため使わない。
+    if [ -n "$prompt" ]; then
+      herdr agent prompt "claude-$task" "$prompt" >/dev/null ||
+        die "new: 初期プロンプトの投入に失敗した (worktree と Claude は作成済み)。再投入: herdr agent prompt claude-$task $(prompt_retry_arg "$prompt_file")"
+    fi
     herdr workspace focus "$ws" >/dev/null
     log "Claude Code を workspace $ws で起動した"
   fi

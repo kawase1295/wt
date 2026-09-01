@@ -20,6 +20,7 @@
 - **Cross-session chat** — the worktree session and the dev session talk to each other directly. `wt new` pins the worktree session name to `wt-<task>`, and `wt peers` lists the addresses
 - **Repo-specific setup stays in the repo** — DB copies, native rebuilds and the like are delegated to the repo's own `scripts/worktree-setup` hook
 - **Pre-merge gate** — runs the repo's `scripts/check` in the worktree before merging and refuses to merge on failure. Same entry point your CI calls
+- **GitHub issue / PR integration (skills)** — `/wt` files an issue and ties its number into the worktree name and the initial prompt; `/wt-merge` opens a PR with `Fixes #N`. Task = issue = branch = PR, one-to-one. Repos without a remote keep the plain local merge
 - **Graceful fallback** — if the herdr server is unreachable, it just creates the git worktree and carries on
 
 ## Requirements
@@ -32,6 +33,7 @@
 | jq | when using herdr, and for `wt peers` | parsing herdr JSON output and the Claude Code session registry |
 | python3 | for `/wt-review` | `skills/wt-review/assets/render.py` builds the review page (standard library only) |
 | curl | for mermaid diagrams in a review page | fetching `mermaid.min.js` once into `~/.cache/wt/` |
+| [gh](https://cli.github.com/) | optional | GitHub issue / PR integration (`/wt` files issues, `/wt-merge` opens PRs, `/wt-clean` verifies the PR merged). Without it, the plain local flow |
 
 ## Install
 
@@ -220,20 +222,28 @@ A skill is not always a lone `SKILL.md`. `/wt-review` bundles the review page's 
 
 | Skill | Runs on | Role |
 | --- | --- | --- |
-| `/wt <task description>` | dev | Derives a worktree name and launches the worktree + Claude Code with the description as the initial prompt |
-| `/wt-detail <task description>` | dev | Explores the codebase, asks you about anything underspecified, builds an implementation plan, and passes it to the worktree as the initial prompt |
+| `/wt <task description>` | dev | Derives a worktree name and launches the worktree + Claude Code with the description as the initial prompt. On GitHub repos it files an issue first (`/wt #123` reuses an existing one) and ties the number into the name and the prompt |
+| `/wt-detail <task description>` | dev | Explores the codebase, asks you about anything underspecified, builds an implementation plan, and passes it to the worktree as the initial prompt. On GitHub repos it files an issue once the plan is settled and records the full plan there |
 | `/wt-review` | worktree | Fills the bundled page template from the diff with `assets/render.py`, opens the result in the browser, and waits for approval before merging |
-| `/wt-merge` | worktree | Merges its own branch into the main checkout's current branch (runs `scripts/check` first if present; reports conflicts and stops) |
-| `/wt-clean` | worktree | Verifies nothing is uncommitted or unmerged, then removes its own worktree and closes the workspace |
+| `/wt-merge` | worktree | On GitHub repos: `scripts/check` → push → open a PR with `Fixes #N` (never merges it itself). Without a remote: merges its own branch into the main checkout's current branch (reports conflicts and stops) |
+| `/wt-clean` | worktree | Verifies nothing is uncommitted and the work has landed (PR merged, or merged into the main checkout), then removes its own worktree and closes the workspace |
 | `/wt-ask <message>` | both | Resolves the other session's address via `wt peers`, sends a question or status report, and waits for the reply |
 | `worktree-parallel` | both | Policy for choosing between `wt` and native worktrees, plus the `.worktreeinclude` contract ([skills/worktree-parallel/SKILL.md](skills/worktree-parallel/SKILL.md)) |
 | `local-artifact` | both | Contract for building HTML with the same design rules as Artifacts but publishing locally instead of to claude.ai. `/wt-review` no longer loads it — its template already carries the skeleton, theme toggle and mermaid |
 
-A typical flow:
+A typical flow (GitHub repo):
 
 ```
 dev:      /wt fix validation on the login screen
-           -> worktree + workspace open, Claude starts with the task description
+           -> issue #42 filed; worktree + workspace open, Claude starts with the issue body
+worktree: (implement, commit) -> /wt-review -> (you review and approve) -> /wt-merge
+           -> PR opened (Fixes #42; CI runs scripts/check) -> (you merge the PR on GitHub)
+           -> /wt-clean -> worktree, workspace and branch disappear
+```
+
+Task = issue = branch (`worktree-42-fix-login-validation`) = PR, one-to-one, and merging the PR closes the issue. On repos without a GitHub remote (or without `gh`), the issue / PR steps drop out and `/wt-merge` becomes a local merge into the main checkout's current branch:
+
+```
 worktree: (implement, commit) -> /wt-review -> (you review and approve) -> /wt-merge -> /wt-clean
            -> work lands on the main branch; worktree, workspace and branch disappear
 ```

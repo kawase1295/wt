@@ -21,6 +21,7 @@ git worktree と [herdr](https://herdr.dev) workspace を一体で管理し、�
 - **repo 固有の準備を委譲** — DB コピーや native rebuild などは repo 側の `scripts/worktree-setup` に委ねる契約
 - **マージ前チェック** — repo 側の `scripts/check` をマージ前に worktree で実行し、失敗したら取り込まない。CI と同一のエントリポイントを共有する契約
 - **GitHub issue / PR 連携（skill）** — `/wt` が issue を起票して worktree 名と初期プロンプトに紐付け、`/wt-merge` が `Fixes #N` 付きの PR を作成する。タスク = issue = ブランチ = PR が 1:1 で対応する。remote の無い repo では従来のローカルマージ
+- **本体 checkout のガード（hook）** — 本体 checkout でブランチを切って直接作業しようとすると `PreToolUse` hook が確認を出す。worktree を経由しない作業を、skill の文章ではなく Bash の実行前検査で止める（plugin 経由のみ）
 - **graceful fallback** — herdr サーバに接続できなければ `git worktree` の作成だけで続行する
 
 ## 前提
@@ -78,6 +79,8 @@ WT_INSTALL_SKILLS=0 ./install.sh # skill を配置しない
 ```
 
 skill は wt の管理物として扱う。install のたびに skill ディレクトリを作り直すため、repo から消えたファイルは配置先にも残らない — ローカルの改変も残らない。改変している場合は `WT_INSTALL_SKILLS=0` で守る。
+
+[ブランチ切替のガード](#本体-checkout-のガードhook)は plugin の機構でのみ読み込まれる。`install.sh` が配るのは skill までなので、手動配置では hook は有効にならない。
 
 ## 使い方
 
@@ -246,6 +249,28 @@ worktree 側: (実装・コミット) → /wt-review → (ユーザーがレビ�
 worktree 側: (実装・コミット) → /wt-review → (ユーザーがレビュー・承認) → /wt-merge → /wt-clean
               → 本体に取り込まれ、worktree / workspace / ブランチが消えて閉じる
 ```
+
+### 本体 checkout のガード（hook）
+
+wt の運用は「タスク = issue = ブランチ = PR」を worktree に 1:1 で対応させる。本体 checkout でブランチを切って直接作業してしまうと、この対応も `/wt-review` のレビューゲートも通らない。skill の文章は skill が起動して初めて読まれるので、起動しない経路（「issue を確認して」からそのまま実装に流れる等）には効かない。
+
+そこで plugin は `PreToolUse` hook（[`hooks/main-checkout-guard.sh`](hooks/main-checkout-guard.sh)）を同梱し、Bash の実行前に検査する。**本体 checkout での**ブランチ切替（`git checkout -b` / `git switch -c` / 既存ブランチへの `checkout`。ローカルに無くても remote に同名があれば git が追跡ブランチを作って切り替えるので、それも含む）を見つけたら `ask` を返し、`/wt` を使う選択肢を添えてユーザーに確認を出す。
+
+`deny` ではなく `ask` にしている。本体のブランチを動かす正当な用途（dev / main の行き来、rebase、緊急のブランチ確認）を詰まらせないため。
+
+素通しする経路:
+
+- linked worktree の中（worktree 側は自分のブランチを自由に操作してよい）
+- 切替先が許可ブランチ — `origin/HEAD` の指す default branch と `main` / `master` / `dev`
+- `git checkout -- <path>` などのファイル復元、ブランチでない対象への `checkout`
+- git work tree でない場所、JSON を読む手段（`jq` / `python3`）が無い環境
+
+最後の 1 つのとおり、判定できない入力では素通しする。hook の不調がそのまま Bash 全体の停止になるのを避けるため、ガードは fail-open にしている。
+
+| 環境変数 | 効果 |
+| --- | --- |
+| `WT_GUARD_DISABLE=1` | hook を無効化する |
+| `WT_GUARD_ALLOW_BRANCHES` | 許可ブランチをカンマ区切りで差し替える（default branch は常に許可）。空文字なら default branch だけ |
 
 ### セッション間の会話（dev ↔ worktree）
 

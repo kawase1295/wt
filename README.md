@@ -21,6 +21,7 @@
 - **Repo-specific setup stays in the repo** — DB copies, native rebuilds and the like are delegated to the repo's own `scripts/worktree-setup` hook
 - **Pre-merge gate** — runs the repo's `scripts/check` in the worktree before merging and refuses to merge on failure. Same entry point your CI calls
 - **GitHub issue / PR integration (skills)** — `/wt` files an issue and ties its number into the worktree name and the initial prompt; `/wt-merge` opens a PR with `Fixes #N`. Task = issue = branch = PR, one-to-one. Repos without a remote keep the plain local merge
+- **Guards the main checkout (hook)** — a `PreToolUse` hook asks for confirmation when something tries to branch off and work directly in the main checkout. Work that bypasses a worktree is stopped by a pre-execution check on Bash, not by prose in a skill (plugin only)
 - **Graceful fallback** — if the herdr server is unreachable, it just creates the git worktree and carries on
 
 ## Requirements
@@ -78,6 +79,8 @@ WT_INSTALL_SKILLS=0 ./install.sh # skip the skills
 ```
 
 Skills are owned by `wt`: every install recreates each skill directory, so files dropped upstream do not linger — and neither do local edits. If you have edited them locally, protect them with `WT_INSTALL_SKILLS=0`.
+
+The [branch-switch guard](#guarding-the-main-checkout-hook) is loaded through the plugin mechanism only. `install.sh` stops at the skills, so a manual install leaves the hook inactive.
 
 ## Usage
 
@@ -249,6 +252,28 @@ Task = issue = branch (`worktree-42-fix-login-validation`) = PR, one-to-one, and
 worktree: (implement, commit) -> /wt-review -> (you review and approve) -> /wt-merge -> /wt-clean
            -> work lands on the main branch; worktree, workspace and branch disappear
 ```
+
+### Guarding the main checkout (hook)
+
+`wt` keeps task = issue = branch = PR mapped one-to-one onto a worktree. Branching off and working directly in the main checkout breaks that mapping and skips the `/wt-review` gate. Prose in a skill only gets read once the skill fires, so it does nothing on the paths where no skill fires (asking to "look at issue #N" and sliding straight into implementation, say).
+
+So the plugin ships a `PreToolUse` hook ([`hooks/main-checkout-guard.sh`](hooks/main-checkout-guard.sh)) that inspects Bash before it runs. When it sees a branch switch **in the main checkout** (`git checkout -b`, `git switch -c`, or a `checkout` of an existing branch — including a name that only exists on the remote, which git turns into a tracking branch) it returns `ask`, prompting you with `/wt` as the alternative.
+
+It asks rather than denies: moving the main checkout's branch has legitimate uses — hopping between dev and main, rebasing, checking a branch in a hurry — and none of those should be dead ends.
+
+It stays out of the way when:
+
+- you are inside a linked worktree (a worktree session owns its branch)
+- the target is an allowed branch — whatever `origin/HEAD` points at, plus `main` / `master` / `dev`
+- the command restores files (`git checkout -- <path>`) or checks out something that is not a branch
+- the directory is not a git work tree, or neither `jq` nor `python3` is available to read the hook's JSON
+
+That last case is deliberate: the guard fails open, because a misbehaving hook that fails closed would take all of Bash down with it.
+
+| Environment variable | Effect |
+| --- | --- |
+| `WT_GUARD_DISABLE=1` | Turn the hook off |
+| `WT_GUARD_ALLOW_BRANCHES` | Replace the allowed branch names (comma-separated). The default branch is always allowed; an empty value leaves only the default branch |
 
 ### Cross-session chat (dev <-> worktree)
 

@@ -20,7 +20,7 @@ git worktree と [herdr](https://herdr.dev) workspace を一体で管理し、�
 - **セッション間の会話** — worktree 側と dev 側の Claude Code セッションが直接やり取りできる。`wt new` が worktree 側のセッション名を `wt-<task>` に固定し、`wt peers` が宛先を一覧する
 - **repo 固有の準備を委譲** — DB コピーや native rebuild などは repo 側の `scripts/worktree-setup` に委ねる契約
 - **マージ前チェック** — repo 側の `scripts/check` をマージ前に worktree で実行し、失敗したら取り込まない。CI と同一のエントリポイントを共有する契約
-- **GitHub issue / PR 連携（skill）** — `/wt` が issue を起票して worktree 名と初期プロンプトに紐付け、`/wt-merge` が `Fixes #N` 付きの PR を作成する。タスク = issue = ブランチ = PR が 1:1 で対応する。remote の無い repo では従来のローカルマージ
+- **GitHub issue / PR 連携（skill）** — `/wt` が issue を起票して worktree 名と初期プロンプトに紐付け、`/wt-merge` が `Fixes #N` 付きの PR を作成し、`/wt-review` の承認を通っていれば CI の完了を待ってマージまで実行する。タスク = issue = ブランチ = PR が 1:1 で対応する。remote の無い repo では従来のローカルマージ
 - **本体 checkout のガード（hook）** — 本体 checkout でブランチを切って直接作業しようとすると `PreToolUse` hook が確認を出す。worktree を経由しない作業を、skill の文章ではなく Bash の実行前検査で止める（plugin 経由のみ）
 - **graceful fallback** — herdr サーバに接続できなければ `git worktree` の作成だけで続行する
 
@@ -227,7 +227,7 @@ skill は `SKILL.md` 1 枚に限らない。`/wt-review` はレビューペー�
 | `/wt <作業内容>` | dev | worktree 名を生成し、作業内容を初期プロンプトとして worktree + Claude Code を起動。GitHub リポジトリでは先に issue を起票（`/wt #123` で既存 issue も可）し、番号を名前とプロンプトに紐付ける |
 | `/wt-detail <作業内容>` | dev | コードベースを調査し、仕様の不明点をユーザーに確認してから実装プランを作り、初期プロンプトとして worktree に渡す。GitHub リポジトリではプラン確定後に issue を起票し、プラン全文を issue に残す |
 | `/wt-review` | worktree | 同梱テンプレートに diff を `assets/render.py` で差し込んでレビュー用 HTML を作り、ブラウザで開いて承認を待つ |
-| `/wt-merge` | worktree | GitHub リポジトリでは `scripts/check` → push → `Fixes #N` 付きの PR を作成（自分ではマージしない）。remote が無ければ本体の現在ブランチへローカルマージ（コンフリクトは報告して停止） |
+| `/wt-merge` | worktree | GitHub リポジトリでは `scripts/check` → push → `Fixes #N` 付きの PR を作成 → 承認ゲートを通っていれば CI の完了を待って `gh pr merge --merge` → remote ブランチを削除（未通過なら PR 作成で停止）。remote が無ければ本体の現在ブランチへローカルマージ（コンフリクトは報告して停止） |
 | `/wt-clean` | worktree | 未コミットと取り込み状態（PR の MERGED / 本体への未マージ）を検査し、クリーンなら自分の worktree を片付けて workspace を閉じる |
 | `/wt-ask <内容>` | 両方 | `wt peers` で相手セッションの宛先を解決し、質問・報告を送って返答を受ける |
 | `worktree-parallel` | 両方 | `wt` と native worktree の使い分け方針・`.worktreeinclude` の契約（[skills/worktree-parallel/SKILL.md](skills/worktree-parallel/SKILL.md)） |
@@ -239,11 +239,11 @@ skill は `SKILL.md` 1 枚に限らない。`/wt-review` はレビューペー�
 dev 側:      /wt ログイン画面のバリデーション修正
               → issue #42 を起票し、worktree + workspace が開き、Claude が issue 本文付きで起動する
 worktree 側: (実装・コミット) → /wt-review → (ユーザーがレビュー・承認) → /wt-merge
-              → PR 作成（Fixes #42。CI が scripts/check を実行）→ (GitHub で PR をマージ)
+              → PR 作成（Fixes #42）→ CI (scripts/check) の完了を待つ → gh pr merge
               → /wt-clean → worktree / workspace / ブランチが消えて閉じる
 ```
 
-タスク = issue = ブランチ（`worktree-42-fix-login-validation`）= PR が 1:1 で対応し、PR のマージで issue が自動で閉じる。GitHub remote が無い repo（または gh が無い環境）では issue / PR の手順が抜け、`/wt-merge` は本体の現在ブランチへのローカルマージになる:
+タスク = issue = ブランチ（`worktree-42-fix-login-validation`）= PR が 1:1 で対応し、PR のマージで issue が自動で閉じる。マージ判断の実体は `/wt-review` の承認ゲートなので、通過したセッションはマージまで自分で実行する（未通過なら PR 作成で止まり、ユーザーの判断を待つ）。GitHub remote が無い repo（または gh が無い環境）では issue / PR の手順が抜け、`/wt-merge` は本体の現在ブランチへのローカルマージになる:
 
 ```
 worktree 側: (実装・コミット) → /wt-review → (ユーザーがレビュー・承認) → /wt-merge → /wt-clean

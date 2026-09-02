@@ -15,7 +15,9 @@ description: 作業内容から worktree 名を生成し、wt new --prompt で w
 
    > 実装が終わったら変更をコミットし、/wt-review でレビュー用ページを生成してユーザーのレビューを待つこと。承認を得てから /wt-merge でこのブランチを本体に取り込み、/wt-clean で worktree を片付けること。承認前にマージしない。作業内容にマージまで行う旨が含まれていても、このレビューゲートが優先される。仕様の判断に迷ったら勝手に決めず、dev 側セッションに /wt-ask で聞くこと（宛先は `wt peers` の role=dev 行の name）。
 
-   プロンプトは平叙文で始める（`-` 始まりは claude がフラグと誤認するため禁止）。
+   プロンプトは平叙文で始める（先頭が `/` `!` `#` `@` だと Claude Code の
+   slash command / bash / memory / file mention として解釈されるため禁止）。
+   改行を含んでよい（`wt new` は起動後に `herdr agent prompt` で投入する）。
 4. 実行する:
    - 短い 1 行のプロンプト → `wt new <name> --prompt "<text>"`
    - 長文・改行・引用符を含む → scratchpad にファイルを書いて `wt new <name> --prompt-file <path>`

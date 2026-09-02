@@ -309,10 +309,12 @@ else
   fail "rm: 本体で task 省略なら die する (rc=$rc out=$out)"
 fi
 
-# --- test 21: fake herdr で claude の起動 argv を検証する ---
+# --- test 21: fake herdr で claude の起動 argv とプロンプト投入を検証する ---
 # 新しい herdr API では実行ファイルを argv で渡さず、agent start <name>
 # --kind claude --pane <root pane> -- <claude の引数> で起動する。
-# 既定で --model opus --permission-mode auto が入り、--prompt は argv 1 要素のまま渡る。
+# 既定で --model opus --permission-mode auto が入る。
+# プロンプトは argv では渡さない: herdr 0.8 は agent 引数に改行を通せない
+# (invalid_agent_argument) ため、起動後に agent prompt で 1 要素として投げる。
 # WT_CLAUDE_ARGS でフラグを差し替えられ、空文字ならフラグ無しになる。
 if [ -x /usr/bin/jq ]; then
   mkdir -p "$TMP/bin"
@@ -350,6 +352,16 @@ case "$cmd" in
     : >"$HERDR_ARGV_LOG"
     for a in "$@"; do printf '%s\n' "$a" >>"$HERDR_ARGV_LOG"; done
     ;;
+  "agent prompt")
+    shift 2
+    if [ "${HERDR_STUB_PROMPT_FAIL:-0}" = "1" ]; then
+      printf '{"error":{"code":"agent_not_found"}}\n'
+      exit 1
+    fi
+    # 宛先と本文を別ファイルに分けて、本文の改行をそのまま保存する
+    printf '%s\n' "$1" >"$HERDR_PROMPT_LOG.target"
+    printf '%s' "$2" >"$HERDR_PROMPT_LOG.text"
+    ;;
   *) exit 0 ;;
 esac
 STUB
@@ -361,41 +373,85 @@ STUB
   R21="$TMP/repo21"
   new_repo "$R21"
   LOG21="$TMP/agent-argv.log"
+  PLOG21="$TMP/agent-prompt"
   (cd "$R21" && env -u WT_HOME -u WT_CLAUDE_ARGS HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21" \
+    HERDR_PROMPT_LOG="$PLOG21" \
     PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21 --prompt "hello world") >/dev/null 2>&1
   assert_eq "stub: agent start は名前 + --kind claude + worktree の root pane を渡す" \
     "claude-p21 --kind claude --pane ws-stub:p1" "$(herdr_opts_of "$LOG21" | paste -sd' ' -)"
   argc="$(claude_args_of "$LOG21" | wc -l | tr -d ' ')"
-  assert_eq "stub: claude 引数が -n + 既定フラグ + prompt の 7 要素" "7" "$argc"
+  assert_eq "stub: claude 引数は -n + 既定フラグの 6 要素 (prompt を含まない)" "6" "$argc"
   assert_eq "stub: 実行ファイル名は argv に含めず --kind に委ねる" \
     "0" "$(claude_args_of "$LOG21" | grep -c '^claude$')"
   assert_eq "stub: セッション名を -n wt-<task> に固定する" \
     "-n wt-p21" "$(claude_args_of "$LOG21" | sed -n 1,2p | paste -sd' ' -)"
   assert_eq "stub: 既定フラグが --model opus --permission-mode auto" \
     "--model opus --permission-mode auto" "$(claude_args_of "$LOG21" | sed -n 3,6p | paste -sd' ' -)"
-  assert_eq "stub: 末尾 argv が prompt 全体 (分割されない)" \
-    "hello world" "$(claude_args_of "$LOG21" | sed -n 7p)"
+  assert_eq "stub: prompt を agent start の argv に載せない" \
+    "0" "$(claude_args_of "$LOG21" | grep -c 'hello world')"
+  assert_eq "stub: agent prompt の宛先が agent 名 claude-<task>" \
+    "claude-p21" "$(cat "$PLOG21.target" 2>/dev/null)"
+  assert_eq "stub: agent prompt の本文が prompt 全体" \
+    "hello world" "$(cat "$PLOG21.text" 2>/dev/null)"
+
+  # 改行入りプロンプト: argv 経路は herdr が invalid_agent_argument で拒むので、
+  # agent prompt に 1 要素で渡し、本文をバイト単位で保つ (畳まない)。
+  LOG21E="$TMP/agent-argv-e.log"
+  PLOG21E="$TMP/agent-prompt-e"
+  ML21="$TMP/prompt-multiline.txt"
+  printf '%s' '1 行目: 調査から始める
+- 箇条書き 1
+- 箇条書き 2
+
+## 見出し
+最終行' >"$ML21"
+  (cd "$R21" && env -u WT_HOME -u WT_CLAUDE_ARGS HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21E" \
+    HERDR_PROMPT_LOG="$PLOG21E" \
+    PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21e --prompt-file "$ML21") >/dev/null 2>&1
+  assert_eq "stub: 改行入り prompt でも agent start の argv は 6 要素のまま" \
+    "6" "$(claude_args_of "$LOG21E" | wc -l | tr -d ' ')"
+  if cmp -s "$ML21" "$PLOG21E.text"; then
+    pass "stub: 改行入り prompt が agent prompt に原文のまま渡る"
+  else
+    fail "stub: 改行入り prompt が agent prompt に原文のまま渡る (got=$(cat "$PLOG21E.text" 2>/dev/null))"
+  fi
+
+  # agent prompt が失敗したらプロンプトを黙って落とさず die する
+  LOG21F="$TMP/agent-argv-f.log"
+  PLOG21F="$TMP/agent-prompt-f"
+  out="$(cd "$R21" && env -u WT_HOME -u WT_CLAUDE_ARGS HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21F" \
+    HERDR_PROMPT_LOG="$PLOG21F" HERDR_STUB_PROMPT_FAIL=1 \
+    PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21f --prompt "hi" 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'herdr agent prompt'; then
+    pass "stub: agent prompt 失敗時は die して再投入コマンドを案内する"
+  else
+    fail "stub: agent prompt 失敗時は die して再投入コマンドを案内する (rc=$rc out=$out)"
+  fi
 
   # WT_CLAUDE_ARGS でフラグを差し替える (-n は残る)
   LOG21B="$TMP/agent-argv-b.log"
-  (cd "$R21" && env -u WT_HOME HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21B" WT_CLAUDE_ARGS="--model sonnet" \
+  (cd "$R21" && env -u WT_HOME HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21B" \
+    HERDR_PROMPT_LOG="$TMP/agent-prompt-b" WT_CLAUDE_ARGS="--model sonnet" \
     PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21b --prompt "hi") >/dev/null 2>&1
   assert_eq "stub: WT_CLAUDE_ARGS でフラグを差し替えられる" \
-    "-n wt-p21b --model sonnet hi" "$(claude_args_of "$LOG21B" | paste -sd' ' -)"
+    "-n wt-p21b --model sonnet" "$(claude_args_of "$LOG21B" | paste -sd' ' -)"
 
   # WT_CLAUDE_ARGS="" (空文字) でフラグ無し (-n は残る)
   LOG21C="$TMP/agent-argv-c.log"
-  (cd "$R21" && env -u WT_HOME HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21C" WT_CLAUDE_ARGS="" \
+  (cd "$R21" && env -u WT_HOME HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21C" \
+    HERDR_PROMPT_LOG="$TMP/agent-prompt-c" WT_CLAUDE_ARGS="" \
     PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21c --prompt "hi") >/dev/null 2>&1
   assert_eq "stub: WT_CLAUDE_ARGS 空文字でもセッション名は付く" \
-    "-n wt-p21c hi" "$(claude_args_of "$LOG21C" | paste -sd' ' -)"
+    "-n wt-p21c" "$(claude_args_of "$LOG21C" | paste -sd' ' -)"
 
   # WT_CLAUDE_ARGS の -n は既定名より後ろに置かれ、claude 側で後勝ちになる
   LOG21D="$TMP/agent-argv-d.log"
-  (cd "$R21" && env -u WT_HOME HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21D" WT_CLAUDE_ARGS="-n custom" \
+  (cd "$R21" && env -u WT_HOME HOME="$TMP/home" HERDR_ARGV_LOG="$LOG21D" \
+    HERDR_PROMPT_LOG="$TMP/agent-prompt-d" WT_CLAUDE_ARGS="-n custom" \
     PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21d --prompt "hi") >/dev/null 2>&1
   assert_eq "stub: WT_CLAUDE_ARGS の -n が既定名より後に来る" \
-    "-n wt-p21d -n custom hi" "$(claude_args_of "$LOG21D" | paste -sd' ' -)"
+    "-n wt-p21d -n custom" "$(claude_args_of "$LOG21D" | paste -sd' ' -)"
 else
   pass "stub: jq が無いためスキップ"
 fi

@@ -87,6 +87,8 @@ wt new <task> [--base <ref>] [--no-claude] [--prompt <text>|--prompt-file <path>
     herdr workspace を開き、bootstrap 後に Claude Code を起動する
     （base 省略時は本体の現在ブランチ）。
     --prompt / --prompt-file は起動する Claude への初期プロンプト（要 herdr）。
+    プロンプトは起動 argv ではなく起動後の herdr agent prompt で投入するので、
+    改行入りの長文もそのまま 1 ターンとして届く。
     claude には既定で --model opus --permission-mode auto を渡す
     （WT_CLAUDE_ARGS で差し替え、空文字でフラグ無し。空白を含む値は不可）
 

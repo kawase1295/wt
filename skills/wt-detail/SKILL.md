@@ -37,7 +37,7 @@ description: コードベースを調査し、仕様の不明点をユーザー�
 
    > 承認を得てから /wt-merge で PR を作成すること（ブランチが push され、PR 本文の Fixes #N でこの issue が閉じる）。PR がマージされたら /wt-clean で worktree を片付けること。承認前に PR を作らない。
 
-8. scratchpad にプランをファイルとして書き、worktree 名を生成して `wt new <name> --prompt-file <planfile>` を実行する。名前は作業内容を要約した小文字 kebab-case（`[a-z0-9-]`）。GitHub 連携時は `<issue番号>-` を先頭に付けて 2〜3 語、番号なしなら 2〜4 語・30 字以内。`git branch --list 'worktree-*'` で衝突を確認し、衝突したら語を変える。ただし同じ issue 番号のブランチ（`worktree-<N>-*`）が既にあるときは別名を作らず、既存 worktree を報告して `wt open <task>` を案内して止まる。
+8. scratchpad にプランをファイルとして書き、worktree 名を生成して `wt new <name> --prompt-file <planfile>` を実行する。プランは平叙文で始める（先頭が `/` `!` `#` `@` なら `wt new` が worktree を作る前に die する）。名前は作業内容を要約した小文字 kebab-case（`[a-z0-9-]`）。GitHub 連携時は `<issue番号>-` を先頭に付けて 2〜3 語、番号なしなら 2〜4 語・30 字以内。`git branch --list 'worktree-*'` で衝突を確認し、衝突したら語を変える。ただし同じ issue 番号のブランチ（`worktree-<N>-*`）が既にあるときは別名を作らず、既存 worktree を報告して `wt open <task>` を案内して止まる。
 9. 起動を報告し、issue URL（GitHub 連携時）、プランの要約（確定仕様・変更ファイル・手順の骨子）と、**確認せずに置いた前提**をユーザーに提示する。前提が違っていた場合は `/wt-ask` で worktree 側に訂正を送れる旨を添える。
 
 ## エラー時

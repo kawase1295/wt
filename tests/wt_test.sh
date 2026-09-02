@@ -206,6 +206,33 @@ for t in p14a p14b p14c p14d; do
   fi
 done
 
+# --- test 14b: プロンプト本文の先頭 / ! # @ も worktree を作る前に弾く ---
+# Claude Code が slash command / bash / memory / file mention として解釈するため。
+assert_prompt_err "先頭 / を弾く" '先頭文字' p14e --prompt "/wt-review でレビューする"
+assert_prompt_err "先頭 ! を弾く" '先頭文字' p14f --prompt "!ls を実行する"
+assert_prompt_err "先頭 # を弾く" '先頭文字' p14g --prompt "#4 の対応をする"
+assert_prompt_err "先頭 @ を弾く" '先頭文字' p14h --prompt "@README.md を読む"
+assert_prompt_err "先頭の空白・改行越しでも弾く" '先頭文字' p14i --prompt $'  \n\t/wt-review でレビューする'
+P14J="$TMP/prompt-lead.txt"
+printf '\n  @README.md を読む\n' >"$P14J"
+assert_prompt_err "--prompt-file の本文先頭も弾く" '先頭文字' p14j --prompt-file "$P14J"
+for t in p14e p14f p14g p14h p14i p14j; do
+  if [ -d "$R14/.claude/worktrees/$t" ] || has_branch "$R14" "worktree-$t"; then
+    fail "prompt: 先頭文字エラーで worktree/ブランチを作らない ($t)"
+  else
+    pass "prompt: 先頭文字エラーで worktree/ブランチを作らない ($t)"
+  fi
+done
+# 正常系: 平叙文で始まれば先頭文字チェックを通り、次の herdr チェックまで進む
+out="$(wt_local "$R14" new p14k --prompt "実装したら /wt-review を呼ぶ #4" 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'herdr' &&
+  ! printf '%s' "$out" | grep -q '先頭文字'; then
+  pass "prompt: 本文途中の / # は先頭文字チェックに掛からない"
+else
+  fail "prompt: 本文途中の / # は先頭文字チェックに掛からない (rc=$rc out=$out)"
+fi
+
 # --- test 15: herdr 不可で --prompt はプロンプトを取りこぼさないよう die する ---
 out="$(wt_local "$R14" new p15 --prompt "hello" 2>&1)"
 rc=$?

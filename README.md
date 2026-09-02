@@ -91,6 +91,8 @@ wt new <task> [--base <ref>] [--no-claude] [--prompt <text>|--prompt-file <path>
     --prompt / --prompt-file is the initial prompt for the launched Claude (needs herdr).
     The prompt is submitted after launch via herdr agent prompt rather than as a
     startup argv, so multi-line prompts arrive intact as a single turn.
+    A body whose first non-space character is / ! # or @ is rejected: Claude Code
+    would read it as a slash command / bash / memory / file mention.
     claude is invoked with --model opus --permission-mode auto by default
     (override via WT_CLAUDE_ARGS; empty string means no flags; values containing
     spaces are not supported)

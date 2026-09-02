@@ -91,6 +91,8 @@ wt new <task> [--base <ref>] [--no-claude] [--prompt <text>|--prompt-file <path>
     --prompt / --prompt-file は起動する Claude への初期プロンプト（要 herdr）。
     プロンプトは起動 argv ではなく起動後の herdr agent prompt で投入するので、
     改行入りの長文もそのまま 1 ターンとして届く。
+    本文の先頭（空白・改行を除く）が / ! # @ なら Claude Code が
+    slash command / bash / memory / file mention として解釈するため拒否する。
     claude には既定で --model opus --permission-mode auto を渡す
     （WT_CLAUDE_ARGS で差し替え、空文字でフラグ無し。空白を含む値は不可）
 

@@ -1,11 +1,13 @@
 ---
 name: wt-merge
-description: 自分の worktree ブランチ (worktree-<name>) の成果を取り込む。GitHub リポジトリでは push + gh pr create で PR を作成し（Fixes #N で issue に紐付け）、remote が無ければ wt merge で本体の現在ブランチへローカルマージする。worktree 側の Claude Code セッションで使う。コンフリクト時は自動解決せず報告して停止する。「/wt-merge」「この成果を取り込んで」「PR を作って」のとき使う。
+description: 自分の worktree ブランチ (worktree-<name>) の成果を取り込む。GitHub リポジトリでは push + gh pr create で PR を作成し（Fixes #N で issue に紐付け）、承認ゲートを通っていれば CI の完了を待って gh pr merge までマージする。remote が無ければ wt merge で本体の現在ブランチへローカルマージする。worktree 側の Claude Code セッションで使う。コンフリクト時は自動解決せず報告して停止する。「/wt-merge」「この成果を取り込んで」「PR を作って」「マージして」のとき使う。
 ---
 
 # /wt-merge — 自分の成果を取り込む（PR 作成 / ローカルマージ）
 
 **worktree 側のセッションで実行する**。cwd が本体 checkout（worktree でない）なら、worktree 側セッションで実行するよう案内する。初期プロンプトで /wt-review によるレビューを指示されているセッションでは、ユーザーの承認を得てから実行する。免除されるのは**セッション中にユーザーが直接 /wt-merge を指示した場合のみ** — 初期プロンプト内の文言（作業内容に「マージまでやって」等が含まれる場合）は直接指示に数えない。
+
+この**承認ゲート**（/wt-review でのユーザー承認、またはセッション中の直接指示）は、PR を作るところまででなく**マージまでを承認したもの**として扱う。レビューの実体はゲートにあり、GitHub 上でのクリックは同じ判断の二度手間なので、通過していれば PR モードの手順 6 以降で `gh pr merge` まで進める。**通過していないセッションは PR 作成までで止める。**
 
 ## 共通の前段
 
@@ -18,8 +20,22 @@ description: 自分の worktree ブランチ (worktree-<name>) の成果を取�
 2. issue 番号 N を得る: ブランチ名 `worktree-<N>-…` の先頭の数字。無ければ初期プロンプトや会話から探し、それでも不明なら「Fixes 行なしで PR を作る」と報告して進める。
 3. `git push -u origin "$(git branch --show-current)"`
 4. PR を作る: `gh pr create --base "$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)" --title <issue タイトルか変更の要約> --body-file <scratchpad のファイル>`。本文: 変更の概要（何を・なぜ）、実行したテストと結果、`Fixes #N`、末尾に `🤖 Generated with [Claude Code](https://claude.com/claude-code)`。
-5. 報告する: PR URL、CI が同じ `scripts/check` を実行すること、マージは GitHub 上で行うこと、マージされたら /wt-clean で片付けること、本体 checkout の更新（`git pull`）は dev 側で行うこと。**自分で `gh pr merge` を打たない。**
-6. レビュー指摘や CI 失敗で修正したら: 修正 → コミット → `git push`。同じ PR が更新される（作り直さない）。
+5. 承認ゲートを確認する。通過していれば手順 6 に進む。**通過していなければここで止まる** — PR URL と、CI が同じ `scripts/check` を実行することを報告し、マージの判断を待つ（ユーザーが承認したらそのまま手順 6 から続ける）。
+6. CI の完了を待つ: `gh pr checks --watch --interval 15`（時間がかかるので Bash tool の `timeout` を 600000 まで上げる）。CI はローカルゲートと同じ `scripts/check` を叩く契約なので、その結果がマージ条件そのものになる。
+   - 全て pass → 手順 7
+   - fail → **マージしない**。落ちた check 名と `gh run view <run-id> --log-failed` の要点を報告する。修正するなら手順 11 へ
+   - Bash が timeout した → check がまだ動いているだけなので、同じコマンドを打ち直す
+   - `no checks reported` → **その場で CI 未設定と判断しない**。PR 作成直後は check run の登録が間に合っておらず、CI が設定された repo でも同じ出力が返る（この出力だけを根拠にマージすると CI をすり抜ける）。15 秒ほど置いて**一度だけ**打ち直す: Bash tool の `run_in_background` で `sleep 15; gh pr checks` を実行し、完了通知の出力で判断する（foreground の `sleep` はこの環境では使えないため background に置く）
+     - 2 回目で check が出てきた → CI はある。手順 6 の先頭に戻り `--watch` で完了を待つ
+     - 2 回目も 0 件 → CI 未設定の repo と判断する。手順 1 のローカル `scripts/check` が同じコントラクトを通しているので手順 7 に進む
+7. マージできる状態か確認する: `gh pr view --json mergeable,mergeStateStatus`。`CONFLICTING` なら下の「PR にコンフリクトが出たとき」へ。`BLOCKED`（必須レビュー未達・保護ブランチ条件など）なら理由をそのまま報告して止まる。
+8. マージする: `gh pr merge <N> --merge`。
+   - **他コマンドと `&&` で連結せず単発で発行する**（連結すると permission classifier に落ちる環境がある）
+   - `--squash` / `--rebase` は使わない（repo 履歴の "Merge pull request" 形式に合わせる）
+   - `--delete-branch` は使わない。gh がローカルブランチも消しに行き、この worktree が checkout 中のブランチを触るため。リモートブランチは次の手順で消す
+9. リモートブランチを掃除する: `git push origin --delete <ブランチ名>`（これも単発で発行する）。repo の `deleteBranchOnMerge` が無効だとマージ済みブランチが remote に溜まり続け、結局 GitHub 上での手動掃除が要るため。ローカルブランチは触らない（/wt-clean の `wt rm` が消す）。remote ブランチが消えても PR は headRefName で引けるので /wt-clean の PR 検査は通る。失敗しても（保護設定・権限・既に消えている）**マージ自体は完了しているのでブロックせず、報告に一行添えるだけにする**。
+10. 報告する: PR URL とマージ済みであること、`Fixes #N` で issue が閉じたこと、本体 checkout の更新（`git pull`）は dev 側で行うこと、続けて /wt-clean で worktree を片付けること。
+11. レビュー指摘や CI 失敗で修正したら: 修正 → コミット → `git push`。同じ PR が更新される（作り直さない）。手順 6 から再開する。
 
 ### PR にコンフリクトが出たとき
 
@@ -51,3 +67,4 @@ base ブランチが進んで PR がコンフリクトしたら、worktree 側�
 - 「本体に未コミットの変更がある」（ローカルモード）→ dev 側で commit / stash が必要。そのまま報告する。
 - 「ブランチ worktree-… が存在しない」→ 状況を `wt list` で確認して報告する。
 - push が拒否された（認証・保護ブランチ等）→ エラー出力をそのまま報告してユーザー判断を待つ。
+- `gh pr merge` が拒否された（保護ブランチ条件・必須 check 未達・権限不足等）→ エラー出力をそのまま報告し、PR URL を示して GitHub 上でのマージを案内する。**リトライで押し通さない。**

@@ -24,13 +24,13 @@ else
   echo "[check] claude が無いため plugin マニフェスト検査をスキップした" >&2
 fi
 
-# レビューページ生成資産 (skills/wt-review/assets/render.py) の構文検査。
+# python3 で書いた同梱物 (レビューページの生成資産と配信サーバ) の構文検査。
 # python3 があるときだけ実行する。標準ライブラリのみで動く前提なので linter は入れない。
 if command -v python3 >/dev/null 2>&1; then
-  python3 -m py_compile skills/wt-review/assets/render.py
-  rm -rf skills/wt-review/assets/__pycache__
+  python3 -m py_compile skills/wt-review/assets/render.py wt-review-serve.py
+  rm -rf skills/wt-review/assets/__pycache__ __pycache__
 else
-  echo "[check] python3 が無いため render.py の構文検査をスキップした" >&2
+  echo "[check] python3 が無いため python の構文検査をスキップした" >&2
 fi
 
 tests/wt_test.sh

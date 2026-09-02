@@ -10,6 +10,12 @@ mkdir -p "$PREFIX"
 install -m 755 "$src" "$PREFIX/wt"
 echo "[install] $PREFIX/wt に配置した"
 
+# レビューページの使い捨て配信サーバ。wt が自分の隣を探すので、この 2 枚を
+# ばらばらの場所に置かないこと (見つからないと wt serve が起動を諦め、
+# /wt-review は承認ボタン無しの file:// 表示に落ちる)。
+install -m 755 "$(dirname "$src")/wt-review-serve.py" "$PREFIX/wt-review-serve.py"
+echo "[install] $PREFIX/wt-review-serve.py に配置した"
+
 # Claude Code skill を配置する (WT_INSTALL_SKILLS=0 でスキップ)。
 # skill は wt の管理物として常に上書きする。SKILL.md 以外の同梱物
 # (wt-review の assets/ など) も要るのでディレクトリごとコピーする。

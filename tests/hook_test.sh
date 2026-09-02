@@ -3,8 +3,9 @@
 #
 #   tests/hook_test.sh
 #
-# hook は PreToolUse の JSON を stdin で受け、本体 checkout でのブランチ切替だけを
-# ask に落とす。判定が cwd の git 状態に依存するため、temp repo を作って検証する。
+# hook は PreToolUse の JSON を stdin で受け、本体 checkout でのブランチ切替
+# (git checkout / git switch / gh pr checkout) だけを ask に落とす。判定が cwd の
+# git 状態に依存するため、temp repo を作って検証する。
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -80,9 +81,32 @@ assert_ask "hook: 絶対パスの git でも検出する" "$R" "/usr/bin/git che
 
 # ローカルに無くても remote にあれば git は追跡ブランチを作って切り替える (DWIM)。
 git -C "$R" update-ref refs/remotes/origin/remote-only "$(git -C "$R" rev-parse HEAD)"
+git -C "$R" update-ref refs/remotes/origin/dev "$(git -C "$R" rev-parse HEAD)"
 assert_ask "hook: remote にだけあるブランチへの checkout も ask" "$R" "git checkout remote-only"
 assert_ask "hook: --track は ask" "$R" "git checkout --track origin/remote-only"
 assert_ask "hook: -t は ask" "$R" "git checkout -t origin/remote-only"
+assert_ask "hook: checkout --orphan は ask" "$R" "git checkout --orphan gh-pages"
+assert_ask "hook: switch --orphan は ask" "$R" "git switch --orphan fresh"
+assert_ask "hook: 括弧で囲まれたブランチ切替も検出する" "$R" "(git checkout -b feature-new)"
+
+# --- 本体 checkout: gh pr checkout もブランチを切り替えるので ask ---
+assert_ask "hook: gh pr checkout <番号> は ask" "$R" "gh pr checkout 5"
+assert_ask "hook: gh pr checkout <URL> は ask" "$R" "gh pr checkout https://github.com/o/r/pull/5"
+assert_ask "hook: gh pr checkout <ブランチ名> は ask" "$R" "gh pr checkout feature-x"
+assert_ask "hook: gh pr checkout -b <名前> は ask" "$R" "gh pr checkout 5 -b local-name"
+assert_ask "hook: gh pr checkout --detach は ask" "$R" "gh pr checkout --detach 5"
+assert_ask "hook: gh pr checkout -R <repo> は ask" "$R" "gh pr checkout -R owner/repo 5"
+assert_ask "hook: gh pr checkout の引数なしも ask" "$R" "gh pr checkout"
+assert_ask "hook: 絶対パスの gh でも検出する" "$R" "/usr/bin/gh pr checkout 5"
+assert_ask "hook: 複合コマンドの中の gh pr checkout も検出する" "$R" "gh pr view 5 && gh pr checkout 5"
+
+# ask の中身は JSON として妥当で、PR の指定を名指しする。
+out_pr="$(run_hook "$R" "gh pr checkout 5")"
+if printf '%s' "$out_pr" | jq -e '.hookSpecificOutput.permissionDecisionReason | contains("PR「5」")' >/dev/null 2>&1; then
+  pass "hook: gh の ask は妥当な JSON で PR 指定を含む"
+else
+  fail "hook: gh の ask は妥当な JSON で PR 指定を含む (out=$out_pr)"
+fi
 
 # --- 本体 checkout: 素通しする経路 ---
 assert_pass "hook: default branch への切替は素通し" "$R" "git checkout main"
@@ -94,6 +118,11 @@ assert_pass "hook: 無関係な git コマンドは素通し" "$R" "git status"
 assert_pass "hook: worktree add は素通し" "$R" "git worktree add ../x -b y"
 assert_pass "hook: switch の引数なしは素通し" "$R" "git switch"
 assert_pass "hook: checkout / switch を含まないコマンドは素通し" "$R" "ls -la"
+assert_pass "hook: --track で remote 付きの許可ブランチは素通し" "$R" "git checkout -t origin/dev"
+assert_pass "hook: gh pr view は素通し" "$R" "gh pr view 5"
+assert_pass "hook: checkout を含む gh の別コマンドは素通し" "$R" "gh pr list --search checkout"
+assert_pass "hook: gh の checkout でないサブコマンドは素通し" "$R" "gh pr diff 5 --name-only"
+assert_pass "hook: gh 以外のコマンドの引数に並んでいても素通し" "$R" "echo gh pr checkout 5"
 
 # --- 直前ブランチ (-) は解決してから判定する ---
 git -C "$R" checkout -q feature-x # 直前は main
@@ -104,6 +133,7 @@ assert_ask "hook: - が許可外ブランチに戻るなら ask" "$R" "git check
 # --- worktree 内は素通し ---
 assert_pass "hook: worktree 内の checkout -b は素通し" "$W" "git checkout -b another"
 assert_pass "hook: worktree 内の既存ブランチ切替も素通し" "$W" "git checkout feature-x"
+assert_pass "hook: worktree 内の gh pr checkout は素通し" "$W" "gh pr checkout 5"
 
 # --- repo 外 / 壊れた入力 ---
 assert_pass "hook: git repo でなければ素通し" "$TMP" "git checkout -b x"
@@ -121,6 +151,13 @@ if [ -z "$out_off" ]; then
   pass "hook: WT_GUARD_DISABLE=1 で無効化できる"
 else
   fail "hook: WT_GUARD_DISABLE=1 で無効化できる (out=$out_off)"
+fi
+
+out_off_pr="$(WT_GUARD_DISABLE=1 run_hook "$R" "gh pr checkout 5")"
+if [ -z "$out_off_pr" ]; then
+  pass "hook: WT_GUARD_DISABLE=1 は gh pr checkout にも効く"
+else
+  fail "hook: WT_GUARD_DISABLE=1 は gh pr checkout にも効く (out=$out_off_pr)"
 fi
 
 out_allow="$(WT_GUARD_ALLOW_BRANCHES=feature-x run_hook "$R" "git checkout feature-x")"

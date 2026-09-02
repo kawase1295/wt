@@ -326,6 +326,7 @@ cmd_bootstrap() {
 # --prompt-file 経路ならファイルから読み直す形にして、長文を再入力させない。
 prompt_retry_arg() { # prompt_file
   if [ -n "${1:-}" ]; then
+    # shellcheck disable=SC2016 # ここで展開させない: ユーザーが貼った時点で展開される文字列
     printf '"$(cat %s)"' "$1"
   else
     printf '<プロンプト>'

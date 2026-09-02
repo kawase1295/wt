@@ -8,6 +8,7 @@
   "homepage": "https://github.com/kawase1295/wt",
   "repository": "https://github.com/kawase1295/wt",
   "license": "MIT",
+  "hooks": "./hooks/hooks.json",
   "keywords": [
     "git",
     "worktree",

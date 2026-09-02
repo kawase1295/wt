@@ -23,9 +23,7 @@ description: 作業内容から worktree 名を生成し、wt new --prompt で w
 
    > 承認を得てから /wt-merge で PR を作成すること（ブランチが push され、PR 本文の Fixes #N でこの issue が閉じる）。PR がマージされたら /wt-clean で worktree を片付けること。承認前に PR を作らない。
 
-   プロンプトは平叙文で始める（先頭が `/` `!` `#` `@` だと Claude Code の
-   slash command / bash / memory / file mention として解釈されるため禁止）。
-   改行を含んでよい（`wt new` は起動後に `herdr agent prompt` で投入する）。
+   プロンプトは平叙文で始める（先頭が `/` `!` `#` `@` なら `wt new` が worktree を作る前に die する）。改行を含んでよい（`wt new` は起動後に `herdr agent prompt` で投入する）。
 6. 実行する:
    - 短い 1 行のプロンプト → `wt new <name> --prompt "<text>"`
    - 長文・改行・引用符を含む → scratchpad にファイルを書いて `wt new <name> --prompt-file <path>`

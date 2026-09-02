@@ -8,7 +8,9 @@
 #       base 省略時は本体の現在ブランチ。WT_HOME を設定すると従来の集約置き場に作る。
 #       --prompt / --prompt-file は起動する Claude への初期プロンプト (要 herdr)。
 #       プロンプトは起動 argv ではなく起動後の herdr agent prompt で投入するため、
-#       改行を含む長文もそのまま 1 ターンとして届く
+#       改行を含む長文もそのまま 1 ターンとして届く。
+#       本文の先頭 (空白・改行を除く) が / ! # @ なら Claude Code が slash command /
+#       bash / memory / file mention として解釈するため拒否する。平叙文で始めること
 #       claude には既定で --model opus --permission-mode auto を渡す
 #       (WT_CLAUDE_ARGS で差し替え、空文字でフラグ無し。空白を含む値は不可)
 #   wt bootstrap [<path>]
@@ -377,6 +379,15 @@ cmd_new() {
   fi
   if [ -n "$prompt" ]; then
     [ "$start_claude" -eq 1 ] || die "new: --prompt は --no-claude と併用できない"
+    # 本文の先頭が / ! # @ だと Claude Code が slash command / bash / memory /
+    # file mention として解釈し、プロンプトが本文として届かない。先頭の空白・改行は
+    # 読み飛ばして判定する (投入時にも無視されるため)。
+    local lead="${prompt#"${prompt%%[![:space:]]*}"}"
+    case "$lead" in
+      [/!#@]*)
+        die "new: プロンプトの先頭文字 ${lead:0:1} は使えない (Claude Code が slash command / bash / memory / file mention として解釈する)。平叙文で始めること"
+        ;;
+    esac
     herdr_ok || die "new: herdr サーバなしでは Claude にプロンプトを渡せない (herdr を起動するか --prompt を外す)"
   fi
   resolve_repo

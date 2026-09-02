@@ -25,7 +25,9 @@ description: 自分の worktree ブランチ (worktree-<name>) の成果を取�
    - 全て pass → 手順 7
    - fail → **マージしない**。落ちた check 名と `gh run view <run-id> --log-failed` の要点を報告する。修正するなら手順 11 へ
    - Bash が timeout した → check がまだ動いているだけなので、同じコマンドを打ち直す
-   - `no checks reported`（CI 未設定の repo）→ 手順 1 のローカル `scripts/check` が同じコントラクトを通しているので手順 7 に進む
+   - `no checks reported` → **その場で CI 未設定と判断しない**。PR 作成直後は check run の登録が間に合っておらず、CI が設定された repo でも同じ出力が返る（この出力だけを根拠にマージすると CI をすり抜ける）。15 秒ほど置いて**一度だけ**打ち直す: Bash tool の `run_in_background` で `sleep 15; gh pr checks` を実行し、完了通知の出力で判断する（foreground の `sleep` はこの環境では使えないため background に置く）
+     - 2 回目で check が出てきた → CI はある。手順 6 の先頭に戻り `--watch` で完了を待つ
+     - 2 回目も 0 件 → CI 未設定の repo と判断する。手順 1 のローカル `scripts/check` が同じコントラクトを通しているので手順 7 に進む
 7. マージできる状態か確認する: `gh pr view --json mergeable,mergeStateStatus`。`CONFLICTING` なら下の「PR にコンフリクトが出たとき」へ。`BLOCKED`（必須レビュー未達・保護ブランチ条件など）なら理由をそのまま報告して止まる。
 8. マージする: `gh pr merge <N> --merge`。
    - **他コマンドと `&&` で連結せず単発で発行する**（連結すると permission classifier に落ちる環境がある）

@@ -19,6 +19,7 @@ import argparse
 import http.server
 import json
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -74,6 +75,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):  # 既定の stderr ログを [serve] に揃える
         log(f"{self.address_string()} {fmt % args}")
+
+    def log_request(self, code="-", size="-"):
+        # requestline には token が入る。ログファイルに残さないよう query を落とす。
+        line = re.sub(r"\?\S*", "?…", self.requestline)
+        self.log_message('"%s" %s %s', line, str(code), str(size))
 
     # ---------------------------------------------------------------- GET
 
@@ -166,11 +172,18 @@ def write_state(path, fields):
     """state を key=value で書く。読む側 (wt) に jq を要求しないための形式。
 
     途中まで書けたファイルを wt に読ませないよう、同ディレクトリの一時ファイルに
-    書いてから置き換える。
+    書いてから置き換える。token が入るので、置き場ごと本人だけが読める権限にする
+    (同じマシンの別ユーザーに token が渡ると承認を代行できてしまう)。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
     tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-    tmp.write_text("".join(f"{k}={v}\n" for k, v in fields.items()), encoding="utf-8")
+    data = "".join(f"{k}={v}\n" for k, v in fields.items()).encode("utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
     os.replace(tmp, path)
 
 

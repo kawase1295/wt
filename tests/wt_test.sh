@@ -1285,6 +1285,18 @@ PY
     assert_eq "serve: 承認の本文は承認文そのもの" "承認します。/wt-merge に進んでください" \
       "$(cat "$S35/prompt.text" 2>/dev/null)"
 
+    # token は state と log から漏らさない。state は本人だけが読める権限にし
+    # (同じマシンの別ユーザーが token を読めれば承認を代行できる)、
+    # アクセスログには query を残さない。
+    mode35() { python3 -c 'import os,sys;print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$1"; }
+    assert_eq "serve: state は 600 で書く" "600" "$(mode35 "$(state35)")"
+    assert_eq "serve: state の置き場は 700" "700" "$(mode35 "$H35/.cache/wt/serve")"
+    if grep -rq "$token35" "$H35/.cache/wt/serve/"*.log 2>/dev/null; then
+      fail "serve: ログに token を残さない"
+    else
+      pass "serve: ログに token を残さない"
+    fi
+
     # 承認は 1 回きり。応答後に自分で終了し state も消える。
     waited35=0
     while [ "$waited35" -lt 30 ] && [ -n "$(state35)" ]; do

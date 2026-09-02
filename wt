@@ -18,10 +18,19 @@
 #       Claude Code が作る .claude/worktrees/* にも使える
 #   wt open <task>
 #       既存 worktree を herdr workspace として開き直す
-#   wt browse <path>
-#       ローカルファイルを既定のアプリ (HTML ならブラウザ) で開く。
+#   wt browse <path|url>
+#       ローカルファイルを既定のアプリ (HTML ならブラウザ) で開く。http(s) の
+#       URL も渡せる (wt serve が出す localhost URL 用)。
 #       WSL / macOS / Linux の差を吸収する。skill が生成したレビューページを
 #       開くのに使う。開く手段が無ければパスを表示して失敗する
+#   wt serve <path> [--task <task>] / wt serve --stop [--task <task>]
+#       レビューページを 127.0.0.1 の空きポートに立てた使い捨て HTTP サーバで
+#       配信し、URL (?token=... 付き) を stdout に 1 行出す。ページの承認ボタンの
+#       POST を herdr agent prompt claude-<task> に変換し、承認を worktree
+#       セッションへユーザーの直接入力として届けて終了する。
+#       HTML はリクエストごとに読み直すので、再レビューはリロードで最新化される。
+#       task 省略時は cwd のブランチから推定する。herdr が使えなければ
+#       起動せず失敗する (呼び出し側は file:// で開く従来手順に落ちる)
 #   wt list
 #       worktree と herdr workspace の対応を一覧表示
 #   wt peers [--json]
@@ -51,6 +60,8 @@ set -euo pipefail
 # 従来の集約置き場 $WT_HOME/<repo>/<task> に作る (複数 repo を一箇所へ集めたいとき用)。
 
 log() { printf '[wt] %s\n' "$*"; }
+# stdout を機械可読な値に使うサブコマンド (wt serve は URL を 1 行出す) 用のログ。
+elog() { printf '[wt] %s\n' "$*" >&2; }
 die() {
   printf '[wt] ERROR: %s\n' "$*" >&2
   exit 1
@@ -466,19 +477,36 @@ cmd_open() {
   log "workspace $ws で開いた: $task"
 }
 
-# ローカルファイルを既定のアプリで開く。開く手段はプラットフォームで違うので、
-# skill 側に explorer.exe を直書きせずここに閉じ込める (WSL 専用にしない)。
+# ローカルファイル (または http(s) URL) を既定のアプリで開く。開く手段は
+# プラットフォームで違うので、skill 側に explorer.exe を直書きせずここに
+# 閉じ込める (WSL 専用にしない)。
 cmd_browse() {
   local target="${1:-}"
   [ -n "$target" ] || usage 1
-  [ -e "$target" ] || die "browse: ファイルが無い: $target"
-  local abs
-  abs="$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+  local abs is_url=0
+  case "$target" in
+    # wt serve が出す localhost URL。ファイルとして解決せずそのまま渡す。
+    http://* | https://*)
+      abs="$target"
+      is_url=1
+      ;;
+    *)
+      [ -e "$target" ] || die "browse: ファイルが無い: $target"
+      abs="$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+      ;;
+  esac
 
   if command -v wslview >/dev/null 2>&1; then
     wslview "$abs" && return 0
   fi
-  if command -v explorer.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; then
+  # URL は explorer.exe では開けない (rc=1 で何も起きない) ため、WSL では
+  # rundll32 の FileProtocolHandler に渡す。引数は argv でそのまま届くので
+  # cmd.exe /c start と違って & 等の再解釈を受けない。
+  if [ "$is_url" -eq 1 ] && command -v rundll32.exe >/dev/null 2>&1; then
+    rundll32.exe url.dll,FileProtocolHandler "$abs" >/dev/null 2>&1 && return 0
+  fi
+  if [ "$is_url" -eq 0 ] && command -v explorer.exe >/dev/null 2>&1 &&
+    command -v wslpath >/dev/null 2>&1; then
     # explorer.exe は成功時も非 0 を返すことがあるため終了状態を見ない。
     explorer.exe "$(wslpath -w "$abs")" >/dev/null 2>&1 || true
     return 0
@@ -491,6 +519,169 @@ cmd_browse() {
     xdg-open "$abs" >/dev/null 2>&1 && return 0
   fi
   die "browse: 開く手段が見つからない (wslview / explorer.exe / open / xdg-open)。手動で開いてください: $abs"
+}
+
+# --- レビューページの使い捨て配信 (wt serve) ---------------------------------
+# 配信の実体は wt-review-serve.py。承認ボタンの POST を herdr agent prompt に
+# 変換するのが目的なので、herdr が使えないなら起動しない (呼び出し側が file://
+# で開く従来手順に落ちる)。
+
+# 配信スクリプトの場所。wt 本体と同じディレクトリに置く契約 (install.sh も
+# plugin もその形で配る)。symlink 経由の起動も拾えるよう解決先も見る。
+serve_script() {
+  local self="${BASH_SOURCE[0]}" d c
+  for d in \
+    "$(dirname "$self")" \
+    "$(dirname "$(readlink -f "$self" 2>/dev/null || printf '%s' "$self")")" \
+    ${CLAUDE_PLUGIN_ROOT:+"$CLAUDE_PLUGIN_ROOT"}; do
+    c="$d/wt-review-serve.py"
+    if [ -f "$c" ]; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# 配信中のサーバの state (pid / port / token / url / html) の置き場。
+# 同名 repo の別 checkout と混ざらないよう本体パスのハッシュを名前に入れる。
+# resolve_repo 済みで呼ぶこと。
+serve_state() { # task
+  local key
+  key="$(printf '%s' "$MAIN_ROOT" | cksum | awk '{print $1}')"
+  printf '%s/.cache/wt/serve/%s-%s-%s.state' "$HOME" "$REPO_NAME" "$1" "$key"
+}
+
+serve_state_get() { # state-file key
+  [ -f "$1" ] || return 1
+  sed -n "s/^$2=//p" "$1" | head -1
+}
+
+# pid が生きている wt のレビューサーバなら 0。pid の再利用で無関係なプロセスを
+# 掴まないようコマンド行も確認する (ps が無い環境では kill -0 の結果を信じる)。
+serve_alive() { # pid
+  local pid="$1" cmd
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  command -v ps >/dev/null 2>&1 || return 0
+  cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  case "$cmd" in
+    *wt-review-serve.py*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 配信中なら止める。動いていなければ何もしない (常に 0 を返す)。
+serve_stop() { # task
+  local state pid
+  state="$(serve_state "$1")"
+  [ -f "$state" ] || return 0
+  pid="$(serve_state_get "$state" pid || true)"
+  if serve_alive "$pid"; then
+    kill "$pid" 2>/dev/null || true
+    # python 側が state を消して終わるのを少しだけ待つ
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      serve_alive "$pid" || break
+      sleep 0.1
+    done
+    if serve_alive "$pid"; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    elog "レビューサーバを停止した (pid $pid)"
+  fi
+  rm -f "$state"
+  return 0
+}
+
+cmd_serve() {
+  local target="" task="" stop=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --stop) stop=1 ;;
+      --task)
+        [ -n "${2:-}" ] || die "serve: --task に値が必要"
+        task="$2"
+        shift
+        ;;
+      -*) die "serve: 不明なオプション $1" ;;
+      *)
+        [ -n "$target" ] && die "serve: 引数が多すぎる"
+        target="$1"
+        ;;
+    esac
+    shift
+  done
+  if [ -z "$task" ]; then
+    task="$(infer_task serve)"
+  fi
+  # state ファイル名と herdr の宛先に埋め込むので wt new と同じ文字集合に限る。
+  [[ "$task" =~ ^[A-Za-z0-9._-]+$ ]] || die "serve: task 名に使えるのは英数字と . _ - のみ: $task"
+  resolve_repo
+
+  if [ "$stop" -eq 1 ]; then
+    [ -z "$target" ] || die "serve: --stop にパスは渡さない"
+    serve_stop "$task"
+    return 0
+  fi
+
+  [ -n "$target" ] || usage 1
+  [ -f "$target" ] || die "serve: ファイルが無い: $target"
+  local abs
+  abs="$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+
+  # 承認の投入先が無いなら配信しない。ボタンだけ出して押せないページは害。
+  herdr_ok || die "serve: herdr サーバに接続できないため承認ボタンを配信できない (file:// で開くこと)"
+  command -v python3 >/dev/null 2>&1 || die "serve: python3 が無い (file:// で開くこと)"
+  local script
+  script="$(serve_script)" ||
+    die "serve: wt-review-serve.py が見つからない (wt と同じディレクトリに置く)"
+
+  local state
+  state="$(serve_state "$task")"
+  # state には token が入る。置き場ごと本人だけが読める権限にする
+  # (token を読めれば承認を代行できてしまう)。
+  mkdir -p "$(dirname "$state")"
+  chmod 700 "$(dirname "$state")" 2>/dev/null || true
+
+  # 同じページを配信中なら URL を使い回す。HTML はリクエストごとに読み直される
+  # ので、再レビューはブラウザのリロードだけで最新化される。
+  if [ -f "$state" ]; then
+    local old_pid old_url old_html
+    old_pid="$(serve_state_get "$state" pid || true)"
+    old_url="$(serve_state_get "$state" url || true)"
+    old_html="$(serve_state_get "$state" html || true)"
+    if [ -n "$old_url" ] && [ "$old_html" = "$abs" ] && serve_alive "$old_pid"; then
+      elog "配信中のレビューサーバを再利用する (pid $old_pid)"
+      printf '%s\n' "$old_url"
+      return 0
+    fi
+    serve_stop "$task"
+  fi
+
+  local log_file="${state%.state}.log"
+  # Claude Code の Bash tool はコマンド終了時にプロセスグループを畳むため、
+  # setsid で新しいセッションに分離して生き残らせる (無ければ nohup)。
+  local launcher=(nohup)
+  if command -v setsid >/dev/null 2>&1; then launcher=(setsid); fi
+  # stdout は捨てる (URL = token をログファイルに残さない)。URL は state から読む。
+  "${launcher[@]}" python3 "$script" --html "$abs" --task "$task" --state "$state" \
+    >/dev/null 2>>"$log_file" &
+
+  # 起動を待つ。pid は state から読む (setsid が fork すると $! は python の
+  # pid ではない)。state は一時ファイル経由で置き換えられるので途中は見えない。
+  local waited=0 url=""
+  while [ "$waited" -lt 50 ]; do
+    url="$(serve_state_get "$state" url || true)"
+    [ -n "$url" ] && break
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if [ -z "$url" ]; then
+    [ -f "$log_file" ] && tail -5 "$log_file" >&2
+    die "serve: レビューサーバの起動に失敗した (ログ: $log_file)"
+  fi
+  elog "レビューページを配信中: $abs (承認先 claude-$task)"
+  printf '%s\n' "$url"
 }
 
 cmd_list() {
@@ -520,6 +711,10 @@ cmd_rm() {
     task="$(infer_task rm)"
   fi
   resolve_repo
+
+  # レビューサーバは worktree とは別プロセスなので、消す前に止める。
+  # 残すと worktree が消えたあとも listener だけ生き続ける (/wt-clean の受け皿)。
+  serve_stop "$task"
 
   local branch="worktree-$task" path
   # porcelain の worktree 行は "worktree <path>"。パスは空白を含み得るため
@@ -666,6 +861,10 @@ case "${1:-}" in
   browse)
     shift
     cmd_browse "$@"
+    ;;
+  serve)
+    shift
+    cmd_serve "$@"
     ;;
   list)
     shift

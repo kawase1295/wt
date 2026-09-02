@@ -20,6 +20,7 @@
 - **Cross-session chat** — the worktree session and the dev session talk to each other directly. `wt new` pins the worktree session name to `wt-<task>`, and `wt peers` lists the addresses
 - **Repo-specific setup stays in the repo** — DB copies, native rebuilds and the like are delegated to the repo's own `scripts/worktree-setup` hook
 - **Pre-merge gate** — runs the repo's `scripts/check` in the worktree before merging and refuses to merge on failure. Same entry point your CI calls
+- **Approve from the review page** — `/wt-review` serves the page off a throwaway `127.0.0.1` HTTP server, so its 「承認してマージ」 (approve and merge) button lands the approval in the worktree session as *your* own input — no switching back to the terminal. Without herdr or python3 it falls back to `file://` with the button hidden
 - **GitHub issue / PR integration (skills)** — `/wt` files an issue and ties its number into the worktree name and the initial prompt; `/wt-merge` opens a PR with `Fixes #N` and, once the `/wt-review` approval gate has passed, waits for CI and merges it. Task = issue = branch = PR, one-to-one. Repos without a remote keep the plain local merge
 - **Guards the main checkout (hook)** — a `PreToolUse` hook asks for confirmation when something tries to branch off and work directly in the main checkout. Work that bypasses a worktree is stopped by a pre-execution check on Bash, not by prose in a skill (plugin only)
 - **Graceful fallback** — if the herdr server is unreachable, it just creates the git worktree and carries on
@@ -32,7 +33,7 @@
 | git | yes | worktree operations |
 | [herdr](https://herdr.dev) | optional | workspace / agent launch (without it, git worktree only). Verified against herdr 0.8 (socket API protocol 19), which the `worktree` and `agent start` calls target |
 | jq | when using herdr, and for `wt peers` | parsing herdr JSON output and the Claude Code session registry |
-| python3 | for `/wt-review` | `skills/wt-review/assets/render.py` builds the review page (standard library only) |
+| python3 | for `/wt-review` | `skills/wt-review/assets/render.py` builds the review page, `wt-review-serve.py` serves it and turns the approve button into a herdr prompt (standard library only) |
 | curl | for mermaid diagrams in a review page | fetching `mermaid.min.js` once into `~/.cache/wt/` |
 | [gh](https://cli.github.com/) | optional | GitHub issue / PR integration (`/wt` files issues, `/wt-merge` opens PRs, `/wt-clean` verifies the PR merged). Without it, the plain local flow |
 
@@ -62,12 +63,15 @@ Three things to know:
 
 ### Manually
 
-`wt` is a single file. Drop it anywhere on your `PATH`.
+`wt` is a single file. Drop it anywhere on your `PATH`, with `wt-review-serve.py` — the review page's throwaway HTTP server, launched by `wt serve` — next to it.
 
 ```bash
 git clone https://github.com/kawase1295/wt.git
 install -m 755 wt/wt ~/.local/bin/wt   # assumes ~/.local/bin is on PATH
+install -m 755 wt/wt-review-serve.py ~/.local/bin/wt-review-serve.py
 ```
+
+`wt` looks for the server as its own sibling. Leave it out and `wt serve` refuses to start, which only costs you the approve button: `/wt-review` falls back to `file://`.
 
 The bundled `install.sh` also installs the Claude Code skills (see below) into `~/.claude/skills/`.
 
@@ -107,10 +111,22 @@ wt bootstrap [<path>]
 wt open <task>
     Reopen an existing worktree as a herdr workspace
 
-wt browse <path>
+wt browse <path|url>
     Open a local file with the platform's default handler — WSL's explorer.exe,
-    macOS's open, Linux's xdg-open. The skills use it to show the HTML they
+    macOS's open, Linux's xdg-open. Takes http(s) URLs too (for what wt serve
+    prints); on WSL those go through rundll32's FileProtocolHandler, since
+    explorer.exe cannot open a URL. The skills use it to show the HTML they
     generate; it fails with the path printed when no handler is available
+
+wt serve <path> [--task <task>] / wt serve --stop [--task <task>]
+    Serve a review page from a throwaway HTTP server bound to a free port on
+    127.0.0.1 and print the URL (with ?token=...) on stdout. The page's approve
+    button POSTs back and the server turns that into
+    `herdr agent prompt claude-<task>`, delivering the approval to the worktree
+    session as your own input, then exits. The HTML is re-read per request, so a
+    re-review only needs a browser reload. Omit --task inside a worktree to
+    infer it from the branch. Without herdr it refuses to start, and the caller
+    (/wt-review) falls back to file://
 
 wt list
     List worktrees and their herdr workspaces
@@ -229,7 +245,7 @@ A skill is not always a lone `SKILL.md`. `/wt-review` bundles the review page's 
 | --- | --- | --- |
 | `/wt <task description>` | dev | Derives a worktree name and launches the worktree + Claude Code with the description as the initial prompt. On GitHub repos it files an issue first (`/wt #123` reuses an existing one) and ties the number into the name and the prompt |
 | `/wt-detail <task description>` | dev | Explores the codebase, asks you about anything underspecified, builds an implementation plan, and passes it to the worktree as the initial prompt. On GitHub repos it files an issue once the plan is settled and records the full plan there |
-| `/wt-review` | worktree | Fills the bundled page template from the diff with `assets/render.py`, opens the result in the browser, and waits for approval before merging |
+| `/wt-review` | worktree | Fills the bundled page template from the diff with `assets/render.py`, serves it over `wt serve` (approve button) or `file://`, opens it in the browser, and waits for approval before merging |
 | `/wt-merge` | worktree | On GitHub repos: `scripts/check` → push → open a PR with `Fixes #N` → if the approval gate has passed, wait for CI, `gh pr merge --merge`, and delete the remote branch (without it, stops at the PR). Without a remote: merges its own branch into the main checkout's current branch (reports conflicts and stops) |
 | `/wt-clean` | worktree | Verifies nothing is uncommitted and the work has landed (PR merged, or merged into the main checkout), then removes its own worktree and closes the workspace |
 | `/wt-ask <message>` | both | Resolves the other session's address via `wt peers`, sends a question or status report, and waits for the reply |
@@ -303,6 +319,8 @@ Sessions started by older versions of Claude Code do not appear in the peer regi
 - Negation (`!`) in `.worktreeinclude` cannot re-include anything under a directory excluded as a whole — that is gitignore's own rule. `secrets/` + `!secrets/x` has no effect; write `secrets/*` + `!secrets/x`.
 - Empty directories, and entries that are themselves relative symlinks, cannot be carried over correctly (git does not enumerate the former; the latter breaks inside the worktree).
 - `wt merge` conflicts land in the main checkout's working tree. The main checkout stays mid-merge until you resolve them or run `git merge --abort`.
+- `wt serve` binds to `127.0.0.1` only. Reaching it from a Windows browser relies on WSL2's localhost forwarding (on by default); where that does not work, let `/wt-review` open the page over `file://` instead of `wt serve`.
+- The server exits once approved, but a page closed without approving leaves it running. `wt rm` (/wt-clean) stops it, `wt serve --stop` stops it on its own, and it folds itself up after 24 hours regardless.
 
 ## Development
 
@@ -311,7 +329,7 @@ scripts/check     # shellcheck + manifest validation + tests — the same gate w
 tests/wt_test.sh  # 34 tests; needs only git and coreutils (no bats)
 ```
 
-`scripts/check` runs `claude plugin validate .` when the `claude` CLI is around, so a broken `.claude-plugin/` manifest fails before it reaches the marketplace. It also byte-compiles `skills/wt-review/assets/render.py` when `python3` is present; the renderer sticks to the standard library, so there is no linter to add. The plugin entries deliberately carry no `version`: setting one pins the plugin until you bump the string, and users would stop receiving commits pushed to `main`.
+`scripts/check` runs `claude plugin validate .` when the `claude` CLI is around, so a broken `.claude-plugin/` manifest fails before it reaches the marketplace. It also byte-compiles the bundled python (`skills/wt-review/assets/render.py` and `wt-review-serve.py`) when `python3` is present; both stick to the standard library, so there is no linter to add. The plugin entries deliberately carry no `version`: setting one pins the plugin until you bump the string, and users would stop receiving commits pushed to `main`.
 
 The tests hide `herdr` from `PATH` to force the git-worktree fallback path, stub it where the herdr path itself is under test, and point `HOME` at a temp directory so your real home is never touched.
 

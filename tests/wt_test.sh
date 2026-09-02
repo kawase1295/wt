@@ -1005,6 +1005,14 @@ EOF
   assert_eq "render: --base 省略時はコミット節を出さない" "0" \
     "$(grep -c 'class="commits"' "$out32")"
 
+  # 承認ボタン。テンプレート同梱の固定資産なので、どの出力にも必ず入る。
+  # 既定は hidden で、http 配信 + token のときだけ script が出す (file:// は degrade)。
+  assert_eq "render: 承認ボタンを埋め込む" "1" "$(grep -c 'id="approve-btn"' "$out32")"
+  assert_eq "render: 承認セクションは既定で hidden" "1" \
+    "$(grep -c 'id="approve" class="approve" hidden' "$out32")"
+  assert_eq "render: 承認は same-origin の POST /approve に送る" "1" \
+    "$(grep -c "fetch('approve'" "$out32")"
+
   if python3 -m py_compile "$ASSETS/render.py" >/dev/null 2>&1; then
     pass "render: render.py が構文エラー無くコンパイルできる"
   else
@@ -1041,6 +1049,39 @@ make_stub xdg-open 'printf "xdg-open %s\n" "$1" >"$WT_TEST_LOG"'
 browse33 page.html >/dev/null 2>&1
 assert_eq "browse: wslview を優先し絶対パスを渡す" "wslview $B33/page.html" \
   "$(cat "$B33/log" 2>/dev/null)"
+
+# http(s) URL はファイルとして解決せず、そのまま opener に渡す (wt serve の出力)。
+rm -f "$B33/log"
+browse33 "http://localhost:12345/?token=abc" >/dev/null 2>&1
+assert_eq "browse: http URL はそのまま opener に渡す" \
+  "wslview http://localhost:12345/?token=abc" "$(cat "$B33/log" 2>/dev/null)"
+
+# WSL で wslview が無いとき、URL は explorer.exe ではなく rundll32 に渡す
+# (explorer.exe は URL を開けず、rc=1 で何も起きないため)。
+mv "$B33/bin/wslview" "$B33/wslview.bak"
+# shellcheck disable=SC2016
+make_stub explorer.exe 'printf "explorer %s\n" "$1" >"$WT_TEST_LOG"'
+# shellcheck disable=SC2016
+make_stub wslpath 'printf "%s" "C:\\fake"'
+# shellcheck disable=SC2016
+make_stub rundll32.exe 'printf "rundll32 %s %s\n" "$1" "$2" >"$WT_TEST_LOG"'
+rm -f "$B33/log"
+browse33 "http://localhost:12345/?token=abc" >/dev/null 2>&1
+assert_eq "browse: URL は rundll32 の FileProtocolHandler に渡す" \
+  "rundll32 url.dll,FileProtocolHandler http://localhost:12345/?token=abc" \
+  "$(cat "$B33/log" 2>/dev/null)"
+# ローカルファイルは従来どおり explorer.exe (wslpath で Windows パスに変換)。
+rm -f "$B33/log"
+browse33 page.html >/dev/null 2>&1
+assert_eq "browse: ファイルは explorer.exe に Windows パスで渡す" 'explorer C:\fake' \
+  "$(cat "$B33/log" 2>/dev/null)"
+# URL で rundll32 が無ければ explorer.exe を使わず次の手段に落ちる。
+rm -f "$B33/bin/rundll32.exe" "$B33/log"
+browse33 "http://localhost:12345/?token=abc" >/dev/null 2>&1
+assert_eq "browse: URL に explorer.exe は使わない" \
+  "xdg-open http://localhost:12345/?token=abc" "$(cat "$B33/log" 2>/dev/null)"
+rm -f "$B33/bin/explorer.exe" "$B33/bin/wslpath"
+mv "$B33/wslview.bak" "$B33/bin/wslview"
 
 # wslview が使えなければ次の手段に落ちる。
 rm -f "$B33/bin/wslview" "$B33/log"
@@ -1104,6 +1145,255 @@ if printf '%s' "$out34c" | grep -q 'gitignore'; then
   fail "gitignore案内: repo 外に作る構成では案内しない (out=$out34c)"
 else
   pass "gitignore案内: repo 外に作る構成では案内しない"
+fi
+
+# --- test 35: serve は使い捨て HTTP サーバで配信し、承認を herdr に変換する ---
+# /wt-review の承認ボタンの土台。token による絞り込み、リクエストごとの読み直し
+# (再レビューはリロードで最新化)、承認 1 回での自己終了を固定する。
+# python3 が無い環境ではスキップする。
+PY35="$REPO_ROOT/wt-review-serve.py"
+assert_file "$PY35" "serve: wt-review-serve.py が wt と同じディレクトリにある"
+if command -v python3 >/dev/null 2>&1; then
+  S35="$TMP/serve35"
+  H35="$TMP/home35"
+  R35="$TMP/repo35"
+  mkdir -p "$S35/bin" "$S35/page" "$H35"
+  new_repo "$R35"
+  printf '<!doctype html><title>t</title><p>REVIEW-MARKER-1</p>\n' >"$S35/page/review.html"
+  printf '/* mm-stub */\n' >"$S35/page/mermaid.min.js"
+
+  # herdr スタブ。workspace list は成功し、agent prompt は宛先と本文を記録する。
+  cat >"$S35/bin/herdr" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-} ${2:-}" in
+  "--version"*) printf 'herdr 0.8.0\n' ;;
+  "workspace list") exit 0 ;;
+  "agent prompt")
+    shift 2
+    if [ "${HERDR_STUB_PROMPT_FAIL:-0}" = "1" ]; then
+      printf 'agent_not_found\n' >&2
+      exit 1
+    fi
+    printf '%s\n' "$1" >"$HERDR_PROMPT_LOG.target"
+    printf '%s' "$2" >"$HERDR_PROMPT_LOG.text"
+    ;;
+  *) exit 0 ;;
+esac
+STUB
+  chmod +x "$S35/bin/herdr"
+
+  serve35() { # args...
+    (cd "$R35" && env -u WT_HOME HOME="$H35" HERDR_PROMPT_LOG="$S35/prompt" \
+      PATH="$S35/bin:$SAFE_PATH" "$WT" serve "$@")
+  }
+  wt35() { # args... (herdr 無しの経路)
+    (cd "$R35" && env -u WT_HOME HOME="$H35" PATH="$SAFE_PATH" "$WT" "$@")
+  }
+  # 配信中の state (pid / port / token / url)。停止の確認に使う。
+  state35() {
+    find "$H35/.cache/wt/serve" -maxdepth 1 -name '*.state' 2>/dev/null | head -1
+  }
+  # PATH を絞っているので HTTP クライアントも python3 で用意する。
+  # 出力は 1 行目が status (接続できなければ no-listener)、以降が body。
+  http35() { # method url [json-body] [origin]
+    python3 - "$@" <<'PY'
+import sys, urllib.error, urllib.request
+method, url = sys.argv[1], sys.argv[2]
+data = sys.argv[3].encode() if len(sys.argv) > 3 and sys.argv[3] else None
+req = urllib.request.Request(url, data=data, method=method)
+if data is not None:
+    req.add_header("Content-Type", "application/json")
+if len(sys.argv) > 4 and sys.argv[4]:
+    req.add_header("Origin", sys.argv[4])
+try:
+    with urllib.request.urlopen(req, timeout=5) as r:
+        print(r.status)
+        sys.stdout.write(r.read().decode("utf-8", "replace"))
+except urllib.error.HTTPError as e:
+    print(e.code)
+    sys.stdout.write(e.read().decode("utf-8", "replace"))
+except OSError as e:
+    print("no-listener")
+    sys.stdout.write(str(e))
+PY
+  }
+
+  url35="$(serve35 "$S35/page/review.html" --task s35 2>"$S35/serve.err" | grep -m1 '^http' || true)"
+  case "$url35" in
+    http://localhost:*/\?token=?*)
+      pass "serve: localhost の URL を token 付きで stdout に 1 行出す"
+      ;;
+    *)
+      fail "serve: localhost の URL を token 付きで stdout に 1 行出す (url=$url35 err=$(cat "$S35/serve.err" 2>/dev/null))"
+      ;;
+  esac
+
+  if [ -n "$url35" ]; then
+    base35="${url35%%\?*}"
+    token35="${url35#*token=}"
+    got35="$(http35 GET "$url35")"
+    assert_eq "serve: token 付き GET はレビューページを返す" "200" \
+      "$(printf '%s\n' "$got35" | head -1)"
+    if printf '%s' "$got35" | grep -q 'REVIEW-MARKER-1'; then
+      pass "serve: 配信するのは指定した HTML"
+    else
+      fail "serve: 配信するのは指定した HTML (got=$got35)"
+    fi
+
+    # token 無し / 不一致は拒否する (他所のページからの読み出し・drive-by 対策)。
+    assert_eq "serve: token 無しの GET は 403" "403" "$(http35 GET "$base35" | head -1)"
+    assert_eq "serve: token 不一致の GET は 403" "403" \
+      "$(http35 GET "${base35}?token=wrong" | head -1)"
+
+    # allowlist のアセットは token 無しで返す (script src は query を引き継げない)。
+    assert_eq "serve: mermaid.min.js は token 無しで返す" "200" \
+      "$(http35 GET "${base35}mermaid.min.js" | head -1)"
+    assert_eq "serve: allowlist 外の同ディレクトリのファイルは 404" "404" \
+      "$(http35 GET "${base35}review.html" | head -1)"
+
+    # 再レビュー: 同じパスへの上書きがリロードだけで反映される。
+    printf '<!doctype html><title>t</title><p>REVIEW-MARKER-2</p>\n' >"$S35/page/review.html"
+    if http35 GET "$url35" | grep -q 'REVIEW-MARKER-2'; then
+      pass "serve: HTML はリクエストごとに読み直す"
+    else
+      fail "serve: HTML はリクエストごとに読み直す"
+    fi
+
+    # 再実行では listener を増やさず同じ URL を返す。
+    url35b="$(serve35 "$S35/page/review.html" --task s35 2>/dev/null | grep -m1 '^http' || true)"
+    assert_eq "serve: 配信中なら同じ URL を再利用する" "$url35" "$url35b"
+
+    # token 不一致の POST は 403。承認は投入されない。
+    assert_eq "serve: token 不一致の POST は 403" "403" \
+      "$(http35 POST "${base35}approve" '{"token":"wrong"}' | head -1)"
+    if [ -f "$S35/prompt.target" ]; then
+      fail "serve: token 不一致の POST では承認を投入しない"
+    else
+      pass "serve: token 不一致の POST では承認を投入しない"
+    fi
+    # token を知っていても別オリジンを名乗る POST は落とす。
+    assert_eq "serve: 別オリジンからの POST は 403" "403" \
+      "$(http35 POST "${base35}approve" "{\"token\":\"$token35\"}" "http://evil.example" | head -1)"
+
+    # 正しい token の POST が herdr agent prompt に変換される。
+    out35="$(http35 POST "${base35}approve" "{\"token\":\"$token35\"}")"
+    assert_eq "serve: token 付きの POST /approve は 200" "200" \
+      "$(printf '%s\n' "$out35" | head -1)"
+    assert_eq "serve: 承認の宛先は claude-<task>" "claude-s35" \
+      "$(cat "$S35/prompt.target" 2>/dev/null)"
+    assert_eq "serve: 承認の本文は承認文そのもの" "承認します。/wt-merge に進んでください" \
+      "$(cat "$S35/prompt.text" 2>/dev/null)"
+
+    # token は state と log から漏らさない。state は本人だけが読める権限にし
+    # (同じマシンの別ユーザーが token を読めれば承認を代行できる)、
+    # アクセスログには query を残さない。
+    mode35() { python3 -c 'import os,sys;print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$1"; }
+    assert_eq "serve: state は 600 で書く" "600" "$(mode35 "$(state35)")"
+    assert_eq "serve: state の置き場は 700" "700" "$(mode35 "$H35/.cache/wt/serve")"
+    if grep -rq "$token35" "$H35/.cache/wt/serve/"*.log 2>/dev/null; then
+      fail "serve: ログに token を残さない"
+    else
+      pass "serve: ログに token を残さない"
+    fi
+
+    # 承認は 1 回きり。応答後に自分で終了し state も消える。
+    waited35=0
+    while [ "$waited35" -lt 30 ] && [ -n "$(state35)" ]; do
+      sleep 0.1
+      waited35=$((waited35 + 1))
+    done
+    assert_eq "serve: 承認したら自分で終了して state を消す" "" "$(state35)"
+    assert_eq "serve: 終了後は listener が居ない" "no-listener" "$(http35 GET "$url35" | head -1)"
+  else
+    fail "serve: 起動しなかったため以降の HTTP 検証をスキップした"
+  fi
+
+  # --stop で止める。動いていなくても失敗しない (べき等)。
+  url35c="$(serve35 "$S35/page/review.html" --task s35 2>/dev/null | grep -m1 '^http' || true)"
+  serve35 --stop --task s35 >/dev/null 2>&1
+  assert_eq "serve: --stop で listener を止めて state を消す" "" "$(state35)"
+  if [ -n "$url35c" ]; then
+    assert_eq "serve: --stop 後は接続できない" "no-listener" "$(http35 GET "$url35c" | head -1)"
+  fi
+  if serve35 --stop --task s35 >/dev/null 2>&1; then
+    pass "serve: --stop はべき等 (動いていなくても成功)"
+  else
+    fail "serve: --stop はべき等 (動いていなくても成功)"
+  fi
+
+  # wt rm も listener を止める (worktree を消して listener だけ残る事故を防ぐ)。
+  wt35 new r35 --no-claude >/dev/null 2>&1
+  serve35 "$S35/page/review.html" --task r35 >/dev/null 2>&1
+  wt35 rm r35 >/dev/null 2>&1
+  assert_eq "rm: レビューサーバが残っていれば止める" "" "$(state35)"
+
+  # herdr が使えなければ配信しない (呼び出し側が file:// に落ちるための契約)。
+  out35="$(wt35 serve "$S35/page/review.html" --task s35 2>&1)"
+  rc35=$?
+  if [ "$rc35" -ne 0 ] && printf '%s' "$out35" | grep -q 'herdr'; then
+    pass "serve: herdr が使えなければ起動せず失敗する"
+  else
+    fail "serve: herdr が使えなければ起動せず失敗する (rc=$rc35 out=$out35)"
+  fi
+
+  # 引数の検査。
+  out35="$(serve35 "$S35/page/nope.html" --task s35 2>&1)"
+  rc35=$?
+  if [ "$rc35" -ne 0 ] && printf '%s' "$out35" | grep -q 'ファイルが無い'; then
+    pass "serve: 存在しないパスを弾く"
+  else
+    fail "serve: 存在しないパスを弾く (rc=$rc35 out=$out35)"
+  fi
+  out35="$(serve35 "$S35/page/review.html" 2>&1)"
+  rc35=$?
+  if [ "$rc35" -ne 0 ] && printf '%s' "$out35" | grep -q 'task'; then
+    pass "serve: worktree 外で task 省略は中断する"
+  else
+    fail "serve: worktree 外で task 省略は中断する (rc=$rc35 out=$out35)"
+  fi
+
+  # --ttl の秒数で自分を畳む (承認されず放置された listener を残さない)。
+  st35="$S35/ttl.state"
+  env HOME="$H35" python3 "$PY35" --html "$S35/page/review.html" --task ttl \
+    --state "$st35" --ttl 1 >/dev/null 2>&1 &
+  ttlpid35=$!
+  waited35=0
+  while [ "$waited35" -lt 50 ] && [ ! -f "$st35" ]; do
+    sleep 0.1
+    waited35=$((waited35 + 1))
+  done
+  assert_file "$st35" "serve: state ファイルを書く"
+  assert_eq "serve: state に url を書く" "1" \
+    "$(grep -c '^url=http://localhost:' "$st35" 2>/dev/null)"
+  assert_eq "serve: state に pid を書く" "$ttlpid35" \
+    "$(sed -n 's/^pid=//p' "$st35" 2>/dev/null)"
+  waited35=0
+  while [ "$waited35" -lt 80 ] && kill -0 "$ttlpid35" 2>/dev/null; do
+    sleep 0.1
+    waited35=$((waited35 + 1))
+  done
+  if kill -0 "$ttlpid35" 2>/dev/null; then
+    kill "$ttlpid35" 2>/dev/null
+    fail "serve: --ttl の秒数で自分を畳む"
+  else
+    pass "serve: --ttl の秒数で自分を畳む"
+  fi
+  wait "$ttlpid35" 2>/dev/null
+  if [ -f "$st35" ]; then
+    fail "serve: 終了時に state を消す"
+  else
+    pass "serve: 終了時に state を消す"
+  fi
+
+  if python3 -m py_compile "$PY35" >/dev/null 2>&1; then
+    pass "serve: wt-review-serve.py が構文エラー無くコンパイルできる"
+  else
+    fail "serve: wt-review-serve.py が構文エラー無くコンパイルできる"
+  fi
+  rm -rf "$REPO_ROOT/__pycache__"
+else
+  pass "serve: python3 が無いためスキップ"
 fi
 
 if [ "$FAILED" -eq 0 ]; then

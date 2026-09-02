@@ -10,7 +10,7 @@
 
 | ファイル | 内容 |
 | --- | --- |
-| `wt-review-template.html` | テンプレート。`<style>` 19KB と `<script>`（テーマトグル + mermaid 描画）を内包する |
+| `wt-review-template.html` | テンプレート。`<style>` 20KB と `<script>`（テーマトグル + mermaid 描画 + 承認ボタン）を内包する |
 | `render.py` | net.diff をパースして diff HTML を組み立て、テンプレートに差し込む。標準ライブラリのみ |
 | `sample-net.diff` | 動作確認用の diff。架空のアプリ `recipe-box` に印刷用ビューを足した 4 ファイル +342/-3 |
 | `sample-summary.html` | 動作確認用の要約断片。使えるクラスの見本も兼ねる |
@@ -47,6 +47,19 @@ render.py --diff <net.diff> --out <out.html> --title <text> --summary <summary.h
 `mermaid.min.js` を置き、描画スクリプトを有効にする。`~/.cache/wt/mermaid.min.js` に
 無ければ `curl` で取得してキャッシュする（`../../local-artifact/SKILL.md` と同じ手順）。
 取得できなければ警告を出して描画スクリプトを落とす（図はソースのまま表示される）。
+
+### 承認ボタン
+
+テンプレートは末尾に「承認」節（`#approve`）を持っている。`render.py` は差し込みも
+出し分けもしない — 常に `hidden` で出力し、`hidden` を外すのはページ内の script。
+条件は「`http(s)` で開かれていて `?token=...` が付いている」こと、つまり
+`wt serve` の配信経由で開いたときだけ出る。`file://` では投げる先が無いので
+節ごと隠れたままになる（承認はセッションに戻って入力する）。
+
+押すと same-origin の `POST /approve`（token 付き）になり、配信サーバ
+（repo ルートの `wt-review-serve.py`）が `herdr agent prompt claude-<task>` で
+「承認します。/wt-merge に進んでください」を worktree セッションへ投入して終了する。
+承認は**ユーザーの直接入力**としてセッションに届くので、レビューゲートの原則は保たれる。
 
 ### 動作確認
 

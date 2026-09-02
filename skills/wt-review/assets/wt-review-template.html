@@ -169,6 +169,9 @@
     border-radius: 2px;
   }
 
+  /* 承認セクションは既定で hidden。display 指定に負けないよう押さえる。 */
+  [hidden] { display: none !important; }
+
   code, .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 
   p code, li code, td code, summary code {
@@ -835,6 +838,58 @@
   :root[data-theme="light"] .theme-icon-sun { display: none; }
   :root[data-theme="light"] .theme-icon-moon { display: block; }
 
+  /* ---------- 承認 (wt serve の HTTP 配信時だけ出る) ---------- */
+  .approve-panel {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+    flex-wrap: wrap;
+    padding: 24px;
+    background: var(--bg-100);
+    border: 1px solid var(--gray-alpha-400);
+    border-radius: 6px;
+    box-shadow: var(--shadow-card);
+  }
+
+  .approve-body { flex: 1 1 320px; min-width: 0; }
+
+  .approve-lede { margin: 0; font-size: 15px; font-weight: 600; }
+
+  .approve-note { margin: 8px 0 0; font-size: 13px; color: var(--gray-900); }
+
+  #approve-btn {
+    flex: 0 0 auto;
+    height: 40px;
+    padding: 0 20px;
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--bg-100);
+    background: var(--gray-1000);
+    border: 1px solid var(--gray-1000);
+    border-radius: 6px;
+    cursor: pointer;
+  }
+
+  #approve-btn:hover { background: var(--gray-900); border-color: var(--gray-900); }
+
+  #approve-btn:disabled {
+    color: var(--gray-700);
+    background: var(--gray-100);
+    border-color: var(--gray-alpha-400);
+    cursor: not-allowed;
+  }
+
+  .approve-status { margin: 16px 0 0; font-size: 13px; color: var(--gray-900); }
+  .approve-status-ok { color: var(--green-900); }
+  .approve-status-err { color: var(--red-900); }
+
+  .approve[data-state="approved"] .approve-panel {
+    background: var(--green-100);
+    border-color: var(--green-400);
+  }
+
   /* ---------- Footer ---------- */
   .page-foot {
     margin-top: 40px;
@@ -926,6 +981,23 @@
     <!--DIFF_SECTION-->
   </section>
 
+  <section id="approve" class="approve" hidden>
+    <div class="section-head">
+      <h2>承認</h2>
+      <p class="section-note">押すと worktree セッションへの直接入力になる</p>
+    </div>
+
+    <div class="approve-panel">
+      <div class="approve-body">
+        <p class="approve-lede">この net diff をマージしてよければ承認します。</p>
+        <p class="approve-note">worktree の Claude Code セッションに「承認します。/wt-merge に進んでください」が入力されます。指摘を返すときはボタンを押さず、セッションに戻って書いてください。</p>
+      </div>
+      <button type="button" id="approve-btn">承認してマージ</button>
+    </div>
+
+    <p id="approve-status" class="approve-status" role="status" aria-live="polite"></p>
+  </section>
+
   <footer class="page-foot">
     <p>
       表示中の diff は <code>git diff &lt;base&gt;...&lt;head&gt;</code> の net diff です。
@@ -943,6 +1015,47 @@
     root.dataset.theme = effectiveTheme() === 'dark' ? 'light' : 'dark';
     document.dispatchEvent(new CustomEvent('themechange'));
   });
+</script>
+
+<script>
+  /* 承認ボタン。wt serve の HTTP 配信 (token 付き URL) のときだけ出す。
+     file:// で開いたときは投げる先が無いので節ごと隠したままにする
+     (その場合の承認は worktree セッションに戻って入力する)。 */
+  (() => {
+    const sec = document.getElementById('approve');
+    const btn = document.getElementById('approve-btn');
+    const state = document.getElementById('approve-status');
+    const token = new URLSearchParams(location.search).get('token');
+    if (!token || !/^https?:$/.test(location.protocol)) return;
+    sec.hidden = false;
+
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      state.className = 'approve-status';
+      state.textContent = '承認を送信中…';
+      try {
+        const res = await fetch('approve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-WT-Token': token },
+          body: JSON.stringify({ token })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.ok) throw new Error(data.error || ('HTTP ' + res.status));
+        sec.dataset.state = 'approved';
+        btn.hidden = true;
+        sec.querySelector('.approve-lede').textContent = '承認しました。';
+        sec.querySelector('.approve-note').textContent =
+          '配信サーバは終了しました。このページはリロードしても開けません。';
+        state.classList.add('approve-status-ok');
+        state.textContent = '承認を送りました。worktree セッションで /wt-merge に進みます';
+      } catch (e) {
+        btn.disabled = false;
+        state.classList.add('approve-status-err');
+        state.textContent = '承認を送れませんでした: ' + e.message +
+          '。セッションに戻って「承認」と入力してください';
+      }
+    });
+  })();
 </script>
 
 <!--MERMAID_BEGIN-->

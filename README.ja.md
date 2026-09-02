@@ -20,6 +20,7 @@ git worktree と [herdr](https://herdr.dev) workspace を一体で管理し、�
 - **セッション間の会話** — worktree 側と dev 側の Claude Code セッションが直接やり取りできる。`wt new` が worktree 側のセッション名を `wt-<task>` に固定し、`wt peers` が宛先を一覧する
 - **repo 固有の準備を委譲** — DB コピーや native rebuild などは repo 側の `scripts/worktree-setup` に委ねる契約
 - **マージ前チェック** — repo 側の `scripts/check` をマージ前に worktree で実行し、失敗したら取り込まない。CI と同一のエントリポイントを共有する契約
+- **レビューページから承認** — `/wt-review` がページを `127.0.0.1` の使い捨て HTTP サーバで配信するので、「承認してマージ」ボタンの押下がそのまま worktree セッションへの**ユーザー入力**として届く。ターミナルに戻る必要がない。herdr や python3 が無ければ `file://` 表示（ボタン無し）に落ちる
 - **GitHub issue / PR 連携（skill）** — `/wt` が issue を起票して worktree 名と初期プロンプトに紐付け、`/wt-merge` が `Fixes #N` 付きの PR を作成し、`/wt-review` の承認を通っていれば CI の完了を待ってマージまで実行する。タスク = issue = ブランチ = PR が 1:1 で対応する。remote の無い repo では従来のローカルマージ
 - **本体 checkout のガード（hook）** — 本体 checkout でブランチを切って直接作業しようとすると `PreToolUse` hook が確認を出す。worktree を経由しない作業を、skill の文章ではなく Bash の実行前検査で止める（plugin 経由のみ）
 - **graceful fallback** — herdr サーバに接続できなければ `git worktree` の作成だけで続行する
@@ -32,7 +33,7 @@ git worktree と [herdr](https://herdr.dev) workspace を一体で管理し、�
 | git | 必須 | worktree 操作 |
 | [herdr](https://herdr.dev) | 任意 | workspace / エージェント起動（無ければ git worktree のみ）。socket API の `worktree` / `agent start` を使うため herdr 0.8（socket API protocol 19）で検証している |
 | jq | herdr 使用時と `wt peers` で必須 | herdr の JSON 出力とセッションレジストリのパース |
-| python3 | `/wt-review` で必須 | `skills/wt-review/assets/render.py` がレビューページを組み立てる（標準ライブラリのみ） |
+| python3 | `/wt-review` で必須 | `skills/wt-review/assets/render.py` がレビューページを組み立て、`wt-review-serve.py` が配信して承認ボタンを herdr へのプロンプト投入に変換する（標準ライブラリのみ） |
 | curl | レビューページで mermaid を使うとき | `mermaid.min.js` を一度だけ `~/.cache/wt/` に取得する |
 | [gh](https://cli.github.com/) | 任意 | GitHub issue / PR 連携（`/wt` の issue 起票、`/wt-merge` の PR 作成、`/wt-clean` の PR 検査）。無ければ従来のローカルフロー |
 
@@ -62,12 +63,15 @@ plugin は `wt` を Bash tool の `PATH` に載せ、skill を plugin の名前�
 
 ### 手動配置
 
-`wt` は単一ファイル。PATH の通ったディレクトリに置くだけで動く。
+`wt` は単一ファイル。PATH の通ったディレクトリに置くだけで動く。レビューページの使い捨て配信サーバ（`wt serve` が起動する `wt-review-serve.py`）は `wt` の隣に置く。
 
 ```bash
 git clone https://github.com/kawase1295/wt.git
 install -m 755 wt/wt ~/.local/bin/wt   # ~/.local/bin が PATH にある前提
+install -m 755 wt/wt-review-serve.py ~/.local/bin/wt-review-serve.py
 ```
+
+`wt` は配信サーバを自分の隣から探す。置かなければ `wt serve` が起動を諦めるだけで、失うのは承認ボタンだけ（`/wt-review` は `file://` 表示に落ちる）。
 
 同梱の `install.sh` は配置に加えて Claude Code skill（後述）も `~/.claude/skills/` に入れる。
 
@@ -106,10 +110,21 @@ wt bootstrap [<path>]
 wt open <task>
     既存 worktree を herdr workspace として開き直す
 
-wt browse <path>
+wt browse <path|url>
     ローカルファイルをそのプラットフォームの既定の手段で開く（WSL は explorer.exe、
-    macOS は open、Linux は xdg-open）。skill が生成した HTML を開くのに使う。
+    macOS は open、Linux は xdg-open）。http(s) の URL も渡せる（wt serve の出力）。
+    WSL では URL だけ rundll32 の FileProtocolHandler に渡す
+    （explorer.exe は URL を開けない）。skill が生成した HTML を開くのに使う。
     開く手段が無ければパスを表示して失敗する
+
+wt serve <path> [--task <task>] / wt serve --stop [--task <task>]
+    レビューページを 127.0.0.1 の空きポートに立てた使い捨て HTTP サーバで配信し、
+    ?token=... 付きの URL を stdout に 1 行出す。ページの承認ボタンの POST を
+    herdr agent prompt claude-<task> に変換し、承認を worktree セッションへ
+    ユーザーの直接入力として届けて終了する。HTML はリクエストごとに読み直すので、
+    再レビューはブラウザのリロードだけで最新化される。worktree 内なら --task 省略で
+    ブランチから推定する。herdr が使えなければ起動せず失敗し、
+    呼び出し側（/wt-review）は file:// で開く従来手順に落ちる
 
 wt list
     worktree と herdr workspace の対応を一覧表示
@@ -226,7 +241,7 @@ skill は `SKILL.md` 1 枚に限らない。`/wt-review` はレビューペー�
 | --- | --- | --- |
 | `/wt <作業内容>` | dev | worktree 名を生成し、作業内容を初期プロンプトとして worktree + Claude Code を起動。GitHub リポジトリでは先に issue を起票（`/wt #123` で既存 issue も可）し、番号を名前とプロンプトに紐付ける |
 | `/wt-detail <作業内容>` | dev | コードベースを調査し、仕様の不明点をユーザーに確認してから実装プランを作り、初期プロンプトとして worktree に渡す。GitHub リポジトリではプラン確定後に issue を起票し、プラン全文を issue に残す |
-| `/wt-review` | worktree | 同梱テンプレートに diff を `assets/render.py` で差し込んでレビュー用 HTML を作り、ブラウザで開いて承認を待つ |
+| `/wt-review` | worktree | 同梱テンプレートに diff を `assets/render.py` で差し込んでレビュー用 HTML を作り、`wt serve`（承認ボタン付き）か `file://` で配信してブラウザで開き、承認を待つ |
 | `/wt-merge` | worktree | GitHub リポジトリでは `scripts/check` → push → `Fixes #N` 付きの PR を作成 → 承認ゲートを通っていれば CI の完了を待って `gh pr merge --merge` → remote ブランチを削除（未通過なら PR 作成で停止）。remote が無ければ本体の現在ブランチへローカルマージ（コンフリクトは報告して停止） |
 | `/wt-clean` | worktree | 未コミットと取り込み状態（PR の MERGED / 本体への未マージ）を検査し、クリーンなら自分の worktree を片付けて workspace を閉じる |
 | `/wt-ask <内容>` | 両方 | `wt peers` で相手セッションの宛先を解決し、質問・報告を送って返答を受ける |
@@ -300,6 +315,8 @@ fix-login            wt-fix-login             interactive  idle            /home
 - `.worktreeinclude` の否定パターン `!` は、親ディレクトリごと除外した配下を再 include できない（gitignore の仕様）。`secrets/` + `!secrets/x` は効かず、`secrets/*` + `!secrets/x` と書く。
 - 空ディレクトリと、エントリ自体が相対 symlink のファイルは正しく持ち込めない（git が列挙しない / リンク先が worktree 内で切れる）。
 - `wt merge` のコンフリクトは本体 checkout の working tree に発生する。解決するか `git merge --abort` で戻すまで本体が merge 中の状態になる。
+- `wt serve` の listener は `127.0.0.1` にしか bind しない。WSL2 から Windows 側のブラウザで開けるのは localhost 転送が有効なとき（既定は有効）。届かない環境ではページが開けないので、`/wt-review` に `file://` で開かせる（`wt serve` を使わない）。
+- 配信サーバは承認で終了するが、承認せずに閉じた場合は残る。`wt rm`（/wt-clean）が止めるほか、`wt serve --stop` で個別に止められる。放置しても 24 時間で自分を畳む。
 
 ## 開発
 
@@ -308,7 +325,7 @@ scripts/check     # shellcheck + マニフェスト検査 + テスト。wt merge
 tests/wt_test.sh  # 34 ケース。依存は git と coreutils のみ（bats 不要）
 ```
 
-`scripts/check` は `claude` CLI があれば `claude plugin validate .` も走らせるので、`.claude-plugin/` のマニフェストが壊れた状態はマーケットプレイスに出る前に落ちる。`python3` があれば `skills/wt-review/assets/render.py` の構文検査も走らせる。生成スクリプトは標準ライブラリだけで書いてあるので linter は入れない。plugin エントリに `version` を意図的に持たせていない点に注意する。付けると値を上げるまでその版に固定され、`main` に push したコミットがユーザーへ届かなくなる。
+`scripts/check` は `claude` CLI があれば `claude plugin validate .` も走らせるので、`.claude-plugin/` のマニフェストが壊れた状態はマーケットプレイスに出る前に落ちる。`python3` があれば同梱 python（`skills/wt-review/assets/render.py` と `wt-review-serve.py`）の構文検査も走らせる。どちらも標準ライブラリだけで書いてあるので linter は入れない。plugin エントリに `version` を意図的に持たせていない点に注意する。付けると値を上げるまでその版に固定され、`main` に push したコミットがユーザーへ届かなくなる。
 
 テストは `herdr` を PATH から隠して git worktree フォールバック経路を強制し、herdr 経路自体の検証では fake herdr を差し込む。`HOME` は temp に差し替えるため実ホームを汚さない。
 

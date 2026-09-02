@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # 本体 checkout でのブランチ切替を ask に落とす PreToolUse hook。
 #
+# 対象は git checkout / git switch でのブランチ切替と、gh pr checkout。
+# gh pr checkout も本体のブランチを動かすので、同じ穴として扱う。
+#
 # wt の運用は「タスク = issue = ブランチ = PR」を worktree に 1:1 で対応させる。
 # 本体 checkout でブランチを切って直接作業すると対応が崩れ、レビューゲート
 # (/wt-review) も worktree セッションも通らない。skill の文章は skill が起動して
@@ -15,6 +18,7 @@
 #   - cwd が git work tree でない / linked worktree の中
 #   - 切替先が許可ブランチ (origin/HEAD の default branch + WT_GUARD_ALLOW_BRANCHES)
 #   - git checkout -- <path> などのファイル復元、ブランチ以外への checkout
+#   - gh の checkout でないサブコマンド (gh pr view など)
 #   - JSON を読む手段 (jq / python3) が無い
 #
 # ガードは fail-open にする。判定できない入力でブロックすると、hook の不調が
@@ -101,7 +105,7 @@ unquote() { # 前後の同一クォートを 1 組だけ剥がす
 
 # セグメントがブランチ切替なら、その切替先を stdout に出して 0 を返す。
 branch_target() { # segment
-  local seg="$1" tok=() i n w sub create=0 detach=0 track=0 target=""
+  local seg="$1" tok=() i n w sub remote create=0 detach=0 track=0 target=""
   read -ra tok <<<"$seg"
   n=${#tok[@]}
   [ "$n" -gt 0 ] || return 1
@@ -135,6 +139,12 @@ branch_target() { # segment
     w="$(unquote "${tok[$i]}")"
     case "$w" in
       --) return 1 ;;
+      --orphan)
+        create=1 && i=$((i + 1))
+        [ "$i" -lt "$n" ] || return 1
+        target="$(unquote "${tok[$i]}")"
+        break
+        ;;
       -b | -B)
         [ "$sub" = checkout ] || { i=$((i + 1)) && continue; }
         create=1 && i=$((i + 1))
@@ -158,6 +168,19 @@ branch_target() { # segment
   done
   [ -n "$target" ] || return 1
 
+  # `--track origin/foo` で git が作るローカルブランチは remote 名を除いた側。
+  # 許可判定もその名前で行う (origin/dev を許可ブランチとして扱えるように)。
+  if [ "$track" -eq 1 ]; then
+    case "$target" in
+      */*)
+        remote="${target%%/*}"
+        if git -C "$cwd" show-ref --verify --quiet "refs/remotes/$target"; then
+          target="${target#"$remote"/}"
+        fi
+        ;;
+    esac
+  fi
+
   # `-` は直前ブランチ。実名に解決してから許可判定にかける。
   if [ "$target" = "-" ]; then
     target="$(git -C "$cwd" rev-parse --abbrev-ref '@{-1}' 2>/dev/null)" || return 1
@@ -177,21 +200,84 @@ branch_target() { # segment
   printf '%s' "$target"
 }
 
+# セグメントが gh pr checkout なら、その PR 指定 (番号 / URL / ブランチ名) を
+# stdout に出して 0 を返す。指定を読み取れなくても、サブコマンドが一致した時点で
+# ブランチは動くので 0 を返す (この場合 stdout は空)。
+gh_pr_checkout_target() { # segment
+  local seg="$1" tok=() i n w target=""
+  read -ra tok <<<"$seg"
+  n=${#tok[@]}
+  [ "$n" -gt 0 ] || return 1
+
+  w="$(unquote "${tok[0]}")"
+  case "$w" in
+    gh | */gh) ;;
+    *) return 1 ;;
+  esac
+
+  # gh のグローバルオプションは値を取らない (--help / --version)。
+  i=1
+  while [ "$i" -lt "$n" ]; do
+    w="$(unquote "${tok[$i]}")"
+    case "$w" in
+      -*) i=$((i + 1)) ;;
+      *) break ;;
+    esac
+  done
+
+  # `gh pr checkout` の並びだけを対象にする。
+  [ "$i" -lt "$n" ] && [ "$(unquote "${tok[$i]}")" = pr ] || return 1
+  i=$((i + 1))
+  [ "$i" -lt "$n" ] && [ "$(unquote "${tok[$i]}")" = checkout ] || return 1
+  i=$((i + 1))
+
+  # 値を取るオプションは --branch / --repo。それ以外の非オプション語が PR 指定。
+  while [ "$i" -lt "$n" ]; do
+    w="$(unquote "${tok[$i]}")"
+    case "$w" in
+      -b | --branch | -R | --repo) i=$((i + 2)) ;;
+      -*) i=$((i + 1)) ;;
+      *) target="$w" && break ;;
+    esac
+  done
+
+  printf '%s' "$target"
+}
+
 # 複合コマンドを分解する。区切り文字はすべて改行に潰す
 # (クォート内の区切りも割れるが、誤検出しても出るのは ask なので害はない)。
+kind=""
 hit=""
 while IFS= read -r seg; do
   [ -n "$seg" ] || continue
-  target="$(branch_target "$seg")" || continue
-  is_allowed "$target" && continue
-  hit="$target"
-  break
-done < <(printf '%s\n' "$cmd" | tr ';|&' '\n')
+  if target="$(branch_target "$seg")"; then
+    is_allowed "$target" && continue
+    kind="branch"
+    hit="$target"
+    break
+  fi
+  if target="$(gh_pr_checkout_target "$seg")"; then
+    kind="pr"
+    hit="$target"
+    break
+  fi
+done < <(printf '%s\n' "$cmd" | tr ';|&()' '\n')
 
-[ -n "$hit" ] || exit 0
+[ -n "$kind" ] || exit 0
 
 # reason は JSON の文字列に埋めるので、壊す文字を落としてから使う。
 # shellcheck disable=SC1003  # '"\\' は二重引用符とバックスラッシュの 2 文字を落とす指定
 safe="$(printf '%s' "$hit" | tr -d '"\\' | tr -d '[:cntrl:]' | cut -c 1-80)"
-printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"本体 checkout でブランチ「%s」に切り替えようとしています。worktree で作業するなら dev 側セッションで /wt を使ってください。本体のブランチを動かす必要があるときだけ許可してください。"}}\n' "$safe"
+advice="worktree で作業するなら dev 側セッションで /wt を使ってください。本体のブランチを動かす必要があるときだけ許可してください。"
+if [ "$kind" = "pr" ]; then
+  if [ -n "$safe" ]; then
+    reason="本体 checkout で PR「${safe}」を checkout しようとしています。gh pr checkout は本体のブランチを切り替えます。${advice}"
+  else
+    reason="本体 checkout で gh pr checkout を実行しようとしています。本体のブランチが切り替わります。${advice}"
+  fi
+else
+  reason="本体 checkout でブランチ「${safe}」に切り替えようとしています。${advice}"
+fi
+
+printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"%s"}}\n' "$reason"
 exit 0

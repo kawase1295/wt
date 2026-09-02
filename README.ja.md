@@ -269,7 +269,11 @@ worktree 側: (実装・コミット) → /wt-review → (ユーザーがレビ�
 
 wt の運用は「タスク = issue = ブランチ = PR」を worktree に 1:1 で対応させる。本体 checkout でブランチを切って直接作業してしまうと、この対応も `/wt-review` のレビューゲートも通らない。skill の文章は skill が起動して初めて読まれるので、起動しない経路（「issue を確認して」からそのまま実装に流れる等）には効かない。
 
-そこで plugin は `PreToolUse` hook（[`hooks/main-checkout-guard.sh`](hooks/main-checkout-guard.sh)）を同梱し、Bash の実行前に検査する。**本体 checkout での**ブランチ切替（`git checkout -b` / `git switch -c` / 既存ブランチへの `checkout`。ローカルに無くても remote に同名があれば git が追跡ブランチを作って切り替えるので、それも含む）を見つけたら `ask` を返し、`/wt` を使う選択肢を添えてユーザーに確認を出す。
+そこで plugin は `PreToolUse` hook（[`hooks/main-checkout-guard.sh`](hooks/main-checkout-guard.sh)）を同梱し、Bash の実行前に検査する。**本体 checkout での**ブランチ切替を見つけたら `ask` を返し、`/wt` を使う選択肢を添えてユーザーに確認を出す。切替とみなすのは次のもの。
+
+- `git checkout -b` / `git switch -c` / `--orphan` など、ブランチを作ってそこに移る操作
+- 既存ブランチへの `checkout`（ローカルに無くても remote に同名があれば git が追跡ブランチを作って切り替えるので、それも含む）
+- `gh pr checkout`。`git checkout` と同じように本体のブランチを動かす。PR を読む流れは worktree を経由しない作業に滑り込みやすいので、同じ扱いにしている
 
 `deny` ではなく `ask` にしている。本体のブランチを動かす正当な用途（dev / main の行き来、rebase、緊急のブランチ確認）を詰まらせないため。
 
@@ -278,6 +282,7 @@ wt の運用は「タスク = issue = ブランチ = PR」を worktree に 1:1 �
 - linked worktree の中（worktree 側は自分のブランチを自由に操作してよい）
 - 切替先が許可ブランチ — `origin/HEAD` の指す default branch と `main` / `master` / `dev`
 - `git checkout -- <path>` などのファイル復元、ブランチでない対象への `checkout`
+- `pr checkout` 以外の `gh` サブコマンド（`gh pr view`、`gh pr diff` など）
 - git work tree でない場所、JSON を読む手段（`jq` / `python3`）が無い環境
 
 最後の 1 つのとおり、判定できない入力では素通しする。hook の不調がそのまま Bash 全体の停止になるのを避けるため、ガードは fail-open にしている。

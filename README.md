@@ -273,7 +273,11 @@ worktree: (implement, commit) -> /wt-review -> (you review and approve) -> /wt-m
 
 `wt` keeps task = issue = branch = PR mapped one-to-one onto a worktree. Branching off and working directly in the main checkout breaks that mapping and skips the `/wt-review` gate. Prose in a skill only gets read once the skill fires, so it does nothing on the paths where no skill fires (asking to "look at issue #N" and sliding straight into implementation, say).
 
-So the plugin ships a `PreToolUse` hook ([`hooks/main-checkout-guard.sh`](hooks/main-checkout-guard.sh)) that inspects Bash before it runs. When it sees a branch switch **in the main checkout** (`git checkout -b`, `git switch -c`, or a `checkout` of an existing branch — including a name that only exists on the remote, which git turns into a tracking branch) it returns `ask`, prompting you with `/wt` as the alternative.
+So the plugin ships a `PreToolUse` hook ([`hooks/main-checkout-guard.sh`](hooks/main-checkout-guard.sh)) that inspects Bash before it runs. When it sees a branch switch **in the main checkout** it returns `ask`, prompting you with `/wt` as the alternative. What counts as a switch:
+
+- `git checkout -b` / `git switch -c` / `--orphan`, and any other way of creating a branch and landing on it
+- a `checkout` of an existing branch — including a name that only exists on the remote, which git turns into a tracking branch
+- `gh pr checkout`, which moves the main checkout's branch exactly like `git checkout` does. Reading a PR is one of the easiest ways to slide into working outside a worktree, so it gets the same treatment
 
 It asks rather than denies: moving the main checkout's branch has legitimate uses — hopping between dev and main, rebasing, checking a branch in a hurry — and none of those should be dead ends.
 
@@ -282,6 +286,7 @@ It stays out of the way when:
 - you are inside a linked worktree (a worktree session owns its branch)
 - the target is an allowed branch — whatever `origin/HEAD` points at, plus `main` / `master` / `dev`
 - the command restores files (`git checkout -- <path>`) or checks out something that is not a branch
+- the `gh` subcommand is anything other than `pr checkout` (`gh pr view`, `gh pr diff`, …)
 - the directory is not a git work tree, or neither `jq` nor `python3` is available to read the hook's JSON
 
 That last case is deliberate: the guard fails open, because a misbehaving hook that fails closed would take all of Bash down with it.

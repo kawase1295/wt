@@ -22,7 +22,7 @@
 - **Pre-merge gate** — runs the repo's `scripts/check` in the worktree before merging and refuses to merge on failure. Same entry point your CI calls
 - **Approve from the review page** — `/wt-review` serves the page off a throwaway `127.0.0.1` HTTP server, so its 「承認してマージ」 (approve and merge) button lands the approval in the worktree session as *your* own input — no switching back to the terminal. Without herdr or python3 it falls back to `file://` with the button hidden
 - **GitHub issue / PR integration (skills)** — `/wt` files an issue and ties its number into the worktree name and the initial prompt; `/wt-merge` opens a PR with `Fixes #N` and, once the `/wt-review` approval gate has passed, waits for CI and merges it. Task = issue = branch = PR, one-to-one. Repos without a remote keep the plain local merge
-- **Guards the main checkout (hook)** — a `PreToolUse` hook asks for confirmation when something tries to branch off and work directly in the main checkout. Work that bypasses a worktree is stopped by a pre-execution check on Bash, not by prose in a skill (plugin only)
+- **Guards the main checkout (hook)** — a `PreToolUse` hook denies with guidance when something tries to branch off and work directly in the main checkout, steering the session back to a worktree (`wt open` / `wt new`). Work that bypasses a worktree is stopped by a pre-execution check on Bash, not by prose in a skill (plugin only)
 - **Graceful fallback** — if the herdr server is unreachable, it just creates the git worktree and carries on
 
 ## Requirements
@@ -275,13 +275,13 @@ worktree: (implement, commit) -> /wt-review -> (you review and approve) -> /wt-m
 
 `wt` keeps task = issue = branch = PR mapped one-to-one onto a worktree. Branching off and working directly in the main checkout breaks that mapping and skips the `/wt-review` gate. Prose in a skill only gets read once the skill fires, so it does nothing on the paths where no skill fires (asking to "look at issue #N" and sliding straight into implementation, say).
 
-So the plugin ships a `PreToolUse` hook ([`hooks/main-checkout-guard.sh`](hooks/main-checkout-guard.sh)) that inspects Bash before it runs. When it sees a branch switch **in the main checkout** it returns `ask`, prompting you with `/wt` as the alternative. What counts as a switch:
+So the plugin ships a `PreToolUse` hook ([`hooks/main-checkout-guard.sh`](hooks/main-checkout-guard.sh)) that inspects Bash before it runs. When it sees a branch switch **in the main checkout** it returns a `deny` whose reason goes straight back to Claude with the case-specific alternative (`worktree-*` branch → `wt open <task>`, creating a branch → `wt new <task>`, `gh pr checkout` → `gh pr view` / `gh pr diff` or a worktree), so the session corrects course instead of stalling. What counts as a switch:
 
 - `git checkout -b` / `git switch -c` / `--orphan`, and any other way of creating a branch and landing on it
 - a `checkout` of an existing branch — including a name that only exists on the remote, which git turns into a tracking branch
 - `gh pr checkout`, which moves the main checkout's branch exactly like `git checkout` does. Reading a PR is one of the easiest ways to slide into working outside a worktree, so it gets the same treatment
 
-It asks rather than denies: moving the main checkout's branch has legitimate uses — hopping between dev and main, rebasing, checking a branch in a hurry — and none of those should be dead ends.
+It denies rather than asks: answering No to an ask prompt hands Claude a reasonless rejection and the turn dies there, while a deny reason is fed back automatically and the session keeps moving. Legitimate branch moves (hopping between dev and main, rebasing) pass through the allow-list; anything else goes through `WT_GUARD_DISABLE=1` under an explicit user instruction — the reason says so.
 
 It stays out of the way when:
 

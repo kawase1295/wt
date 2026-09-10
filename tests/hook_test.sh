@@ -4,7 +4,7 @@
 #   tests/hook_test.sh
 #
 # hook は PreToolUse の JSON を stdin で受け、本体 checkout でのブランチ切替
-# (git checkout / git switch / gh pr checkout) だけを ask に落とす。判定が cwd の
+# (git checkout / git switch / gh pr checkout) だけを理由付き deny にする。判定が cwd の
 # git 状態に依存するため、temp repo を作って検証する。
 set -uo pipefail
 
@@ -39,12 +39,12 @@ run_hook() { # cwd command
     "$HOOK" 2>/dev/null
 }
 
-is_ask() { printf '%s' "$1" | grep -q '"permissionDecision":"ask"'; }
+is_deny() { printf '%s' "$1" | grep -q '"permissionDecision":"deny"'; }
 
-assert_ask() { # desc cwd command
+assert_deny() { # desc cwd command
   local out
   out="$(run_hook "$2" "$3")"
-  if is_ask "$out"; then pass "$1"; else fail "$1 (out=$out)"; fi
+  if is_deny "$out"; then pass "$1"; else fail "$1 (out=$out)"; fi
 }
 
 assert_pass() { # desc cwd command
@@ -67,46 +67,67 @@ W="$TMP/repo-wt"
 git -C "$R" worktree add -q "$W" -b worktree-guard-test
 
 # --- 本体 checkout: ブランチ切替は ask ---
-assert_ask "hook: checkout -b は ask" "$R" "git checkout -b feature-new"
-assert_ask "hook: checkout -B は ask" "$R" "git checkout -B feature-new"
-assert_ask "hook: switch -c は ask" "$R" "git switch -c feature-new"
-assert_ask "hook: switch -C は ask" "$R" "git switch -C feature-new"
-assert_ask "hook: 既存ブランチへの checkout は ask" "$R" "git checkout feature-x"
-assert_ask "hook: 既存ブランチへの switch は ask" "$R" "git switch feature-x"
-assert_ask "hook: worktree-* への切替も ask (wt open を使う)" "$R" "git checkout worktree-42-something"
-assert_ask "hook: クォート付きのブランチ名も見る" "$R" 'git checkout "feature-x"'
-assert_ask "hook: 複合コマンドの中でも検出する" "$R" "cd /tmp && git checkout -b feature-new"
-assert_ask "hook: git -C 付きでも検出する" "$R" "git -C $R checkout -b feature-new"
-assert_ask "hook: 絶対パスの git でも検出する" "$R" "/usr/bin/git checkout -b feature-new"
+assert_deny "hook: checkout -b は deny" "$R" "git checkout -b feature-new"
+assert_deny "hook: checkout -B は deny" "$R" "git checkout -B feature-new"
+assert_deny "hook: switch -c は deny" "$R" "git switch -c feature-new"
+assert_deny "hook: switch -C は deny" "$R" "git switch -C feature-new"
+assert_deny "hook: 既存ブランチへの checkout は deny" "$R" "git checkout feature-x"
+assert_deny "hook: 既存ブランチへの switch は deny" "$R" "git switch feature-x"
+assert_deny "hook: worktree-* への切替も deny (wt open を使う)" "$R" "git checkout worktree-42-something"
+assert_deny "hook: クォート付きのブランチ名も見る" "$R" 'git checkout "feature-x"'
+assert_deny "hook: 複合コマンドの中でも検出する" "$R" "cd /tmp && git checkout -b feature-new"
+assert_deny "hook: git -C 付きでも検出する" "$R" "git -C $R checkout -b feature-new"
+assert_deny "hook: 絶対パスの git でも検出する" "$R" "/usr/bin/git checkout -b feature-new"
 
 # ローカルに無くても remote にあれば git は追跡ブランチを作って切り替える (DWIM)。
 git -C "$R" update-ref refs/remotes/origin/remote-only "$(git -C "$R" rev-parse HEAD)"
 git -C "$R" update-ref refs/remotes/origin/dev "$(git -C "$R" rev-parse HEAD)"
-assert_ask "hook: remote にだけあるブランチへの checkout も ask" "$R" "git checkout remote-only"
-assert_ask "hook: --track は ask" "$R" "git checkout --track origin/remote-only"
-assert_ask "hook: -t は ask" "$R" "git checkout -t origin/remote-only"
-assert_ask "hook: checkout --orphan は ask" "$R" "git checkout --orphan gh-pages"
-assert_ask "hook: switch --orphan は ask" "$R" "git switch --orphan fresh"
-assert_ask "hook: 括弧で囲まれたブランチ切替も検出する" "$R" "(git checkout -b feature-new)"
+assert_deny "hook: remote にだけあるブランチへの checkout も deny" "$R" "git checkout remote-only"
+assert_deny "hook: --track は deny" "$R" "git checkout --track origin/remote-only"
+assert_deny "hook: -t は deny" "$R" "git checkout -t origin/remote-only"
+assert_deny "hook: checkout --orphan は deny" "$R" "git checkout --orphan gh-pages"
+assert_deny "hook: switch --orphan は deny" "$R" "git switch --orphan fresh"
+assert_deny "hook: 括弧で囲まれたブランチ切替も検出する" "$R" "(git checkout -b feature-new)"
 
-# --- 本体 checkout: gh pr checkout もブランチを切り替えるので ask ---
-assert_ask "hook: gh pr checkout <番号> は ask" "$R" "gh pr checkout 5"
-assert_ask "hook: gh pr checkout <URL> は ask" "$R" "gh pr checkout https://github.com/o/r/pull/5"
-assert_ask "hook: gh pr checkout <ブランチ名> は ask" "$R" "gh pr checkout feature-x"
-assert_ask "hook: gh pr checkout -b <名前> は ask" "$R" "gh pr checkout 5 -b local-name"
-assert_ask "hook: gh pr checkout --detach は ask" "$R" "gh pr checkout --detach 5"
-assert_ask "hook: gh pr checkout -R <repo> は ask" "$R" "gh pr checkout -R owner/repo 5"
-assert_ask "hook: gh pr checkout の引数なしも ask" "$R" "gh pr checkout"
-assert_ask "hook: 絶対パスの gh でも検出する" "$R" "/usr/bin/gh pr checkout 5"
-assert_ask "hook: 複合コマンドの中の gh pr checkout も検出する" "$R" "gh pr view 5 && gh pr checkout 5"
+# --- 本体 checkout: gh pr checkout もブランチを切り替えるので deny ---
+assert_deny "hook: gh pr checkout <番号> は deny" "$R" "gh pr checkout 5"
+assert_deny "hook: gh pr checkout <URL> は deny" "$R" "gh pr checkout https://github.com/o/r/pull/5"
+assert_deny "hook: gh pr checkout <ブランチ名> は deny" "$R" "gh pr checkout feature-x"
+assert_deny "hook: gh pr checkout -b <名前> は deny" "$R" "gh pr checkout 5 -b local-name"
+assert_deny "hook: gh pr checkout --detach は deny" "$R" "gh pr checkout --detach 5"
+assert_deny "hook: gh pr checkout -R <repo> は deny" "$R" "gh pr checkout -R owner/repo 5"
+assert_deny "hook: gh pr checkout の引数なしも deny" "$R" "gh pr checkout"
+assert_deny "hook: 絶対パスの gh でも検出する" "$R" "/usr/bin/gh pr checkout 5"
+assert_deny "hook: 複合コマンドの中の gh pr checkout も検出する" "$R" "gh pr view 5 && gh pr checkout 5"
 
-# ask の中身は JSON として妥当で、PR の指定を名指しする。
+# deny の中身は JSON として妥当で、PR の指定を名指しする。
 out_pr="$(run_hook "$R" "gh pr checkout 5")"
 if printf '%s' "$out_pr" | jq -e '.hookSpecificOutput.permissionDecisionReason | contains("PR「5」")' >/dev/null 2>&1; then
-  pass "hook: gh の ask は妥当な JSON で PR 指定を含む"
+  pass "hook: gh の deny は妥当な JSON で PR 指定を含む"
 else
-  fail "hook: gh の ask は妥当な JSON で PR 指定を含む (out=$out_pr)"
+  fail "hook: gh の deny は妥当な JSON で PR 指定を含む (out=$out_pr)"
 fi
+
+# reason は場面別に代替手段を名指しし、逃げ道 (WT_GUARD_DISABLE) を必ず含める。
+reason_contains() { # desc out needle
+  if printf '%s' "$2" | jq -e --arg s "$3" '.hookSpecificOutput.permissionDecisionReason | contains($s)' >/dev/null 2>&1; then
+    pass "$1"
+  else
+    fail "$1 (out=$2)"
+  fi
+}
+out_wtbr="$(run_hook "$R" "git checkout worktree-42-something")"
+reason_contains "hook: worktree-* の deny は wt open <task> を案内する" "$out_wtbr" "wt open 42-something"
+out_create="$(run_hook "$R" "git checkout -b feature-new")"
+reason_contains "hook: 新規ブランチの deny は wt new を案内する" "$out_create" "wt new"
+out_exist="$(run_hook "$R" "git checkout feature-x")"
+if printf '%s' "$out_exist" | jq -e '.hookSpecificOutput.permissionDecisionReason | contains("wt new") or contains("wt open")' >/dev/null 2>&1; then
+  fail "hook: 既存ブランチの deny は wt new / wt open を案内しない (out=$out_exist)"
+else
+  pass "hook: 既存ブランチの deny は wt new / wt open を案内しない"
+fi
+reason_contains "hook: gh pr checkout の deny は gh pr view / diff を案内する" "$out_pr" "gh pr diff"
+reason_contains "hook: deny は WT_GUARD_DISABLE の逃げ道を案内する" "$out_create" "WT_GUARD_DISABLE=1"
 
 # --- 本体 checkout: 素通しする経路 ---
 assert_pass "hook: default branch への切替は素通し" "$R" "git checkout main"
@@ -128,7 +149,7 @@ assert_pass "hook: gh 以外のコマンドの引数に並んでいても素通�
 git -C "$R" checkout -q feature-x # 直前は main
 assert_pass "hook: - が許可ブランチに戻るなら素通し" "$R" "git checkout -"
 git -C "$R" checkout -q main # 直前は feature-x
-assert_ask "hook: - が許可外ブランチに戻るなら ask" "$R" "git checkout -"
+assert_deny "hook: - が許可外ブランチに戻るなら deny" "$R" "git checkout -"
 
 # --- worktree 内は素通し ---
 assert_pass "hook: worktree 内の checkout -b は素通し" "$W" "git checkout -b another"
@@ -168,7 +189,7 @@ else
 fi
 
 out_allow2="$(WT_GUARD_ALLOW_BRANCHES=feature-x run_hook "$R" "git checkout dev")"
-if is_ask "$out_allow2"; then
+if is_deny "$out_allow2"; then
   pass "hook: 差し替えると既定の許可名は外れる"
 else
   fail "hook: 差し替えると既定の許可名は外れる (out=$out_allow2)"

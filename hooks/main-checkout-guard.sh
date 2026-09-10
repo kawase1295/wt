@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 本体 checkout でのブランチ切替を ask に落とす PreToolUse hook。
+# 本体 checkout でのブランチ切替を理由付きで deny する PreToolUse hook。
 #
 # 対象は git checkout / git switch でのブランチ切替と、gh pr checkout。
 # gh pr checkout も本体のブランチを動かすので、同じ穴として扱う。
@@ -10,8 +10,11 @@
 # 初めて読まれるので、起動しない経路 (「issue を確認して」からそのまま実装に
 # 流れる等) には効かない。そのため Bash の実行前に静的に検査する。
 #
-# deny ではなく ask にしている。本体のブランチを動かす正当な用途 (dev / main の
-# 行き来、rebase、緊急のブランチ確認) を詰まらせないため。
+# ask ではなく deny にしている。ask の確認で No を選んでも Claude には理由の
+# ない拒否しか渡らず、そこでターンが止まる。deny の permissionDecisionReason は
+# Claude に自動で返るため、セッションを止めずに worktree 経由 (wt open / wt new)
+# へ誘導できる。本体のブランチを動かす正当な用途は許可ブランチと
+# WT_GUARD_DISABLE / WT_GUARD_ALLOW_BRANCHES で通す。
 #
 # 素通しする条件:
 #   - WT_GUARD_DISABLE=1
@@ -103,7 +106,7 @@ unquote() { # 前後の同一クォートを 1 組だけ剥がす
   printf '%s' "$s"
 }
 
-# セグメントがブランチ切替なら、その切替先を stdout に出して 0 を返す。
+# セグメントがブランチ切替なら、"作成フラグ 切替先" を stdout に出して 0 を返す。
 branch_target() { # segment
   local seg="$1" tok=() i n w sub remote create=0 detach=0 track=0 target=""
   read -ra tok <<<"$seg"
@@ -197,7 +200,7 @@ branch_target() { # segment
     fi
   fi
 
-  printf '%s' "$target"
+  printf '%s %s' "$create" "$target"
 }
 
 # セグメントが gh pr checkout なら、その PR 指定 (番号 / URL / ブランチ名) を
@@ -245,12 +248,16 @@ gh_pr_checkout_target() { # segment
 }
 
 # 複合コマンドを分解する。区切り文字はすべて改行に潰す
-# (クォート内の区切りも割れるが、誤検出しても出るのは ask なので害はない)。
+# (クォート内の区切りも割れるが、誤検出しても出るのは理由付き deny で、
+# 逃げ道も reason に含まれるので手戻りで済む)。
 kind=""
 hit=""
+hit_create=0
 while IFS= read -r seg; do
   [ -n "$seg" ] || continue
-  if target="$(branch_target "$seg")"; then
+  if out="$(branch_target "$seg")"; then
+    hit_create="${out%% *}"
+    target="${out#* }"
     is_allowed "$target" && continue
     kind="branch"
     hit="$target"
@@ -268,16 +275,25 @@ done < <(printf '%s\n' "$cmd" | tr ';|&()' '\n')
 # reason は JSON の文字列に埋めるので、壊す文字を落としてから使う。
 # shellcheck disable=SC1003  # '"\\' は二重引用符とバックスラッシュの 2 文字を落とす指定
 safe="$(printf '%s' "$hit" | tr -d '"\\' | tr -d '[:cntrl:]' | cut -c 1-80)"
-advice="worktree で作業するなら dev 側セッションで /wt を使ってください。本体のブランチを動かす必要があるときだけ許可してください。"
+advice="本体 checkout のブランチは全 worktree の base・マージ先なので動かさない。ユーザーが本体での切替を明示的に指示している場合のみ、WT_GUARD_DISABLE=1 を前置して同じコマンドを再実行してよい。"
 if [ "$kind" = "pr" ]; then
-  if [ -n "$safe" ]; then
-    reason="本体 checkout で PR「${safe}」を checkout しようとしています。gh pr checkout は本体のブランチを切り替えます。${advice}"
-  else
-    reason="本体 checkout で gh pr checkout を実行しようとしています。本体のブランチが切り替わります。${advice}"
-  fi
+  which="gh pr checkout"
+  [ -n "$safe" ] && which="gh pr checkout（PR「${safe}」）"
+  reason="${which} は本体 checkout のブランチを切り替えるため拒否した。PR の内容確認は gh pr view / gh pr diff を使う。変更を手元で動かす必要があるなら worktree 内で checkout する。${advice}"
 else
-  reason="本体 checkout でブランチ「${safe}」に切り替えようとしています。${advice}"
+  case "$safe" in
+    worktree-*)
+      reason="ブランチ「${safe}」への切替を拒否した。worktree ブランチは wt open ${safe#worktree-} で対応する worktree を開いて作業する。${advice}"
+      ;;
+    *)
+      if [ "$hit_create" = "1" ]; then
+        reason="本体 checkout での新規ブランチ「${safe}」の作成を拒否した。タスクのブランチは wt new <task> で worktree として切る（dev 側セッションなら /wt skill を使う）。${advice}"
+      else
+        reason="本体 checkout でのブランチ「${safe}」への切替を拒否した。${advice}"
+      fi
+      ;;
+  esac
 fi
 
-printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"%s"}}\n' "$reason"
+printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}\n' "$reason"
 exit 0

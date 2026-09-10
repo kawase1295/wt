@@ -10,7 +10,7 @@ description: コードベースを調査し、仕様の不明点をユーザー�
 ## 手順
 
 1. 引数が空なら、何を計画する worktree か質問する。
-2. 引数が既存 issue（`#123`・番号のみ・issue URL。GitHub 連携時）なら、先に `gh issue view <N> --json number,title,body,state` で取得する。OPEN でなければ報告して止まる。issue 本文が作業内容になる。
+2. 引数が既存 issue（`#123`・番号のみ・issue URL。GitHub 連携時）なら、先に `gh issue view <N> --json number,title,body,state` で取得する。OPEN でなければ報告して止まる。issue 本文が作業内容になる。本文が複数の独立タスクのチェックリストになっている（または既に `## 子タスク` に分解済みの）issue は 1 つの worktree に詰め込まず、/wt-split を案内して止まる。
 3. **調査は dev 側の自分が行う**（worktree 側にやり直させない）。作業内容に関連するファイル・既存パターン・影響範囲を読む。規模が大きければ Explore subagent に投げる。
 4. **仕様の不明点をユーザーに質問する（省略禁止）**。調査で埋まらなかった判断を推測で埋めてはいけない。`AskUserQuestion` で聞き、回答を得てから次へ進む。worktree に投げた後だと、ユーザーが食い違いに気づくのは実装が終わってからになる。
 

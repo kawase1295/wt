@@ -75,12 +75,13 @@ peer レジストリに載らないセッション（古い Claude Code で起�
 
 ## slash command skill
 
-wt repo は 6 つのコマンド skill を同梱し、install.sh が `~/.claude/skills/` に配置する。
+wt repo は 7 つのコマンド skill を同梱し、install.sh が `~/.claude/skills/` に配置する。
 
 | skill | 実行する側 | 役割 |
 | --- | --- | --- |
 | `/wt <作業内容>` | dev (本体) | worktree 名を生成し、初期プロンプト付きで worktree + Claude を起動 |
 | `/wt-detail <作業内容>` | dev (本体) | コード調査 → 不明点をユーザーに確認 → 実装プランを初期プロンプトとして worktree に渡す |
+| `/wt-split <親issue>` | dev (本体) | 親 issue を子 issue に分解して起票し、独立な子ごとに worktree + Claude を並列起動（依存の子は再実行で追加起動） |
 | `/wt-ask <内容>` | 両方 | `wt peers` で宛先を解決し、相手セッションに質問・報告を送る |
 | `/wt-review` | worktree | 変更の diff からレビュー用 HTML を生成してブラウザで開き、マージ承認を待つ |
 | `/wt-merge` | worktree | 自分のブランチを本体の現在ブランチへマージ（レビュー指示があれば承認後） |

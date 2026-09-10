@@ -22,7 +22,7 @@ git worktree と [herdr](https://herdr.dev) workspace を一体で管理し、�
 - **マージ前チェック** — repo 側の `scripts/check` をマージ前に worktree で実行し、失敗したら取り込まない。CI と同一のエントリポイントを共有する契約
 - **レビューページから承認** — `/wt-review` がページを `127.0.0.1` の使い捨て HTTP サーバで配信するので、「承認してマージ」ボタンの押下がそのまま worktree セッションへの**ユーザー入力**として届く。ターミナルに戻る必要がない。herdr や python3 が無ければ `file://` 表示（ボタン無し）に落ちる
 - **GitHub issue / PR 連携（skill）** — `/wt` が issue を起票して worktree 名と初期プロンプトに紐付け、`/wt-merge` が `Fixes #N` 付きの PR を作成し、`/wt-review` の承認を通っていれば CI の完了を待ってマージまで実行する。タスク = issue = ブランチ = PR が 1:1 で対応する。remote の無い repo では従来のローカルマージ
-- **本体 checkout のガード（hook）** — 本体 checkout でブランチを切って直接作業しようとすると `PreToolUse` hook が確認を出す。worktree を経由しない作業を、skill の文章ではなく Bash の実行前検査で止める（plugin 経由のみ）
+- **本体 checkout のガード（hook）** — 本体 checkout でブランチを切って直接作業しようとすると `PreToolUse` hook が理由付きで deny し、worktree 経由（`wt open` / `wt new`）へ誘導する。worktree を経由しない作業を、skill の文章ではなく Bash の実行前検査で止める（plugin 経由のみ）
 - **graceful fallback** — herdr サーバに接続できなければ `git worktree` の作成だけで続行する
 
 ## 前提
@@ -271,13 +271,13 @@ worktree 側: (実装・コミット) → /wt-review → (ユーザーがレビ�
 
 wt の運用は「タスク = issue = ブランチ = PR」を worktree に 1:1 で対応させる。本体 checkout でブランチを切って直接作業してしまうと、この対応も `/wt-review` のレビューゲートも通らない。skill の文章は skill が起動して初めて読まれるので、起動しない経路（「issue を確認して」からそのまま実装に流れる等）には効かない。
 
-そこで plugin は `PreToolUse` hook（[`hooks/main-checkout-guard.sh`](hooks/main-checkout-guard.sh)）を同梱し、Bash の実行前に検査する。**本体 checkout での**ブランチ切替を見つけたら `ask` を返し、`/wt` を使う選択肢を添えてユーザーに確認を出す。切替とみなすのは次のもの。
+そこで plugin は `PreToolUse` hook（[`hooks/main-checkout-guard.sh`](hooks/main-checkout-guard.sh)）を同梱し、Bash の実行前に検査する。**本体 checkout での**ブランチ切替を見つけたら理由付きの `deny` を返す。理由は Claude にそのまま渡り、場面別の代替手段（`worktree-*` ブランチ → `wt open <task>`、新規ブランチ作成 → `wt new <task>`、`gh pr checkout` → `gh pr view` / `gh pr diff` か worktree 内で実行）を読んで自分で進路修正できる。切替とみなすのは次のもの。
 
 - `git checkout -b` / `git switch -c` / `--orphan` など、ブランチを作ってそこに移る操作
 - 既存ブランチへの `checkout`（ローカルに無くても remote に同名があれば git が追跡ブランチを作って切り替えるので、それも含む）
 - `gh pr checkout`。`git checkout` と同じように本体のブランチを動かす。PR を読む流れは worktree を経由しない作業に滑り込みやすいので、同じ扱いにしている
 
-`deny` ではなく `ask` にしている。本体のブランチを動かす正当な用途（dev / main の行き来、rebase、緊急のブランチ確認）を詰まらせないため。
+`ask` ではなく `deny` にしている。ask の確認でユーザーが No を選んでも Claude には理由のない拒否しか渡らず、そこでターンが止まる。deny の reason は Claude に自動で返るので、セッションを止めずに worktree 経由へ誘導できる。本体のブランチを動かす正当な用途（dev / main の行き来、rebase）は許可ブランチで素通しし、それ以外はユーザーの明示指示のもとで `WT_GUARD_DISABLE=1` を前置して通す（reason にもその旨を含める）。
 
 素通しする経路:
 

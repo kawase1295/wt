@@ -237,7 +237,7 @@ npm test
 
 ## Claude Code integration
 
-[`skills/`](skills/) ships 8 skills, installed into `~/.claude/skills/` by `install.sh` or supplied by the [plugin](#from-the-plugin-marketplace-claude-code) (where they are namespaced: `/wt:wt-review`). They let a session in the dev (main) checkout throw work at a worktree, and let the worktree session review, land and clean up on its own. The two sides can talk while the work is in flight.
+[`skills/`](skills/) ships 9 skills, installed into `~/.claude/skills/` by `install.sh` or supplied by the [plugin](#from-the-plugin-marketplace-claude-code) (where they are namespaced: `/wt:wt-review`). They let a session in the dev (main) checkout throw work at a worktree, and let the worktree session review, land and clean up on its own. The two sides can talk while the work is in flight.
 
 A skill is not always a lone `SKILL.md`. `/wt-review` bundles the review page's HTML template and its renderer under [`skills/wt-review/assets/`](skills/wt-review/assets/), which is why `install.sh` copies each skill directory whole.
 
@@ -245,6 +245,7 @@ A skill is not always a lone `SKILL.md`. `/wt-review` bundles the review page's 
 | --- | --- | --- |
 | `/wt <task description>` | dev | Derives a worktree name and launches the worktree + Claude Code with the description as the initial prompt. On GitHub repos it files an issue first (`/wt #123` reuses an existing one) and ties the number into the name and the prompt |
 | `/wt-detail <task description>` | dev | Explores the codebase, asks you about anything underspecified, builds an implementation plan, and passes it to the worktree as the initial prompt. On GitHub repos it files an issue once the plan is settled and records the full plan there |
+| `/wt-split <parent issue>` | dev | Breaks a multi-task parent issue into child issues and launches a worktree + Claude Code per independent child in parallel. Re-running it starts the children whose dependencies have since closed |
 | `/wt-review` | worktree | Fills the bundled page template from the diff with `assets/render.py`, serves it over `wt serve` (approve button) or `file://`, opens it in the browser, and waits for approval before merging |
 | `/wt-merge` | worktree | On GitHub repos: `scripts/check` → push → open a PR with `Fixes #N` → if the approval gate has passed, wait for CI, `gh pr merge --merge`, and delete the remote branch (without it, stops at the PR). Without a remote: merges its own branch into the main checkout's current branch (reports conflicts and stops) |
 | `/wt-clean` | worktree | Verifies nothing is uncommitted and the work has landed (PR merged, or merged into the main checkout), then removes its own worktree and closes the workspace |

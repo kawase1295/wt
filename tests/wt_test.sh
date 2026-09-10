@@ -489,13 +489,13 @@ H22="$TMP/home22"
 mkdir -p "$H22"
 env HOME="$H22" PREFIX="$TMP/bin22" PATH="$SAFE_PATH" bash "$INSTALL" >/dev/null 2>&1
 ok22=1
-for s in worktree-parallel wt wt-detail wt-review wt-merge wt-clean wt-ask local-artifact; do
+for s in worktree-parallel wt wt-detail wt-split wt-review wt-merge wt-clean wt-ask local-artifact; do
   [ -f "$H22/.claude/skills/$s/SKILL.md" ] || ok22=0
 done
 if [ "$ok22" -eq 1 ]; then
-  pass "install: skills 8 個を ~/.claude/skills に配置する"
+  pass "install: skills 9 個を ~/.claude/skills に配置する"
 else
-  fail "install: skills 8 個を ~/.claude/skills に配置する"
+  fail "install: skills 9 個を ~/.claude/skills に配置する"
 fi
 # SKILL.md 以外の同梱物も配置される (wt-review はテンプレートと render.py が無いと動かない)。
 assert_file "$H22/.claude/skills/wt-review/assets/render.py" \

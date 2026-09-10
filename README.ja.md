@@ -233,7 +233,7 @@ npm test
 
 ## Claude Code 連携
 
-[`skills/`](skills/) に 8 つの skill を同梱しており、`install.sh` が `~/.claude/skills/` に配置する（[plugin](#plugin-マーケットプレイス経由claude-code) 経由なら plugin 側が供給し、名前は `/wt:wt-review` のようにプレフィックスが付く）。dev（本体 checkout）側のセッションから作業を worktree に投げ、worktree 側のセッションでレビュー・取り込み・片付けを完結させる。作業中は両者が直接会話できる。
+[`skills/`](skills/) に 9 つの skill を同梱しており、`install.sh` が `~/.claude/skills/` に配置する（[plugin](#plugin-マーケットプレイス経由claude-code) 経由なら plugin 側が供給し、名前は `/wt:wt-review` のようにプレフィックスが付く）。dev（本体 checkout）側のセッションから作業を worktree に投げ、worktree 側のセッションでレビュー・取り込み・片付けを完結させる。作業中は両者が直接会話できる。
 
 skill は `SKILL.md` 1 枚に限らない。`/wt-review` はレビューページの HTML テンプレートと生成スクリプトを [`skills/wt-review/assets/`](skills/wt-review/assets/) に同梱している。`install.sh` が skill ディレクトリごとコピーするのはこのため。
 
@@ -241,6 +241,7 @@ skill は `SKILL.md` 1 枚に限らない。`/wt-review` はレビューペー�
 | --- | --- | --- |
 | `/wt <作業内容>` | dev | worktree 名を生成し、作業内容を初期プロンプトとして worktree + Claude Code を起動。GitHub リポジトリでは先に issue を起票（`/wt #123` で既存 issue も可）し、番号を名前とプロンプトに紐付ける |
 | `/wt-detail <作業内容>` | dev | コードベースを調査し、仕様の不明点をユーザーに確認してから実装プランを作り、初期プロンプトとして worktree に渡す。GitHub リポジトリではプラン確定後に issue を起票し、プラン全文を issue に残す |
+| `/wt-split <親issue>` | dev | 複数タスクを含む親 issue を子 issue に分解して起票し、独立な子ごとに worktree + Claude Code を並列起動。依存のある子は先行の子が閉じたあと再実行で追加起動する |
 | `/wt-review` | worktree | 同梱テンプレートに diff を `assets/render.py` で差し込んでレビュー用 HTML を作り、`wt serve`（承認ボタン付き）か `file://` で配信してブラウザで開き、承認を待つ |
 | `/wt-merge` | worktree | GitHub リポジトリでは `scripts/check` → push → `Fixes #N` 付きの PR を作成 → 承認ゲートを通っていれば CI の完了を待って `gh pr merge --merge` → remote ブランチを削除（未通過なら PR 作成で停止）。remote が無ければ本体の現在ブランチへローカルマージ（コンフリクトは報告して停止） |
 | `/wt-clean` | worktree | 未コミットと取り込み状態（PR の MERGED / 本体への未マージ）を検査し、クリーンなら自分の worktree を片付けて workspace を閉じる |

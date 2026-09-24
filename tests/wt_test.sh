@@ -354,7 +354,7 @@ set -euo pipefail
 cmd="${1:-} ${2:-}"
 case "$cmd" in
   "--version"*)
-    printf 'herdr %s\n' "${HERDR_STUB_VERSION:-0.8.0}"
+    printf 'herdr %s\n' "${HERDR_STUB_VERSION:-0.9.1}"
     exit 0
     ;;
   "workspace list") exit 0 ;;
@@ -788,10 +788,11 @@ fi
 # --- test 30: herdr バージョン契約 (系列外は fail-fast、スキップ可、不明は通す) ---
 # herdr は 0.x の間マイナー更新で CLI 契約が変わる実績があるため、wt は検証済み
 # 系列 (HERDR_SERIES) 以外の herdr では黙って壊れる代わりに die する。
+# 0.10 は 0.9 系ではない (前方一致で誤って通さない)。
 if [ -x /usr/bin/jq ] && [ -x "$TMP/bin/herdr" ]; then
   R30="$TMP/repo30"
   new_repo "$R30"
-  out="$(cd "$R30" && env -u WT_HOME HOME="$TMP/home" HERDR_STUB_VERSION=0.9.0 \
+  out="$(cd "$R30" && env -u WT_HOME HOME="$TMP/home" HERDR_STUB_VERSION=0.10.0 \
     PATH="$TMP/bin:$SAFE_PATH" "$WT" new v30 --no-claude 2>&1)"
   rc=$?
   if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q '未検証'; then
@@ -806,7 +807,7 @@ if [ -x /usr/bin/jq ] && [ -x "$TMP/bin/herdr" ]; then
     pass "herdr契約: die 時はブランチも作らない"
   fi
 
-  out="$(cd "$R30" && env -u WT_HOME HOME="$TMP/home" HERDR_STUB_VERSION=0.9.0 WT_HERDR_SKIP_CHECK=1 \
+  out="$(cd "$R30" && env -u WT_HOME HOME="$TMP/home" HERDR_STUB_VERSION=0.8.0 WT_HERDR_SKIP_CHECK=1 \
     PATH="$TMP/bin:$SAFE_PATH" "$WT" new v30b --no-claude 2>&1)"
   rc=$?
   if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '警告.*未検証'; then
@@ -1167,7 +1168,7 @@ if command -v python3 >/dev/null 2>&1; then
 #!/usr/bin/env bash
 set -euo pipefail
 case "${1:-} ${2:-}" in
-  "--version"*) printf 'herdr 0.8.0\n' ;;
+  "--version"*) printf 'herdr 0.9.1\n' ;;
   "workspace list") exit 0 ;;
   "agent prompt")
     shift 2

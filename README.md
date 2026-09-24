@@ -31,7 +31,7 @@
 | --- | --- | --- |
 | bash 4+ | yes | the CLI itself |
 | git | yes | worktree operations |
-| [herdr](https://herdr.dev) | optional | workspace / agent launch (without it, git worktree only). Verified against herdr 0.8 (socket API protocol 19), which the `worktree` and `agent start` calls target |
+| [herdr](https://herdr.dev) | optional | workspace / agent launch (without it, git worktree only). Verified against herdr 0.9 (socket API protocol 22), which the `worktree` and `agent start` calls target |
 | jq | when using herdr, and for `wt peers` | parsing herdr JSON output and the Claude Code session registry |
 | python3 | for `/wt-review` | `skills/wt-review/assets/render.py` builds the review page, `wt-review-serve.py` serves it and turns the approve button into a herdr prompt (standard library only) |
 | curl | for mermaid diagrams in a review page | fetching `mermaid.min.js` once into `~/.cache/wt/` |

@@ -31,7 +31,7 @@ git worktree と [herdr](https://herdr.dev) workspace を一体で管理し、�
 | --- | --- | --- |
 | bash 4+ | 必須 | 本体 |
 | git | 必須 | worktree 操作 |
-| [herdr](https://herdr.dev) | 任意 | workspace / エージェント起動（無ければ git worktree のみ）。socket API の `worktree` / `agent start` を使うため herdr 0.8（socket API protocol 19）で検証している |
+| [herdr](https://herdr.dev) | 任意 | workspace / エージェント起動（無ければ git worktree のみ）。socket API の `worktree` / `agent start` を使うため herdr 0.9（socket API protocol 22）で検証している |
 | jq | herdr 使用時と `wt peers` で必須 | herdr の JSON 出力とセッションレジストリのパース |
 | python3 | `/wt-review` で必須 | `skills/wt-review/assets/render.py` がレビューページを組み立て、`wt-review-serve.py` が配信して承認ボタンを herdr へのプロンプト投入に変換する（標準ライブラリのみ） |
 | curl | レビューページで mermaid を使うとき | `mermaid.min.js` を一度だけ `~/.cache/wt/` に取得する |

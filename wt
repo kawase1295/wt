@@ -101,10 +101,11 @@ warn_untracked_wt_dir() {
 }
 
 # wt が検証済みの herdr CLI 系列。herdr は 0.x の間、マイナー更新で CLI 契約が
-# 変わる (0.7→0.8 で worktree create / agent start が非互換になった実績)。
+# 変わる (0.7→0.8 で worktree create / agent start が非互換になった実績。0.8→0.9 は
+# wt が使う範囲では互換だった)。
 # 系列外の herdr では途中で黙って壊れる代わりに herdr_ok で fail-fast する。
 # herdr に追随したら tests/wt_test.sh の stub と一緒にこの値を上げる。
-HERDR_SERIES="0.8"
+HERDR_SERIES="0.9"
 
 # herdr のバージョンが検証済み系列か確かめる。バージョンを報告しない herdr は
 # 判定しない (stub や旧版を殺さない)。WT_HERDR_SKIP_CHECK=1 で警告に緩和する

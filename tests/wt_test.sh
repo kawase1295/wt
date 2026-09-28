@@ -721,13 +721,13 @@ H22="$TMP/home22"
 mkdir -p "$H22"
 env HOME="$H22" PREFIX="$TMP/bin22" PATH="$SAFE_PATH" bash "$INSTALL" >/dev/null 2>&1
 ok22=1
-for s in worktree-parallel wt wt-detail wt-split wt-review wt-auto-review wt-merge wt-clean wt-ask wt-loop local-artifact; do
+for s in worktree-parallel wt wt-detail wt-split wt-review wt-auto-review wt-merge wt-clean wt-ask wt-loop wt-pm local-artifact; do
   [ -f "$H22/.claude/skills/$s/SKILL.md" ] || ok22=0
 done
 if [ "$ok22" -eq 1 ]; then
-  pass "install: skills 11 個を ~/.claude/skills に配置する"
+  pass "install: skills 12 個を ~/.claude/skills に配置する"
 else
-  fail "install: skills 11 個を ~/.claude/skills に配置する"
+  fail "install: skills 12 個を ~/.claude/skills に配置する"
 fi
 # wt loop の driver は wt が自分の隣を探すので、wt と一緒に配置する。
 if [ -x "$TMP/bin22/wt-loop" ]; then
@@ -1119,6 +1119,33 @@ for d in "$REPO_ROOT/skills"/*/; do
   [ "$fm" = "$n" ] || skill_name_mismatch="$skill_name_mismatch $n(=$fm)"
 done
 assert_eq "plugin: 全 skill の frontmatter name がディレクトリ名と一致" "" "$skill_name_mismatch"
+
+# /wt-pm はメインのオーケストレーション契約。トリガー・監視の対象イベント・禁止事項が
+# 抜けると別の skill と振る舞いが混ざるので、契約の要の語を固定する。
+PM="$REPO_ROOT/skills/wt-pm/SKILL.md"
+pm_missing=""
+if [ -f "$PM" ]; then
+  pm_desc="$(sed -n '/^description:/p' "$PM")"
+  for t in '/wt-pm <作業内容>' '進めておいて' 'オーケストレートして' 'サブエージェントに任せて'; do
+    case "$pm_desc" in *"$t"*) ;; *) pm_missing="$pm_missing desc:$t" ;; esac
+  done
+  for t in 'AskUserQuestion' 'needs-human' 'wt loop doctor' 'wt loop <親N> --dry-run' 'run_in_background' \
+    'wt new' '/wt-ask' 'events.jsonl' 'tail -F' '"event":"(merged|needs_human|failed|stopped|run_finished)"' \
+    'round-K.worker.md' 'gh issue comment <N>' 'gh issue edit <N> --remove-label needs-human' \
+    'wt loop <N>' '--stop' 'ScheduleWakeup' '/wt-split' '/wt-detail'; do
+    grep -qF -- "$t" "$PM" || pm_missing="$pm_missing $t"
+  done
+else
+  pm_missing="(SKILL.md が無い)"
+fi
+assert_eq "skill: /wt-pm は起票・投入・監視・仲介・報告の契約を持つ" "" "$pm_missing"
+
+# skill 表 (README ja / en と worktree-parallel) に /wt-pm が載っていること。
+pm_tables=""
+for f in README.md README.ja.md skills/worktree-parallel/SKILL.md; do
+  grep -q '^| `/wt-pm' "$REPO_ROOT/$f" || pm_tables="$pm_tables $f"
+done
+assert_eq "skill: /wt-pm を skill 表に載せる" "" "$pm_tables"
 
 # --- test 32: render.py がレビューページを組み立てる ---
 # /wt-review の生成資産。テンプレートのプレースホルダーが全部埋まること、

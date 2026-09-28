@@ -253,7 +253,7 @@ npm test
 
 ## Claude Code 連携
 
-[`skills/`](skills/) に 11 の skill を同梱しており、`install.sh` が `~/.claude/skills/` に配置する（[plugin](#plugin-マーケットプレイス経由claude-code) 経由なら plugin 側が供給し、名前は `/wt:wt-review` のようにプレフィックスが付く）。dev（本体 checkout）側のセッションから作業を worktree に投げ、worktree 側のセッションでレビュー・取り込み・片付けを完結させる。作業中は両者が直接会話できる。
+[`skills/`](skills/) に 12 の skill を同梱しており、`install.sh` が `~/.claude/skills/` に配置する（[plugin](#plugin-マーケットプレイス経由claude-code) 経由なら plugin 側が供給し、名前は `/wt:wt-review` のようにプレフィックスが付く）。dev（本体 checkout）側のセッションから作業を worktree に投げ、worktree 側のセッションでレビュー・取り込み・片付けを完結させる。作業中は両者が直接会話できる。
 
 skill は `SKILL.md` 1 枚に限らない。`/wt-review` はレビューページの HTML テンプレートと生成スクリプトを [`skills/wt-review/assets/`](skills/wt-review/assets/) に同梱している。`install.sh` が skill ディレクトリごとコピーするのはこのため。
 
@@ -268,6 +268,7 @@ skill は `SKILL.md` 1 枚に限らない。`/wt-review` はレビューペー�
 | `/wt-clean` | worktree | 未コミットと取り込み状態（PR の MERGED / 本体への未マージ）を検査し、クリーンなら自分の worktree を片付けて workspace を閉じる |
 | `/wt-ask <内容>` | 両方 | `wt peers` で相手セッションの宛先を解決し、質問・報告を送って返答を受ける |
 | `/wt-loop` | dev | ラベル付き issue を `wt loop` で人間の操作なしにマージまで回す。起動（`--dry-run` で対象を見せてから background 起動）・監視・停止（[無人ループ](#無人ループwt-loop)） |
+| `/wt-pm <作業内容>` | dev | メインを実装しないオーケストレータにする。親 / 子の issue をユーザー確認のうえ起票し、`wt loop` に投入、`events.jsonl` を監視し、`needs-human` の問いをユーザーに仲介してマージを報告する（[無人ループ](#無人ループwt-loop)） |
 | `worktree-parallel` | 両方 | `wt` と native worktree の使い分け方針・`.worktreeinclude` の契約（[skills/worktree-parallel/SKILL.md](skills/worktree-parallel/SKILL.md)） |
 | `local-artifact` | 両方 | Artifact と同一の設計規約で HTML を作り、claude.ai に publish せずローカル公開する契約。`/wt-review` はもうロードしない（skeleton・テーマトグル・mermaid をテンプレートが内包しているため） |
 
@@ -323,6 +324,20 @@ repo をループに乗せる前に `wt loop doctor` を実行する。本体 ch
 - 同じ repo で 2 本目の `wt loop` は起動できない（lock）
 
 state は `~/.cache/wt/loop/<repo>-<key>/<N>/`（`WT_LOOP_STATE` で変更）に残る: ラウンドごとの worker のプロンプトと出力、reviewer の JSON、`scripts/check` のログ、diff、session id、PR URL。進行は同じ場所の `loop.log` に追記される。`wt loop status` で issue ごとの状態（`running` / `merged` / `needs-human` / `stopped` / `failed`）と、`events.jsonl` の最新 5 件を一覧できる。
+
+**オーケストレーション（`/wt-pm`）。** loop は「何を回すか」を決めず、worker の問いにも自分では答えない。`/wt-pm` はユーザーと対話しているメインのセッション（dev 側）を loop の外側のオーケストレータにする。メインは起票・投入・監視・仲介・報告だけを行い、実装しない。
+
+```
+ユーザー ⇄ メイン（/wt-pm、dev 側。実装しない）
+  起票: 親 / 子に分解（/wt-split の原則。単一なら /wt-detail の要領で調査）
+        → ユーザーが確認 → gh issue create        ← needs-human 相当の項目は先に返す
+  投入: wt loop doctor → wt loop <親N> --dry-run → wt loop <親N>（background）
+        仕様判断が多い issue は wt new + /wt-ask の対話経路へ
+  監視: Monitor: tail -F <state>/events.jsonl | grep merged|needs_human|failed|stopped|run_finished
+  仲介: needs_human → <N>/round-K.worker.md を読む → ユーザーに 1 問
+        → gh issue comment <N> → needs-human ラベルを外す → wt loop <N>
+  報告: merged は PR URL + 所要・コスト / run_finished はサマリ / failed は claude・gh の確認を促す
+```
 
 前提: `gh`（認証済み）、`jq`、`claude`。「no checks reported」は、`.github/workflows` がある repo では check の登録待ちとみなして上限まで待ち、無い repo だけ一度待って再確認してから CI 無しと判断する（ローカルの `scripts/check` を根拠にマージ）。`scripts/check` も無い repo はゲート無しになるので、乗せる前に用意する（[マージ前チェック](#マージ前チェックrepo-の-scriptscheck)）。
 

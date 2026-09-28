@@ -260,7 +260,7 @@ npm test
 
 ## Claude Code integration
 
-[`skills/`](skills/) ships 11 skills, installed into `~/.claude/skills/` by `install.sh` or supplied by the [plugin](#from-the-plugin-marketplace-claude-code) (where they are namespaced: `/wt:wt-review`). They let a session in the dev (main) checkout throw work at a worktree, and let the worktree session review, land and clean up on its own. The two sides can talk while the work is in flight.
+[`skills/`](skills/) ships 12 skills, installed into `~/.claude/skills/` by `install.sh` or supplied by the [plugin](#from-the-plugin-marketplace-claude-code) (where they are namespaced: `/wt:wt-review`). They let a session in the dev (main) checkout throw work at a worktree, and let the worktree session review, land and clean up on its own. The two sides can talk while the work is in flight.
 
 A skill is not always a lone `SKILL.md`. `/wt-review` bundles the review page's HTML template and its renderer under [`skills/wt-review/assets/`](skills/wt-review/assets/), which is why `install.sh` copies each skill directory whole.
 
@@ -275,6 +275,7 @@ A skill is not always a lone `SKILL.md`. `/wt-review` bundles the review page's 
 | `/wt-clean` | worktree | Verifies nothing is uncommitted and the work has landed (PR merged, or merged into the main checkout), then removes its own worktree and closes the workspace |
 | `/wt-ask <message>` | both | Resolves the other session's address via `wt peers`, sends a question or status report, and waits for the reply |
 | `/wt-loop` | dev | Runs labelled issues to merge unattended via `wt loop`: shows the targets with `--dry-run`, starts the driver in the background, watches it, stops it ([Unattended loop](#unattended-loop-wt-loop)) |
+| `/wt-pm <task>` | dev | Makes the main session an orchestrator that never implements: files parent / child issues after your confirmation, feeds them to `wt loop`, watches `events.jsonl`, relays `needs-human` questions to you and reports merges ([Unattended loop](#unattended-loop-wt-loop)) |
 | `worktree-parallel` | both | Policy for choosing between `wt` and native worktrees, plus the `.worktreeinclude` contract ([skills/worktree-parallel/SKILL.md](skills/worktree-parallel/SKILL.md)) |
 | `local-artifact` | both | Contract for building HTML with the same design rules as Artifacts but publishing locally instead of to claude.ai. `/wt-review` no longer loads it — its template already carries the skeleton, theme toggle and mermaid |
 
@@ -311,7 +312,7 @@ wt loop (dev side, bash)
 
 Claude only does two things, "implement" and "judge", each in its own headless (`claude -p`) session. The reviewer gets nothing but the diff, the issue body and the criteria (the author never grades its own work). Minor-only findings pass; blocker / major fail; when in doubt, fail.
 
-Whatever fails (uncommitted changes / merge conflict / `scripts/check` / review FAIL / CI) is fed back to the same worker session with `--resume` as the next round. Past the round limit (`--max-rounds`, default 3), when the worker opens its final report with `BLOCKED:` (needs production access, a human decision, a missing tool), when push or merge is refused, or when CI does not finish within `WT_LOOP_CI_TIMEOUT` (default 1800 s), the driver labels the issue `needs-human`, comments why (with the worktree and state paths) and moves on. The worktree stays: fix the cause, drop the label and run `wt loop <N>` with the number, and the driver reuses the worktree and the session to carry on. If the worker dies right after starting (under `WT_LOOP_INFRA_SECS`, default 60 s) that is treated as a usage limit or API outage rather than a failed task: the issue is marked `failed` and the whole loop stops instead of parking the entire queue as `needs-human`.
+Whatever fails (uncommitted changes / merge conflict / `scripts/check` / review FAIL / CI) is fed back to the same worker session with `--resume` as the next round. Past the round limit (`--max-rounds`, default 3), when the worker opens its final report with `BLOCKED:` (needs production access, a human decision, a missing tool), when push or merge is refused, or when CI does not finish within `WT_LOOP_CI_TIMEOUT` (default 1800 s), the driver labels the issue `needs-human`, comments why (with the worktree and state paths) and moves on. The worktree stays: fix the cause, drop the label and run `wt loop <N>` with the number, and the driver reuses the worktree and the session to carry on. To answer the worker, just comment on the issue: on resume the driver passes comments posted after the escalation, plus the issue body if you edited it, to the worker as a handoff (its own comments and ones already handed over are left out). If the worker dies right after starting (under `WT_LOOP_INFRA_SECS`, default 60 s) that is treated as a usage limit or API outage rather than a failed task: the issue is marked `failed` and the whole loop stops instead of parking the entire queue as `needs-human`.
 
 **Permission settings are left alone.** The worker runs with `--permission-mode acceptEdits` plus an allowlist (git, test runners, package managers, read-only shell commands; `bash` / `sh` and `gh` are deliberately absent; extend with `WT_LOOP_EXTRA_TOOLS`, replace with `WT_LOOP_ALLOWED_TOOLS`). Headless `--permission-mode auto` refuses writes, so it is not used.
 
@@ -329,9 +330,54 @@ Target selection:
 - one issue at a time. After a pass that merged something the driver re-selects, so children unblocked by that merge are picked up in the same run. This also applies when issues are named on the command line: `wt loop <parent>` re-selects from the same numbers and runs every child in dependency order (issues merged in this run and CLOSED ones are excluded, so naming standalone issues just ends after one pass). `--max-issues` caps the run; `wt loop --stop` ends it at the next boundary (right after a claude call, before push, between issues)
 - a second `wt loop` on the same repo refuses to start (lock)
 
-State lives in `~/.cache/wt/loop/<repo>-<key>/<N>/` (`WT_LOOP_STATE` to relocate): per-round worker prompt and output, reviewer JSON, `scripts/check` log, diff, session id, PR URL. Progress is appended to `loop.log` next to them. `wt loop status` lists each issue's state (`running` / `merged` / `needs-human` / `stopped` / `failed`).
+State lives in `~/.cache/wt/loop/<repo>-<key>/<N>/` (`WT_LOOP_STATE` to relocate): per-round worker prompt and output, reviewer JSON, `scripts/check` log, diff, session id, PR URL. Progress is appended to `loop.log` next to them. `wt loop status` lists each issue's state (`running` / `merged` / `needs-human` / `stopped` / `failed`) and the latest 5 entries of `events.jsonl`.
+
+**Orchestration (`/wt-pm`).** The loop does not decide what to run or answer its own questions. `/wt-pm` turns the main session (the one you talk to, in the dev checkout) into the orchestrator around it: it files the issues, feeds them to the loop, watches, relays `needs-human` questions and reports. It never implements.
+
+```
+you ⇄ main session (/wt-pm, dev side; never implements)
+  file:    split into parent / children (/wt-split rules; single task → /wt-detail)
+           → confirm with you → gh issue create        ← "needs-human" items handed back first
+  feed:    wt loop doctor → wt loop <parent> --dry-run → wt loop <parent> (background)
+           issues needing many spec calls → wt new + /wt-ask instead
+  watch:   Monitor: tail -F <state>/events.jsonl | grep merged|needs_human|failed|stopped|run_finished
+  relay:   needs_human → read <N>/round-K.worker.md → ask you one question
+           → gh issue comment <N> → drop the needs-human label → wt loop <N>
+  report:  merged: PR URL + time/cost · run_finished: summary · failed: check claude / gh
+```
 
 Requires `gh` (authenticated), `jq` and `claude`. "no checks reported" is treated as "checks not registered yet" in a repo that has `.github/workflows` (the driver keeps waiting up to the CI timeout); only a repo without workflows is merged on the strength of the local `scripts/check` after one re-check. A repo with no `scripts/check` has no gate at all, so add one before putting it on the loop ([Pre-merge check](#pre-merge-check-scriptscheck)).
+
+#### Events (events.jsonl) and notifications (WT_LOOP_NOTIFY)
+
+To let another session or script watch the loop without regex-scraping `loop.log`, the driver appends one JSON object per line to `~/.cache/wt/loop/<repo>-<key>/events.jsonl`.
+
+```json
+{"at":"2026-09-28T01:23:45Z","event":"merged","repo":"owner/repo","issue":10,"round":1,"stage":null,"reason":null,"pr":"https://github.com/owner/repo/pull/12","message":"#10 Add greeting をマージした (https://github.com/owner/repo/pull/12)","state":"/home/me/.cache/wt/loop/repo-123"}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `at` | ISO 8601 in UTC (`YYYY-MM-DDThh:mm:ssZ`) |
+| `event` | `run_started` / `issue_started` / `round` / `stage` / `merged` / `needs_human` / `failed` / `stopped` / `run_finished` |
+| `repo` | `owner/repo` |
+| `issue` | issue number; `null` for run-wide events (`run_started` / `run_finished`, a `stopped` between issues) |
+| `round` | round number (`null` before the first round) |
+| `stage` | `stage` events only: `worker` / `check` / `reviewer` / `pr` / `ci` / `merge` |
+| `reason` | one-line reason for `needs_human` / `failed` / `stopped` |
+| `pr` | PR URL, once created |
+| `message` | one-line human-readable summary (Japanese) |
+| `state` | path of the state directory |
+
+Missing values are `null`; every line carries every key. `run_finished` is emitted even when the driver dies abnormally.
+
+Set `WT_LOOP_NOTIFY` to a command and it runs on `merged` / `needs_human` / `failed` / `run_finished`, with the event JSON on stdin (interpreted by `sh -c`, so arguments are fine). It runs in the background with a 10-second limit; a failure only adds one line to `loop.log` and never stops the loop. The command's output goes to `notify.log` in the state directory. An existing notifier that reads `{"message": ...}` works as is.
+
+```bash
+WT_LOOP_NOTIFY="$HOME/.claude/hooks/notify.sh" wt loop
+# follow the events
+tail -f ~/.cache/wt/loop/<repo>-<key>/events.jsonl | jq -r .message
+```
 
 ### Guarding the main checkout (hook)
 

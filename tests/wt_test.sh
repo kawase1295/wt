@@ -238,6 +238,54 @@ else
   fail "prompt: 本文途中の / # は先頭文字チェックに掛からない (rc=$rc out=$out)"
 fi
 
+# --- test 14c: Claude を起動する task は herdr の agent 名規則を worktree 作成前に検証する ---
+# agent 名 claude-<task> は herdr の規則 (小文字始まり、[a-z0-9_-]、1〜32 字) に従う。
+# 違反は worktree / workspace を作った後の agent start で初めて失敗し、空の worktree が
+# 残って再実行も「同名ブランチあり」で止まるため、副作用の前に弾く。
+assert_task_err() { # desc pattern task [args...]
+  local desc="$1" pattern="$2" out rc
+  shift 2
+  out="$(wt_local "$R14" new "$@" 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF -- "$pattern"; then
+    pass "task: $desc"
+  else
+    fail "task: $desc (rc=$rc out=$out)"
+  fi
+  if [ -d "$R14/.claude/worktrees/$1" ] || has_branch "$R14" "worktree-$1"; then
+    fail "task: $desc で worktree/ブランチを作らない"
+  else
+    pass "task: $desc で worktree/ブランチを作らない"
+  fi
+}
+T26="10-validate-connectivity-d" # 26 字 (claude- を足すと 33 字)
+assert_task_err "26 字の task は agent 名の上限を理由に弾く" '25 字' "$T26"
+assert_task_err "上限超過の案内に agent 名を示す" "claude-$T26" "$T26" --prompt "hi"
+assert_task_err "大文字を含む task は agent 名の文字種を理由に弾く" '小文字' Fix-login
+assert_task_err ". を含む task は agent 名の文字種を理由に弾く" '小文字' fix.login
+# 境界: 25 字は agent 名の検証を通り、次の段階 (herdr チェック) まで進む
+T25="10-validate-connectivity-"
+out="$(wt_local "$R14" new "$T25" --prompt "hi" 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'herdr サーバなし' &&
+  ! printf '%s' "$out" | grep -q '25 字'; then
+  pass "task: 25 字の task は agent 名の検証を通る"
+else
+  fail "task: 25 字の task は agent 名の検証を通る (rc=$rc out=$out)"
+fi
+# --no-claude は agent を起動しないので、従来の task 名規則のまま許可する
+wt_local "$R14" new "$T26" --no-claude >/dev/null 2>&1
+assert_dir "$R14/.claude/worktrees/$T26" "task: --no-claude なら 26 字の task も作れる"
+# worktree 名を生成する skill の規約が wt new の上限 (25 字) と食い違わないこと
+SKILLS14="$(cd "$(dirname "$WT")/skills" && pwd)"
+for s in wt wt-detail; do
+  if grep -q '25 字以内' "$SKILLS14/$s/SKILL.md" && ! grep -q '30 字以内' "$SKILLS14/$s/SKILL.md"; then
+    pass "task: /$s の worktree 名の規約は 25 字以内"
+  else
+    fail "task: /$s の worktree 名の規約は 25 字以内"
+  fi
+done
+
 # --- test 15: herdr 不可で --prompt はプロンプトを取りこぼさないよう die する ---
 out="$(wt_local "$R14" new p15 --prompt "hello" 2>&1)"
 rc=$?
@@ -603,6 +651,14 @@ STUB
   assert_start_fail "stub: invalid_agent_argument は WT_CLAUDE_ARGS を指す" \
     "$rc" "$out" 'invalid_agent_argument' 'WT_CLAUDE_ARGS' 'wt rm p21i' '!trust'
 
+  # invalid_agent_name: 事前検証をすり抜けた (herdr 側の規則が変わった等) ときも、
+  # 原因が agent 名であることと herdr の本文を示し、herdr update に誘導しない
+  out="$(start_fail_out p21q invalid_agent_name --prompt "hi")"
+  rc=$?
+  assert_start_fail "stub: invalid_agent_name は agent 名の規則違反と herdr の本文を示す" \
+    "$rc" "$out" 'invalid_agent_name' 'agent 名 claude-p21q' 'stub failure for claude-p21q' \
+    'wt rm p21q' '!herdr update' '!trust'
+
   # 整形された (複数行の) JSON でも error.code を取れる
   out="$(HERDR_STUB_START_PRETTY=1 start_fail_out p21m agent_not_ready --prompt "hi")"
   rc=$?
@@ -665,13 +721,13 @@ H22="$TMP/home22"
 mkdir -p "$H22"
 env HOME="$H22" PREFIX="$TMP/bin22" PATH="$SAFE_PATH" bash "$INSTALL" >/dev/null 2>&1
 ok22=1
-for s in worktree-parallel wt wt-detail wt-split wt-review wt-auto-review wt-merge wt-clean wt-ask wt-loop local-artifact; do
+for s in worktree-parallel wt wt-detail wt-split wt-review wt-auto-review wt-merge wt-clean wt-ask wt-loop wt-pm local-artifact; do
   [ -f "$H22/.claude/skills/$s/SKILL.md" ] || ok22=0
 done
 if [ "$ok22" -eq 1 ]; then
-  pass "install: skills 11 個を ~/.claude/skills に配置する"
+  pass "install: skills 12 個を ~/.claude/skills に配置する"
 else
-  fail "install: skills 11 個を ~/.claude/skills に配置する"
+  fail "install: skills 12 個を ~/.claude/skills に配置する"
 fi
 # wt loop の driver は wt が自分の隣を探すので、wt と一緒に配置する。
 if [ -x "$TMP/bin22/wt-loop" ]; then
@@ -1063,6 +1119,33 @@ for d in "$REPO_ROOT/skills"/*/; do
   [ "$fm" = "$n" ] || skill_name_mismatch="$skill_name_mismatch $n(=$fm)"
 done
 assert_eq "plugin: 全 skill の frontmatter name がディレクトリ名と一致" "" "$skill_name_mismatch"
+
+# /wt-pm はメインのオーケストレーション契約。トリガー・監視の対象イベント・禁止事項が
+# 抜けると別の skill と振る舞いが混ざるので、契約の要の語を固定する。
+PM="$REPO_ROOT/skills/wt-pm/SKILL.md"
+pm_missing=""
+if [ -f "$PM" ]; then
+  pm_desc="$(sed -n '/^description:/p' "$PM")"
+  for t in '/wt-pm <作業内容>' '進めておいて' 'オーケストレートして' 'サブエージェントに任せて'; do
+    case "$pm_desc" in *"$t"*) ;; *) pm_missing="$pm_missing desc:$t" ;; esac
+  done
+  for t in 'AskUserQuestion' 'needs-human' 'wt loop doctor' 'wt loop <親N> --dry-run' 'run_in_background' \
+    'wt new' '/wt-ask' 'events.jsonl' 'tail -F' '"event":"(merged|needs_human|failed|stopped|run_finished)"' \
+    'round-K.worker.md' 'gh issue comment <N>' 'gh issue edit <N> --remove-label needs-human' \
+    'wt loop <N>' '--stop' 'ScheduleWakeup' '/wt-split' '/wt-detail'; do
+    grep -qF -- "$t" "$PM" || pm_missing="$pm_missing $t"
+  done
+else
+  pm_missing="(SKILL.md が無い)"
+fi
+assert_eq "skill: /wt-pm は起票・投入・監視・仲介・報告の契約を持つ" "" "$pm_missing"
+
+# skill 表 (README ja / en と worktree-parallel) に /wt-pm が載っていること。
+pm_tables=""
+for f in README.md README.ja.md skills/worktree-parallel/SKILL.md; do
+  grep -q '^| `/wt-pm' "$REPO_ROOT/$f" || pm_tables="$pm_tables $f"
+done
+assert_eq "skill: /wt-pm を skill 表に載せる" "" "$pm_tables"
 
 # --- test 32: render.py がレビューページを組み立てる ---
 # /wt-review の生成資産。テンプレートのプレースホルダーが全部埋まること、

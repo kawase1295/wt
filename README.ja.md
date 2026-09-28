@@ -253,7 +253,7 @@ npm test
 
 ## Claude Code 連携
 
-[`skills/`](skills/) に 11 の skill を同梱しており、`install.sh` が `~/.claude/skills/` に配置する（[plugin](#plugin-マーケットプレイス経由claude-code) 経由なら plugin 側が供給し、名前は `/wt:wt-review` のようにプレフィックスが付く）。dev（本体 checkout）側のセッションから作業を worktree に投げ、worktree 側のセッションでレビュー・取り込み・片付けを完結させる。作業中は両者が直接会話できる。
+[`skills/`](skills/) に 12 の skill を同梱しており、`install.sh` が `~/.claude/skills/` に配置する（[plugin](#plugin-マーケットプレイス経由claude-code) 経由なら plugin 側が供給し、名前は `/wt:wt-review` のようにプレフィックスが付く）。dev（本体 checkout）側のセッションから作業を worktree に投げ、worktree 側のセッションでレビュー・取り込み・片付けを完結させる。作業中は両者が直接会話できる。
 
 skill は `SKILL.md` 1 枚に限らない。`/wt-review` はレビューページの HTML テンプレートと生成スクリプトを [`skills/wt-review/assets/`](skills/wt-review/assets/) に同梱している。`install.sh` が skill ディレクトリごとコピーするのはこのため。
 
@@ -268,6 +268,7 @@ skill は `SKILL.md` 1 枚に限らない。`/wt-review` はレビューペー�
 | `/wt-clean` | worktree | 未コミットと取り込み状態（PR の MERGED / 本体への未マージ）を検査し、クリーンなら自分の worktree を片付けて workspace を閉じる |
 | `/wt-ask <内容>` | 両方 | `wt peers` で相手セッションの宛先を解決し、質問・報告を送って返答を受ける |
 | `/wt-loop` | dev | ラベル付き issue を `wt loop` で人間の操作なしにマージまで回す。起動（`--dry-run` で対象を見せてから background 起動）・監視・停止（[無人ループ](#無人ループwt-loop)） |
+| `/wt-pm <作業内容>` | dev | メインを実装しないオーケストレータにする。親 / 子の issue をユーザー確認のうえ起票し、`wt loop` に投入、`events.jsonl` を監視し、`needs-human` の問いをユーザーに仲介してマージを報告する（[無人ループ](#無人ループwt-loop)） |
 | `worktree-parallel` | 両方 | `wt` と native worktree の使い分け方針・`.worktreeinclude` の契約（[skills/worktree-parallel/SKILL.md](skills/worktree-parallel/SKILL.md)） |
 | `local-artifact` | 両方 | Artifact と同一の設計規約で HTML を作り、claude.ai に publish せずローカル公開する契約。`/wt-review` はもうロードしない（skeleton・テーマトグル・mermaid をテンプレートが内包しているため） |
 
@@ -304,7 +305,7 @@ wt loop（dev 側、bash）
 
 Claude が担うのは「実装」と「レビュー判定」だけで、どちらも headless（`claude -p`）の別セッション。reviewer には diff と issue 本文と合否基準しか渡さない（書いた本人に合否を判定させない）。minor のみ PASS、blocker / major は FAIL、迷ったら FAIL。
 
-落ちた工程（未コミット / コンフリクト / `scripts/check` / レビュー FAIL / CI）は、その内容を同じ worker セッションに `--resume` で渡して次のラウンドにする。ラウンド上限（`--max-rounds`、既定 3）を超える、worker が最終報告を `BLOCKED:` で始める（本番環境が要る・人間の判断が要る等）、push / merge が拒否される、CI 待ちが上限（`WT_LOOP_CI_TIMEOUT`、既定 1800 秒）に達する、のどれかで issue に `needs-human` ラベルとコメント（理由・worktree・state の場所）を付けて次の issue へ進む。worktree は残るので、原因を直してラベルを外し、`wt loop <N>` と番号で指定すれば、残った worktree と session を再利用して続きから進む。worker が起動直後（`WT_LOOP_INFRA_SECS`、既定 60 秒未満）に異常終了したときは作業の失敗ではなく利用上限や API 障害とみなし、その issue を `failed` にして loop 全体を止める（キュー全体に `needs-human` を付けない）。
+落ちた工程（未コミット / コンフリクト / `scripts/check` / レビュー FAIL / CI）は、その内容を同じ worker セッションに `--resume` で渡して次のラウンドにする。ラウンド上限（`--max-rounds`、既定 3）を超える、worker が最終報告を `BLOCKED:` で始める（本番環境が要る・人間の判断が要る等）、push / merge が拒否される、CI 待ちが上限（`WT_LOOP_CI_TIMEOUT`、既定 1800 秒）に達する、のどれかで issue に `needs-human` ラベルとコメント（理由・worktree・state の場所）を付けて次の issue へ進む。worktree は残るので、原因を直してラベルを外し、`wt loop <N>` と番号で指定すれば、残った worktree と session を再利用して続きから進む。worker の問いには issue コメントで答えれば worker に届く（エスカレーション後に付いたコメントと、書き直した issue 本文を、driver が再開時のプロンプトに「前回からの引き継ぎ」として渡す。driver 自身のコメントと、前回の再開で渡したコメントは除く）。worker が起動直後（`WT_LOOP_INFRA_SECS`、既定 60 秒未満）に異常終了したときは作業の失敗ではなく利用上限や API 障害とみなし、その issue を `failed` にして loop 全体を止める（キュー全体に `needs-human` を付けない）。
 
 **権限設定は変えない。** worker は `--permission-mode acceptEdits` と allowlist（git / テスト / パッケージマネージャ / 読み取り系のシェルコマンド。任意コードを実行できる `bash` / `sh` と `gh` は入れない。`WT_LOOP_EXTRA_TOOLS` で追記、`WT_LOOP_ALLOWED_TOOLS` で差し替え）で動く。headless では `--permission-mode auto` が書き込みを拒否するため使わない。
 
@@ -322,9 +323,54 @@ repo をループに乗せる前に `wt loop doctor` を実行する。本体 ch
 - 直列で 1 issue ずつ。1 巡して何かマージできたら選び直し、依存が解けた子を同じ run で拾う。番号指定でも同じで、`wt loop <親>` は同じ番号から選び直して子を依存順にすべて回す（この run でマージ済みと CLOSED は除外されるので、単体の番号だけなら 1 巡で終わる）。`--max-issues` で件数を区切れる。`wt loop --stop` は次の区切り（claude 呼び出しの直後 / push の前 / issue の間）で止める
 - 同じ repo で 2 本目の `wt loop` は起動できない（lock）
 
-state は `~/.cache/wt/loop/<repo>-<key>/<N>/`（`WT_LOOP_STATE` で変更）に残る: ラウンドごとの worker のプロンプトと出力、reviewer の JSON、`scripts/check` のログ、diff、session id、PR URL。進行は同じ場所の `loop.log` に追記される。`wt loop status` で issue ごとの状態（`running` / `merged` / `needs-human` / `stopped` / `failed`）を一覧できる。
+state は `~/.cache/wt/loop/<repo>-<key>/<N>/`（`WT_LOOP_STATE` で変更）に残る: ラウンドごとの worker のプロンプトと出力、reviewer の JSON、`scripts/check` のログ、diff、session id、PR URL。進行は同じ場所の `loop.log` に追記される。`wt loop status` で issue ごとの状態（`running` / `merged` / `needs-human` / `stopped` / `failed`）と、`events.jsonl` の最新 5 件を一覧できる。
+
+**オーケストレーション（`/wt-pm`）。** loop は「何を回すか」を決めず、worker の問いにも自分では答えない。`/wt-pm` はユーザーと対話しているメインのセッション（dev 側）を loop の外側のオーケストレータにする。メインは起票・投入・監視・仲介・報告だけを行い、実装しない。
+
+```
+ユーザー ⇄ メイン（/wt-pm、dev 側。実装しない）
+  起票: 親 / 子に分解（/wt-split の原則。単一なら /wt-detail の要領で調査）
+        → ユーザーが確認 → gh issue create        ← needs-human 相当の項目は先に返す
+  投入: wt loop doctor → wt loop <親N> --dry-run → wt loop <親N>（background）
+        仕様判断が多い issue は wt new + /wt-ask の対話経路へ
+  監視: Monitor: tail -F <state>/events.jsonl | grep merged|needs_human|failed|stopped|run_finished
+  仲介: needs_human → <N>/round-K.worker.md を読む → ユーザーに 1 問
+        → gh issue comment <N> → needs-human ラベルを外す → wt loop <N>
+  報告: merged は PR URL + 所要・コスト / run_finished はサマリ / failed は claude・gh の確認を促す
+```
 
 前提: `gh`（認証済み）、`jq`、`claude`。「no checks reported」は、`.github/workflows` がある repo では check の登録待ちとみなして上限まで待ち、無い repo だけ一度待って再確認してから CI 無しと判断する（ローカルの `scripts/check` を根拠にマージ）。`scripts/check` も無い repo はゲート無しになるので、乗せる前に用意する（[マージ前チェック](#マージ前チェックrepo-の-scriptscheck)）。
+
+#### イベント（events.jsonl）と通知（WT_LOOP_NOTIFY）
+
+loop を別のセッションやスクリプトから監視するために、`~/.cache/wt/loop/<repo>-<key>/events.jsonl` に 1 イベント 1 行の JSON を追記する（`loop.log` を正規表現で追う必要はない）。
+
+```json
+{"at":"2026-09-28T01:23:45Z","event":"merged","repo":"owner/repo","issue":10,"round":1,"stage":null,"reason":null,"pr":"https://github.com/owner/repo/pull/12","message":"#10 Add greeting をマージした (https://github.com/owner/repo/pull/12)","state":"/home/me/.cache/wt/loop/repo-123"}
+```
+
+| フィールド | 内容 |
+| --- | --- |
+| `at` | UTC の ISO 8601（`YYYY-MM-DDThh:mm:ssZ`） |
+| `event` | `run_started` / `issue_started` / `round` / `stage` / `merged` / `needs_human` / `failed` / `stopped` / `run_finished` |
+| `repo` | `owner/repo` |
+| `issue` | issue 番号。run 全体のイベント（`run_started` / `run_finished`、issue の間での `stopped`）では `null` |
+| `round` | ラウンド番号（ラウンド開始前は `null`） |
+| `stage` | `stage` イベントのみ: `worker` / `check` / `reviewer` / `pr` / `ci` / `merge` |
+| `reason` | `needs_human` / `failed` / `stopped` の理由（1 行） |
+| `pr` | PR の URL（作成後） |
+| `message` | 人間向けの 1 行の要約（日本語） |
+| `state` | state ディレクトリのパス |
+
+値の無いフィールドは `null`（キーは常に全部そろう）。die などで異常終了したときも `run_finished` を出す。
+
+環境変数 `WT_LOOP_NOTIFY` にコマンドを設定すると、`merged` / `needs_human` / `failed` / `run_finished` のイベントで、その JSON を stdin に渡して実行する（`sh -c` で解釈するので引数も書ける）。background で走らせ、10 秒で打ち切る。失敗しても loop は止めず、`loop.log` に 1 行出すだけ。コマンドの出力は state の `notify.log` に残る。`{"message": ...}` を読む既存の通知スクリプトをそのまま指定できる。
+
+```bash
+WT_LOOP_NOTIFY="$HOME/.claude/hooks/notify.sh" wt loop
+# 最新のイベントを追う
+tail -f ~/.cache/wt/loop/<repo>-<key>/events.jsonl | jq -r .message
+```
 
 ### 本体 checkout のガード（hook）
 

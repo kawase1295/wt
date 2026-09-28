@@ -156,11 +156,13 @@ wt rm [<task>] [--force]
 
 wt loop [<issue>...] [--label <name>] [--max-issues <n>] [--max-rounds <n>] [--dry-run]
 wt loop --stop / wt loop status
+wt loop doctor [--label <name>] [--fix-labels]
     ラベル付き（既定 wt-loop）の open issue を、人間の操作なしに
     worktree 作成 → headless claude で実装 → scripts/check → 別セッションの AI レビュー
     → PR → CI → マージ → 片付け → 次の issue、と回す driver。落ちた工程は同じ worker に
     渡して再試行（上限 --max-rounds）、超えたら needs-human ラベルで切り出して次へ進む。
-    詳細は「無人ループ」の節
+    wt loop doctor は repo がループに乗せられる状態かを診断する（wt loop も起動前に
+    同じ検査を走らせ、NG なら始めない）。詳細は「無人ループ」の節
 ```
 
 ### 例
@@ -310,9 +312,11 @@ Claude が担うのは「実装」と「レビュー判定」だけで、どち�
 
 防いでいるのは「気を利かせて push してしまう」誤操作までで、`Bash(git *)` を許す以上、実 git を絶対パスで呼ぶ・環境を組み直す・`git -c alias.x='!…'` で任意のシェルを実行するといった意図的な回避は防げない。悪意のある worker を想定する場合は、この driver ではなくネットワークや認証の外側で塞ぐ必要がある。push / PR / merge は driver が自分の環境の git / gh で行う。
 
+repo をループに乗せる前に `wt loop doctor` を実行する。本体 checkout で次を検査し、項目ごとに `OK` / `NG` と直し方を 1 行で出す: `scripts/check` が実行可能 / `.github/workflows/ci.yml` がある / `.claude/worktrees/` が ignore 済み / `gh` が認証済みで default branch を取得できる / ラベル `wt-loop`（`--label` で変更）と `needs-human` がある / 本体が default branch 上でクリーン（追跡ファイルに未コミットの変更が無い）/ `claude` CLI がある。NG が 1 つでもあれば exit 1。`wt loop` は起動前に同じ検査を走らせ、NG なら始めない。`--dry-run` は診断を出したうえで対象の一覧まで見せる（NG があれば exit 1）。`wt loop doctor --fix-labels` は無いラベルだけを作る（他の項目は直さず、repo のファイルにも触らない）。
+
 対象の選び方:
 
-- 引数に番号を並べればそれ、無ければラベル `wt-loop`（`--label` で変更。無ければ作る）付きの open issue
+- 引数に番号を並べればそれ、無ければラベル `wt-loop`（`--label` で変更。無ければ `wt loop doctor --fix-labels` で作る）付きの open issue
 - `needs-human` ラベル付き、CLOSED、依存が未完了のものは飛ばす。ブランチ `worktree-<N>-*` が既にある issue は、ラベル選択では進行中として飛ばし、番号指定なら残っている worktree と session を再利用して再開する
 - 本文に `## 子タスク` のチェックリストを持つ親 issue は子に展開し、「（#M のあと）」の依存が CLOSED の子だけを対象にする（`/wt-split` の表記と同じ）。子を単体で指定・ラベル付けした場合も、本文の「親 issue: #P」から親を引いて同じ依存判定をする。親自体は閉じない
 - 直列で 1 issue ずつ。1 巡して何かマージできたら選び直し、依存が解けた子を同じ run で拾う。`--max-issues` で件数を区切れる。`wt loop --stop` は次の区切り（claude 呼び出しの直後 / push の前 / issue の間）で止める

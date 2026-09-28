@@ -21,6 +21,15 @@
 #   wt loop --stop      進行中の loop を次の区切り (claude 呼び出しの直後 / push の前 /
 #                       issue の間) で止める
 #   wt loop status      state ディレクトリの issue ごとの状態を一覧する
+#   wt loop doctor [--label <name>] [--fix-labels]
+#                       repo が loop に乗せられる状態かを本体 checkout で診断し、項目ごとに
+#                       OK / NG と直し方を 1 行で出す (NG があれば exit 1)。検査項目:
+#                       scripts/check が実行可能 / .github/workflows/ci.yml / .claude/worktrees/
+#                       の ignore / gh 認証 / default branch / ラベル (対象と needs-human) /
+#                       本体が default branch 上でクリーン / claude CLI。
+#                       --fix-labels は無いラベルだけ作る (repo のファイルには触らない)
+#   wt loop は起動前に同じ検査を走らせ、NG なら始めない。--dry-run は診断を出して対象の
+#   一覧まで見せる (NG があれば exit 1)。
 #
 # 対象 issue: 引数で番号を与えればそれ、無ければラベル (既定 wt-loop) 付きの open issue。
 #   needs-human ラベル付き / CLOSED / 依存が未完了のものは飛ばす。

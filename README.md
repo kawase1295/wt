@@ -260,7 +260,7 @@ npm test
 
 ## Claude Code integration
 
-[`skills/`](skills/) ships 11 skills, installed into `~/.claude/skills/` by `install.sh` or supplied by the [plugin](#from-the-plugin-marketplace-claude-code) (where they are namespaced: `/wt:wt-review`). They let a session in the dev (main) checkout throw work at a worktree, and let the worktree session review, land and clean up on its own. The two sides can talk while the work is in flight.
+[`skills/`](skills/) ships 12 skills, installed into `~/.claude/skills/` by `install.sh` or supplied by the [plugin](#from-the-plugin-marketplace-claude-code) (where they are namespaced: `/wt:wt-review`). They let a session in the dev (main) checkout throw work at a worktree, and let the worktree session review, land and clean up on its own. The two sides can talk while the work is in flight.
 
 A skill is not always a lone `SKILL.md`. `/wt-review` bundles the review page's HTML template and its renderer under [`skills/wt-review/assets/`](skills/wt-review/assets/), which is why `install.sh` copies each skill directory whole.
 
@@ -275,6 +275,7 @@ A skill is not always a lone `SKILL.md`. `/wt-review` bundles the review page's 
 | `/wt-clean` | worktree | Verifies nothing is uncommitted and the work has landed (PR merged, or merged into the main checkout), then removes its own worktree and closes the workspace |
 | `/wt-ask <message>` | both | Resolves the other session's address via `wt peers`, sends a question or status report, and waits for the reply |
 | `/wt-loop` | dev | Runs labelled issues to merge unattended via `wt loop`: shows the targets with `--dry-run`, starts the driver in the background, watches it, stops it ([Unattended loop](#unattended-loop-wt-loop)) |
+| `/wt-pm <task>` | dev | Makes the main session an orchestrator that never implements: files parent / child issues after your confirmation, feeds them to `wt loop`, watches `events.jsonl`, relays `needs-human` questions to you and reports merges ([Unattended loop](#unattended-loop-wt-loop)) |
 | `worktree-parallel` | both | Policy for choosing between `wt` and native worktrees, plus the `.worktreeinclude` contract ([skills/worktree-parallel/SKILL.md](skills/worktree-parallel/SKILL.md)) |
 | `local-artifact` | both | Contract for building HTML with the same design rules as Artifacts but publishing locally instead of to claude.ai. `/wt-review` no longer loads it — its template already carries the skeleton, theme toggle and mermaid |
 
@@ -330,6 +331,20 @@ Target selection:
 - a second `wt loop` on the same repo refuses to start (lock)
 
 State lives in `~/.cache/wt/loop/<repo>-<key>/<N>/` (`WT_LOOP_STATE` to relocate): per-round worker prompt and output, reviewer JSON, `scripts/check` log, diff, session id, PR URL. Progress is appended to `loop.log` next to them. `wt loop status` lists each issue's state (`running` / `merged` / `needs-human` / `stopped` / `failed`).
+
+**Orchestration (`/wt-pm`).** The loop does not decide what to run or answer its own questions. `/wt-pm` turns the main session (the one you talk to, in the dev checkout) into the orchestrator around it: it files the issues, feeds them to the loop, watches, relays `needs-human` questions and reports. It never implements.
+
+```
+you ⇄ main session (/wt-pm, dev side; never implements)
+  file:    split into parent / children (/wt-split rules; single task → /wt-detail)
+           → confirm with you → gh issue create        ← "needs-human" items handed back first
+  feed:    wt loop doctor → wt loop <parent> --dry-run → wt loop <parent> (background)
+           issues needing many spec calls → wt new + /wt-ask instead
+  watch:   Monitor: tail -F <state>/events.jsonl | grep merged|needs_human|failed|stopped|run_finished
+  relay:   needs_human → read <N>/round-K.worker.md → ask you one question
+           → gh issue comment <N> → drop the needs-human label → wt loop <N>
+  report:  merged: PR URL + time/cost · run_finished: summary · failed: check claude / gh
+```
 
 Requires `gh` (authenticated), `jq` and `claude`. "no checks reported" is treated as "checks not registered yet" in a repo that has `.github/workflows` (the driver keeps waiting up to the CI timeout); only a repo without workflows is merged on the strength of the local `scripts/check` after one re-check. A repo with no `scripts/check` has no gate at all, so add one before putting it on the loop ([Pre-merge check](#pre-merge-check-scriptscheck)).
 

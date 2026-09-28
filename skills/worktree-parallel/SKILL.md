@@ -75,7 +75,7 @@ peer レジストリに載らないセッション（古い Claude Code で起�
 
 ## slash command skill
 
-wt repo は 9 つのコマンド skill を同梱し、install.sh が `~/.claude/skills/` に配置する。
+wt repo は 10 のコマンド skill を同梱し、install.sh が `~/.claude/skills/` に配置する。
 
 | skill | 実行する側 | 役割 |
 | --- | --- | --- |
@@ -88,5 +88,6 @@ wt repo は 9 つのコマンド skill を同梱し、install.sh が `~/.claude/
 | `/wt-merge` | worktree | 自分のブランチを本体の現在ブランチへマージ（レビュー指示があれば承認後） |
 | `/wt-clean` | worktree | 未コミット・未マージを検査し、クリーンなら自分の worktree を片付けて閉じる |
 | `/wt-loop` | dev (本体) | ラベル付き issue を `wt loop`（bash driver + headless claude）で人間の操作なしにマージまで回す。起動・監視・停止 |
+| `/wt-pm <作業内容>` | dev (本体) | メインを実装しないオーケストレータにする。起票（ユーザー確認あり）→ `wt loop` へ投入 → `events.jsonl` を監視 → needs-human を仲介 → 報告 |
 
 このほか契約 skill `local-artifact` を同梱する。Artifact と同一の設計規約で HTML を作り、claude.ai に publish せずローカル公開する（skeleton / テーマトグル / mermaid の再現込み）。`/wt-review` のレビューページ生成はこれに従う。

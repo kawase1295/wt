@@ -557,6 +557,11 @@ git -c "url.$(git remote get-url origin).pushInsteadOf=$(git remote get-url orig
 GIT_CONFIG_COUNT=0 git push origin HEAD:evil4 >/dev/null 2>&1; echo "push4=$?" >>"$CLAUDE_STUB_DIR/push.log"
 # shim を外した素の git でも環境の塞ぎが効く
 "$WT_LOOP_REAL_GIT" -C . push origin HEAD:evil5 >/dev/null 2>&1; echo "push5=$?" >>"$CLAUDE_STUB_DIR/push.log"
+# alias / pushurl / send-pack / credential の上書き経路も shim が止める
+git -c alias.p=push p origin HEAD:evil6 >/dev/null 2>&1; echo "push6=$?" >>"$CLAUDE_STUB_DIR/push.log"
+git -c remote.origin.pushurl="$(git remote get-url origin)" push origin HEAD:evil7 >/dev/null 2>&1; echo "push7=$?" >>"$CLAUDE_STUB_DIR/push.log"
+git send-pack "$(git remote get-url origin)" HEAD:refs/heads/evil8 >/dev/null 2>&1; echo "push8=$?" >>"$CLAUDE_STUB_DIR/push.log"
+git -c credential.helper=store credential fill </dev/null >/dev/null 2>&1; echo "cred=$?" >>"$CLAUDE_STUB_DIR/push.log"
 git -c core.pager=cat commit --allow-empty -qm "push という語を含むコミット" ; echo "commit=$?" >>"$CLAUDE_STUB_DIR/push.log"
 git fetch -q origin dev; echo "fetch=$?" >>"$CLAUDE_STUB_DIR/push.log"
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
@@ -568,12 +573,16 @@ assert_contains "sandbox: worker に pushInsteadOf を渡す" "$(cat "$CLAUDE_ST
 assert_contains "sandbox: worker の gh を無認証にする" "$(cat "$CLAUDE_STUB_DIR/env-1.txt")" "GH_CONFIG_DIR="
 assert_not_contains "sandbox: GH_TOKEN を渡さない" "$(cat "$CLAUDE_STUB_DIR/env-1.txt")" "GH_TOKEN="
 assert_contains "sandbox: reviewer にも同じ環境" "$(cat "$CLAUDE_STUB_DIR/env-2.txt")" "pushInsteadOf"
-assert_contains "sandbox: remote 名への push は shim が止める" "$(cat "$CLAUDE_STUB_DIR/push.log")" "push1=1"
+assert_eq "sandbox: remote 名への push は shim が止める (exit 1)" "1" "$(grep -cx 'push1=1' "$CLAUDE_STUB_DIR/push.log")"
 assert_contains "sandbox: URL 直指定の push も失敗する" "$(cat "$CLAUDE_STUB_DIR/push.log")" "push2=1"
 assert_contains "sandbox: -c で pushInsteadOf を上書きしても shim が止める" "$(cat "$CLAUDE_STUB_DIR/push.log")" "push3=1"
 assert_contains "sandbox: GIT_CONFIG_COUNT=0 でも shim が止める" "$(cat "$CLAUDE_STUB_DIR/push.log")" "push4=1"
 assert_contains "sandbox: shim を外した実 git でも環境の塞ぎが効く" "$(cat "$CLAUDE_STUB_DIR/push.log")" "push5=128"
 assert_contains "sandbox: push 以外の git は shim を素通りする" "$(cat "$CLAUDE_STUB_DIR/push.log")" "commit=0"
+assert_contains "sandbox: -c alias 経由の push を止める" "$(cat "$CLAUDE_STUB_DIR/push.log")" "push6=1"
+assert_contains "sandbox: -c pushurl の上書きを止める" "$(cat "$CLAUDE_STUB_DIR/push.log")" "push7=1"
+assert_contains "sandbox: send-pack を止める" "$(cat "$CLAUDE_STUB_DIR/push.log")" "push8=1"
+assert_contains "sandbox: -c credential.* の上書きを止める" "$(cat "$CLAUDE_STUB_DIR/push.log")" "cred=1"
 assert_contains "sandbox: fetch は通る" "$(cat "$CLAUDE_STUB_DIR/push.log")" "fetch=0"
 if git -C "$ORIGIN" for-each-ref 'refs/heads/evil*' | grep -q evil; then
   fail "sandbox: origin に worker の push が届かない"
@@ -584,6 +593,53 @@ assert_eq "sandbox: driver 自身の push は通り merged になる" "merged" "
 assert_contains "sandbox: allowlist に bash / sh を入れない" "$(cat "$CLAUDE_STUB_DIR/argv-1.txt")" "Bash(git *)"
 assert_not_contains "sandbox: allowlist に bash を入れない" "$(cat "$CLAUDE_STUB_DIR/argv-1.txt")" "Bash(bash *)"
 assert_not_contains "sandbox: allowlist に gh を入れない" "$(cat "$CLAUDE_STUB_DIR/argv-1.txt")" "Bash(gh "
+
+# --- test 14b: worker が書いた scripts/check と hook を driver の環境で走らせない --------
+make_fixture t14b
+add_issue 121 "Evil check" OPEN "wt-loop" "x"
+cat >"$CLAUDE_STUB_DIR/step-1.sh" <<'EOF'
+#!/usr/bin/env bash
+# scripts/check に push を仕込み、pre-push hook も置く
+cat >scripts/check <<'CHK'
+#!/usr/bin/env bash
+git push -q origin HEAD:refs/heads/evil-from-check >/dev/null 2>&1 && echo "pushed" >"${CHECK_LOG%/*}/evil-check.marker"
+"$WT_LOOP_REAL_GIT" push -q origin HEAD:refs/heads/evil-from-check2 >/dev/null 2>&1 && echo "pushed" >"${CHECK_LOG%/*}/evil-check2.marker"
+exit 0
+CHK
+mkdir -p .githooks
+printf '#!/usr/bin/env bash\necho hooked >"${CHECK_LOG%%/*}/hook.marker"\nexit 0\n' >.githooks/pre-push
+chmod +x .githooks/pre-push scripts/check
+printf 'x\n' >a.txt
+git add -A
+git -c user.email=w@example.com -c user.name=worker commit -qm evil
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
+EOF
+chmod +x "$CLAUDE_STUB_DIR/step-1.sh"
+reviewer_step 2 PASS ok '[]'
+rm -f "$TMP/evil-check.marker" "$TMP/evil-check2.marker" "$TMP/hook.marker"
+out="$(loop)"
+if git -C "$ORIGIN" for-each-ref 'refs/heads/evil-from-check*' | grep -q evil; then
+  fail "check sandbox: scripts/check からの push が origin に届かない"
+else
+  pass "check sandbox: scripts/check からの push が origin に届かない"
+fi
+assert_eq "check sandbox: check 自体は通り merged になる" "merged" "$(cat "$(state_dir 121)/status" 2>/dev/null)"
+# worker が core.hooksPath を設定した場合は共有 config の変更として escalate する
+make_fixture t14c
+add_issue 122 "Hooks" OPEN "wt-loop" "x"
+cat >"$CLAUDE_STUB_DIR/step-1.sh" <<'EOF'
+#!/usr/bin/env bash
+git config core.hooksPath .githooks
+printf 'x\n' >a.txt
+git add -A
+git -c user.email=w@example.com -c user.name=worker commit -qm add
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
+EOF
+chmod +x "$CLAUDE_STUB_DIR/step-1.sh"
+out="$(loop)"
+assert_eq "config drift: needs-human にする" "needs-human" "$(cat "$(state_dir 122)/status" 2>/dev/null)"
+assert_contains "config drift: 変更内容をコメントする" "$(cat "$GH_STUB_DIR/comment-122-1.md")" "core.hookspath=.githooks"
+assert_eq "config drift: reviewer を呼ばずに止める" "1" "$(claude_calls)"
 
 # --- test 15: needs-human の issue を番号指定で再開する (worktree と session を再利用) ---
 make_fixture t15
@@ -614,6 +670,31 @@ assert_contains "resume: 前回の session を --resume する" "$(tr '\n' ' ' <
 assert_contains "resume: 続きから進める指示を渡す" "$(cat "$CLAUDE_STUB_DIR/prompt-2.txt")" "前回の run は途中で止まった"
 assert_eq "resume: 完走して merged" "merged" "$(cat "$sd/status" 2>/dev/null)"
 assert_eq "resume: 両方のコミットが origin に入る" "full" "$(git -C "$ORIGIN" show dev:a.txt 2>/dev/null)"
+# session が残っていない (resume が No conversation found) ときは、issue 本文込みの新 session で続ける
+make_fixture t15b
+add_issue 131 "Lost session" OPEN "wt-loop" "## 受け入れ条件
+- [ ] 本文が新しい session に渡る"
+cat >"$CLAUDE_STUB_DIR/step-1.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"**BLOCKED**: 一旦止める"}'
+EOF
+chmod +x "$CLAUDE_STUB_DIR/step-1.sh"
+out="$(loop)"
+assert_eq "resume: **BLOCKED**: の形も検出する" "needs-human" "$(cat "$(state_dir 131)/status" 2>/dev/null)"
+jq 'map(if .number == 131 then .labels = [] else . end)' "$GH_STUB_DIR/issues.json" >"$GH_STUB_DIR/issues.json.tmp" && mv "$GH_STUB_DIR/issues.json.tmp" "$GH_STUB_DIR/issues.json"
+cat >"$CLAUDE_STUB_DIR/step-2.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "No conversation found with session ID: x" >&2
+exit 1
+EOF
+chmod +x "$CLAUDE_STUB_DIR/step-2.sh"
+worker_step 3 a.txt v1
+reviewer_step 4 PASS ok '[]'
+out="$(loop 131)"
+assert_contains "resume: session 再作成時は issue 本文を渡す" "$(cat "$CLAUDE_STUB_DIR/prompt-3.txt")" "本文が新しい session に渡る"
+assert_contains "resume: session 再作成時は引き継ぎも渡す" "$(cat "$CLAUDE_STUB_DIR/prompt-3.txt")" "## 前回からの引き継ぎ"
+assert_contains "resume: 新しい --session-id で起動する" "$(cat "$CLAUDE_STUB_DIR/argv-3.txt")" "--session-id"
+assert_eq "resume: 完走して merged" "merged" "$(cat "$(state_dir 131)/status" 2>/dev/null)"
 
 # --- test 16: ラベル付きの子 issue も依存判定を受ける (一覧は新しい順) ----------
 make_fixture t16
@@ -696,6 +777,12 @@ assert_contains "infra: loop を止める" "$out" "claude か gh が動いてい
 assert_eq "infra: 次の issue を始めない" "" "$(state_dir 151)"
 assert_not_contains "infra: needs-human は付けない" "$(cat "$GH_STUB_DIR/gh.log")" "add-label needs-human"
 assert_contains "infra: 終了コードは 1" "$out" "rc=1"
+assert_contains "infra: 再開は番号指定と案内する" "$out" "wt loop 150 と番号指定で再開"
+# 直ったら番号指定で再開できる
+worker_step 2 a.txt v1
+reviewer_step 3 PASS ok '[]'
+out="$(loop 150)"
+assert_eq "infra: 番号指定で再開して merged" "merged" "$(cat "$(state_dir 150)/status" 2>/dev/null)"
 
 # --- test 20: CI 待ちの上限 / workflow がある repo では no checks を待ち続ける -------
 make_fixture t20

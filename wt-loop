@@ -377,21 +377,39 @@ run_claude() { # cwd prompt_file out_json timeout_sec args...
   (cd "$cwd" && "${pre[@]}" claude -p --output-format json --model "$MODEL" "$@" <"$prompt" >"$out" 2>"$out.err")
 }
 
-# worker の PATH 先頭に置く git の shim。サブコマンドが push なら拒否し、それ以外は
-# 実 git に委譲する。環境変数の塞ぎ (pushInsteadOf) は git -c や GIT_CONFIG_COUNT の
-# 上書きで外せるので、コマンド経路でも止める (絶対パスで実 git を呼ぶ経路は残る。
-# 防ぐ対象は悪意ではなく「気を利かせて push してしまう」誤操作)。
+# worker の PATH 先頭に置く git の shim。push / send-pack、および塞ぎや認証を
+# 上書きする -c (alias.* / remote.*.pushurl / url.* / credential.* / core.hooksPath) を
+# 拒否し、それ以外は実 git に委譲する。環境変数の塞ぎ (pushInsteadOf) は git -c や
+# GIT_CONFIG_COUNT の上書きで外せるので、コマンド経路でも止める。
+# 防ぐ対象は「気を利かせて push してしまう」誤操作であって、実 git を絶対パスで
+# 呼ぶ・環境を組み直すといった意図的な回避は対象外 (Bash(git *) を許す以上、塞ぎ切れない)。
 write_git_shim() { # dir
   mkdir -p "$1"
   cat >"$1/git" <<'SHIM'
 #!/usr/bin/env bash
-# wt loop の worker 用 git shim: push を拒否する (driver が push する)
+# wt loop の worker 用 git shim: push と、塞ぎを外す設定の上書きを拒否する
+deny() {
+  echo "wt loop: worker は $1 できない (push / PR / merge は driver が行う)" >&2
+  exit 1
+}
 sub=""
-skip=0
+expect=""
 for a in "$@"; do
-  if [ "$skip" -eq 1 ]; then skip=0; continue; fi
+  if [ -n "$expect" ]; then
+    case "$expect" in
+      -c | --config-env)
+        case "$a" in
+          alias.* | remote.*.pushurl* | url.* | credential.* | core.hooksPath* | http.* | ssh.* | core.sshCommand*) deny "git 設定 ($a) を上書き" ;;
+        esac
+        ;;
+    esac
+    expect=""
+    continue
+  fi
   case "$a" in
-    -C | -c | --git-dir | --work-tree | --namespace | --super-prefix | --config-env | --exec-path | --list-cmds) skip=1 ;;
+    -c | --config-env) expect="$a" ;;
+    -C | --git-dir | --work-tree | --namespace | --super-prefix | --exec-path | --list-cmds) expect="$a" ;;
+    --config-env=* | -c*) deny "git 設定 ($a) を上書き" ;;
     -*) ;;
     *)
       sub="$a"
@@ -399,35 +417,59 @@ for a in "$@"; do
       ;;
   esac
 done
-if [ "$sub" = "push" ]; then
-  echo "wt loop: worker は push できない (push / PR / merge は driver が行う)" >&2
-  exit 1
-fi
+case "$sub" in
+  push | send-pack) deny "push" ;;
+esac
 exec "$WT_LOOP_REAL_GIT" "$@"
 SHIM
   chmod +x "$1/git"
 }
 
-# worker / reviewer を、push と gh の書き込みができない環境で走らせる。
+# push と gh の書き込みができない環境を、現在のシェルに設定する (subshell の中で呼ぶ)。
 # 環境変数は claude の Bash tool が起動する子プロセスにも引き継がれる。
-# GIT_CONFIG_* / PATH はこのサブシェルだけに効き、driver 自身の git には影響しない。
+sandbox_env() {
+  local i=0 p
+  for p in 'https://' 'http://' 'git@' 'ssh://' 'git://' 'file://' '/' '.' '~'; do
+    export "GIT_CONFIG_KEY_$i=url.$PUSH_BLOCK.pushInsteadOf" "GIT_CONFIG_VALUE_$i=$p"
+    i=$((i + 1))
+  done
+  # worker が worktree に置いた hook は driver でも worker でも動かさない
+  export "GIT_CONFIG_KEY_$i=core.hooksPath" "GIT_CONFIG_VALUE_$i=/dev/null"
+  i=$((i + 1))
+  export GIT_CONFIG_COUNT="$i"
+  unset GH_TOKEN GITHUB_TOKEN
+  mkdir -p "$STATE/no-gh"
+  export GH_CONFIG_DIR="$STATE/no-gh" GIT_TERMINAL_PROMPT=0
+  WT_LOOP_REAL_GIT="$(command -v git)"
+  export WT_LOOP_REAL_GIT
+  write_git_shim "$STATE/shim"
+  export PATH="$STATE/shim:$PATH"
+}
+
+# worker / reviewer を sandbox 環境で走らせる。GIT_CONFIG_* / PATH はこのサブシェル
+# だけに効き、driver 自身の git には影響しない。
 run_sandboxed() { # cwd prompt_file out_json timeout_sec args...
   (
-    local i=0 p
-    for p in 'https://' 'http://' 'git@' 'ssh://' 'git://' 'file://' '/' '.' '~'; do
-      export "GIT_CONFIG_KEY_$i=url.$PUSH_BLOCK.pushInsteadOf" "GIT_CONFIG_VALUE_$i=$p"
-      i=$((i + 1))
-    done
-    export GIT_CONFIG_COUNT="$i"
-    unset GH_TOKEN GITHUB_TOKEN
-    mkdir -p "$STATE/no-gh"
-    export GH_CONFIG_DIR="$STATE/no-gh" GIT_TERMINAL_PROMPT=0
-    WT_LOOP_REAL_GIT="$(command -v git)"
-    export WT_LOOP_REAL_GIT
-    write_git_shim "$STATE/shim"
-    export PATH="$STATE/shim:$PATH"
+    sandbox_env
     run_claude "$@"
   )
+}
+
+# scripts/check は worker が書いたコードなので、driver の認証や git 設定で走らせない。
+run_check_sandboxed() { # wt_path log
+  (
+    sandbox_env
+    cd "$1" && scripts/check
+  ) >"$2" 2>&1
+}
+
+# driver 自身の git 操作。worktree 内の hook (worker が置けるもの) を実行しない。
+gitq() { git -c core.hooksPath=/dev/null "$@"; }
+
+# 共有される .git/config を worker が書き換えていないか (pushurl / hooksPath 等)。
+# 変更があれば escalate の材料にする。
+config_snapshot() { # wt_path
+  git -C "$1" config --local --list 2>/dev/null | sort
 }
 
 # envelope から結果本文を取り出す (無ければ空)
@@ -494,7 +536,8 @@ EOF
 
 # 最終報告が BLOCKED: で始まるか (太字や見出し記号が前に付いていても拾う)
 report_blocked() { # report
-  printf '%s\n' "$1" | grep -v '^[[:space:]]*$' | head -1 | grep -qE '^[[:space:]*#_`>]*BLOCKED:'
+  # shellcheck disable=SC2016 # 正規表現のバッククォート
+  printf '%s\n' "$1" | grep -v '^[[:space:]]*$' | head -1 | grep -qE '^[[:space:]*#_`>]*BLOCKED[*_`]*[:：]'
 }
 
 # --- 1 issue ---------------------------------------------------------------------
@@ -549,6 +592,7 @@ $(tail -5 "$sdir/log")"
     printf '%s\n' "$round" >"$sdir/round"
     local prompt="$sdir/round-$round.prompt.md" out="$sdir/round-$round.worker.json"
     rm -f "$out" "$out.err"
+    config_snapshot "$wt_path" >"$sdir/round-$round.config.before"
     t0=$SECONDS
     if [ "$round" -eq 1 ] && [ "$resume" -eq 0 ]; then
       worker_prompt_first "$n" "$title" "$body" "$task" >"$prompt"
@@ -566,11 +610,25 @@ $(tail -5 "$sdir/log")"
         session="$(new_session_id)"
         printf '%s\n' "$session" >"$sdir/session-id"
         log "#$n round $round: session を再作成して続行"
+        # 新しい session は issue も契約も知らないので、初回プロンプトに引き継ぎを足して渡す
+        {
+          worker_prompt_first "$n" "$title" "$body" "$task"
+          printf '\n## 前回からの引き継ぎ\n\n%s\n' "$feedback"
+        } >"$prompt"
         run_sandboxed "$wt_path" "$prompt" "$out" "$WORKER_TIMEOUT" \
           --session-id "$session" --permission-mode acceptEdits --allowedTools "$ALLOWED_TOOLS" || true
       fi
     fi
     elapsed=$((SECONDS - t0))
+    # worktree の .git/config は本体と共有される。worker が書き換えていたら (pushurl /
+    # hooksPath / credential 等)、driver の git 操作に影響するので進めず人に返す
+    local config_diff
+    config_diff="$(diff "$sdir/round-$round.config.before" <(config_snapshot "$wt_path") || true)"
+    if [ -n "$config_diff" ]; then
+      escalate "$n" "$sdir" "$wt_path" "worker が repo の git 設定 (.git/config、本体と共有) を変更した。内容を確認して元に戻すこと:
+$config_diff"
+      return 1
+    fi
     if stop_requested; then
       set_status "$sdir" stopped
       log "#$n: stopped (停止指示。worktree は残す: $wt_path。再開は wt loop $n)"
@@ -605,7 +663,7 @@ $dirty"
     fi
     # 検証 2: base の取り込み (コンフリクトは worker に解かせる)
     git -C "$wt_path" fetch -q origin "$DEFAULT" 2>>"$sdir/log" || true
-    if ! git -C "$wt_path" merge --no-edit "origin/$DEFAULT" >>"$sdir/log" 2>&1; then
+    if ! gitq -C "$wt_path" merge --no-edit "origin/$DEFAULT" >>"$sdir/log" 2>&1; then
       local conflicts
       conflicts="$(git -C "$wt_path" diff --name-only --diff-filter=U)"
       feedback="origin/$DEFAULT の取り込みでコンフリクトした（worktree は merge 中の状態）。次のファイルを解決して git add し、git commit で merge を完了させること:
@@ -622,7 +680,7 @@ $conflicts"
     # 検証 4: scripts/check
     if [ -x "$wt_path/scripts/check" ]; then
       log "#$n round $round: scripts/check"
-      if ! (cd "$wt_path" && scripts/check) >"$sdir/round-$round.check.log" 2>&1; then
+      if ! run_check_sandboxed "$wt_path" "$sdir/round-$round.check.log"; then
         feedback="scripts/check が失敗した。ログ末尾:
 $(tail -60 "$sdir/round-$round.check.log")"
         log "#$n round $round: check 失敗"
@@ -660,7 +718,7 @@ $(review_field "$review_json" '.findings[] | select(.severity != "minor") | "- [
     fi
 
     # 着地: push → PR → CI → merge
-    if ! git -C "$wt_path" push -u origin "$branch" >>"$sdir/log" 2>&1; then
+    if ! gitq -C "$wt_path" push -u origin "$branch" >>"$sdir/log" 2>&1; then
       escalate "$n" "$sdir" "$wt_path" "git push が失敗した:
 $(tail -10 "$sdir/log")"
       return 1
@@ -748,7 +806,9 @@ wait_checks() { # pr_url log wt_path
     remaining=$((deadline - SECONDS))
     [ "$remaining" -gt 0 ] || return 2
     rc=0
-    (cd "$MAIN_ROOT" && timeout -k 10 "$remaining" gh pr checks "$1" --watch --fail-fast --interval 15) >"$2" 2>&1 || rc=$?
+    local -a pre=()
+    command -v timeout >/dev/null 2>&1 && pre=(timeout -k 10 "$remaining")
+    (cd "$MAIN_ROOT" && "${pre[@]}" gh pr checks "$1" --watch --fail-fast --interval 15) >"$2" 2>&1 || rc=$?
     [ "$rc" -eq 0 ] && return 0
     [ "$rc" -eq 124 ] && return 2
     if grep -q 'no checks reported' "$2"; then
@@ -776,7 +836,7 @@ update_main_checkout() {
     log "本体に未コミットの変更があるため pull しない"
     return 0
   fi
-  git -C "$MAIN_ROOT" pull -q --ff-only origin "$DEFAULT" 2>/dev/null || log "本体の pull (ff-only) に失敗。手動で更新する"
+  gitq -C "$MAIN_ROOT" pull -q --ff-only origin "$DEFAULT" 2>/dev/null || log "本体の pull (ff-only) に失敗。手動で更新する"
 }
 
 escalate() { # number sdir wt_path reason
@@ -890,7 +950,7 @@ cmd_loop() {
         1) human=$((human + 1)) ;;
         2) stop=1 ;;
         3)
-          log "claude か gh が動いていない疑いがあるため loop を止める (直したら wt loop で再開)"
+          log "claude か gh が動いていない疑いがあるため loop を止める (直したら wt loop $n と番号指定で再開)"
           stop=2
           ;;
       esac

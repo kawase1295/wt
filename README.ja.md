@@ -103,9 +103,14 @@ wt new <task> [--base <ref>] [--no-claude] [--prompt <text>|--prompt-file <path>
     claude には既定で --model opus --permission-mode auto を渡す
     （WT_CLAUDE_ARGS で差し替え、空文字でフラグ無し。空白を含む値は不可）。
     Claude Code の起動・プロンプト投入に失敗しても worktree / workspace は残し、
-    herdr の error.code ごとの次の手（agent_not_ready なら pane で信頼ダイアログを
-    承認し、herdr agent prompt claude-<task> … で再投入。それ以外は herdr の出力を
-    そのまま表示）と wt open <task> / wt rm <task> を案内する
+    herdr の error.code ごとの次の手と wt open <task> / wt rm <task> を案内する:
+      agent_not_ready         pane で信頼ダイアログを承認し、案内の
+                              herdr agent prompt claude-<task> … で再投入する
+      invalid_agent_argument  WT_CLAUDE_ARGS を見直す（渡した引数を表示）
+      それ以外・code なし     herdr の出力をそのまま表示
+    初期プロンプトは worktree の git ディレクトリに wt-initial-prompt.txt として
+    退避し、再投入コマンドはそこから読む。呼び出し元が --prompt-file を消しても
+    使える（wt rm で一緒に消える）
 
 wt bootstrap [<path>]
     既存 worktree に、gitignore されて入らないファイルを補完する。

@@ -378,8 +378,12 @@ case "$cmd" in
     shift 2
     : >"$HERDR_ARGV_LOG"
     for a in "$@"; do printf '%s\n' "$a" >>"$HERDR_ARGV_LOG"; done
+    # HERDR_STUB_START_WARN=1 で JSON でない警告行を stderr に混ぜる (成否に関係なく)。
+    [ "${HERDR_STUB_START_WARN:-0}" = "1" ] && printf 'warning: stub deprecation notice\n' >&2
     # HERDR_STUB_START_FAIL=<code> で server エラー (JSON on stderr + exit 1) を、
     # =raw で JSON でない失敗 (CLI 構文エラー相当) を再現する。
+    # HERDR_STUB_START_PRETTY=1 で JSON を整形 (複数行) して出す。
+    json=""
     case "${HERDR_STUB_START_FAIL:-}" in
       "") ;;
       raw)
@@ -387,15 +391,21 @@ case "$cmd" in
         exit 2
         ;;
       agent_not_ready)
-        printf '{"error":{"code":"agent_not_ready","message":"agent %s is blocked during startup and is not ready for prompts"},"id":"cli:agent:start"}\n' "$1" >&2
-        exit 1
+        json="$(printf '{"error":{"code":"agent_not_ready","message":"agent %s is blocked during startup and is not ready for prompts"},"id":"cli:agent:start"}' "$1")"
         ;;
       *)
-        printf '{"error":{"code":"%s","message":"stub failure for %s"},"id":"cli:agent:start"}\n' \
-          "$HERDR_STUB_START_FAIL" "$1" >&2
-        exit 1
+        json="$(printf '{"error":{"code":"%s","message":"stub failure for %s"},"id":"cli:agent:start"}' \
+          "$HERDR_STUB_START_FAIL" "$1")"
         ;;
     esac
+    if [ -n "$json" ]; then
+      if [ "${HERDR_STUB_START_PRETTY:-0}" = "1" ]; then
+        jq . <<<"$json" >&2
+      else
+        printf '%s\n' "$json" >&2
+      fi
+      exit 1
+    fi
     ;;
   "agent prompt")
     shift 2
@@ -475,6 +485,25 @@ STUB
     fail "stub: agent prompt 失敗時は die して再投入コマンドと破棄の仕方を案内する (rc=$rc out=$out)"
   fi
 
+  # 案内の再投入コマンドは貼ればそのまま動くこと。案内から取り出して stub に対して実行し、
+  # 元のプロンプトが届くかで検査する。
+  retry_cmd_of() { printf '%s\n' "$1" | sed -n 's/.*\(herdr agent prompt claude-[^ ]* .*\)$/\1/p' | head -n1; }
+  assert_retry_delivers() { # desc out expected_file
+    local cmd log="$TMP/retry-$RANDOM"
+    cmd="$(retry_cmd_of "$2")"
+    if [ -n "$cmd" ] && env HERDR_PROMPT_LOG="$log" PATH="$TMP/bin:$SAFE_PATH" bash -c "$cmd" &&
+      cmp -s "$3" "$log.text"; then
+      pass "$1"
+    else
+      fail "$1 (cmd=$cmd got=$(cat "$log.text" 2>/dev/null))"
+    fi
+  }
+  printf 'hi' >"$TMP/prompt-hi.txt"
+  assert_retry_delivers "stub: prompt 投入失敗の再投入コマンドで元のプロンプトが届く" \
+    "$out" "$TMP/prompt-hi.txt"
+  assert_eq "stub: prompt 投入失敗の案内の最後の行は再投入が失敗したときの手" \
+    "1" "$(printf '%s\n' "$out" | tail -n1 | grep -c 'wt rm p21f.*wt new')"
+
   # agent start の失敗は error.code ごとに案内を変える。原因で次の一手が違うため、
   # 一律の「herdr が古いなら update」では pane を見るまで原因が分からない。
   # 非 0 で終わり、pattern を全て含み、"!pat" の pattern は含まないことを検査する。
@@ -509,6 +538,10 @@ STUB
     "$rc" "$out" 'herdr agent prompt claude-p21g'
   assert_start_fail "stub: agent_not_ready でも残した worktree の入り直し方 / 破棄の仕方を示す" \
     "$rc" "$out" 'wt open p21g' 'wt rm p21g'
+  assert_retry_delivers "stub: agent_not_ready の再投入コマンドで --prompt の本文が届く" \
+    "$out" "$TMP/prompt-hi.txt"
+  assert_eq "stub: agent_not_ready の案内の最後の行は再投入が失敗したときの手" \
+    "1" "$(printf '%s\n' "$out" | tail -n1 | grep -c 'wt rm p21g.*wt new')"
   assert_dir "$R21/.claude/worktrees/p21g" "stub: 起動失敗でも worktree は残す"
   if [ -e "$TMP/agent-prompt-p21g.text" ]; then
     fail "stub: agent start 失敗後は agent prompt を投げない"
@@ -516,13 +549,20 @@ STUB
     pass "stub: agent start 失敗後は agent prompt を投げない"
   fi
 
-  # --prompt-file 経路の再投入はファイルから読み直す形にする (長文を再入力させない)
-  PF21K="$TMP/prompt-p21k.txt"
-  printf 'plan body' >"$PF21K"
-  out="$(start_fail_out p21k agent_not_ready --prompt-file "$PF21K")"
+  # --prompt-file は呼び出し元 (issue-board 等) が wt new の終了後に消す一時ファイルの
+  # ことがある。案内がそのファイルを指すと再投入が空振りするので、wt が worktree の
+  # git ディレクトリに退避したファイルを指すこと (作業ツリーは汚さない)。
+  mkdir -p "$TMP/caller-tmp"
+  cp "$ML21" "$TMP/caller-tmp/prompt.txt"
+  out="$(start_fail_out p21k agent_not_ready --prompt-file "$TMP/caller-tmp/prompt.txt")"
   rc=$?
-  assert_start_fail "stub: agent_not_ready の再投入は --prompt-file を読み直す" \
-    "$rc" "$out" "herdr agent prompt claude-p21k \"\$(cat $PF21K)\""
+  rm -r "$TMP/caller-tmp"
+  assert_start_fail "stub: agent_not_ready の再投入は呼び出し元の一時ファイルを指さない" \
+    "$rc" "$out" 'herdr agent prompt claude-p21k' "!$TMP/caller-tmp"
+  assert_retry_delivers "stub: prompt ファイルを消した後でも再投入コマンドで原文が届く" \
+    "$out" "$ML21"
+  assert_eq "stub: 退避したプロンプトは作業ツリーに置かない" "" \
+    "$(git -C "$R21/.claude/worktrees/p21k" status --porcelain --ignored | grep wt-initial-prompt)"
 
   # 初期プロンプトが無ければ再投入の案内は出さない (承認すれば終わり)
   out="$(start_fail_out p21l agent_not_ready)"
@@ -542,6 +582,29 @@ STUB
   rc=$?
   assert_start_fail "stub: invalid_agent_argument は WT_CLAUDE_ARGS を指す" \
     "$rc" "$out" 'invalid_agent_argument' 'WT_CLAUDE_ARGS' 'wt rm p21i' '!trust'
+
+  # 整形された (複数行の) JSON でも error.code を取れる
+  out="$(HERDR_STUB_START_PRETTY=1 start_fail_out p21m agent_not_ready --prompt "hi")"
+  rc=$?
+  assert_start_fail "stub: 複数行の JSON でも agent_not_ready を判別する" \
+    "$rc" "$out" 'Is this a project you created or one you trust?'
+
+  # JSON でない警告行が混ざっても error.code を取れ、警告も見せる
+  out="$(HERDR_STUB_START_WARN=1 start_fail_out p21n agent_not_ready --prompt "hi")"
+  rc=$?
+  assert_start_fail "stub: 警告行が混ざっても agent_not_ready を判別する" \
+    "$rc" "$out" 'Is this a project you created or one you trust?'
+
+  # 成功時も herdr の stderr (非推奨警告など) を捨てない
+  out="$(cd "$R21" && env -u WT_HOME -u WT_CLAUDE_ARGS HOME="$TMP/home" \
+    HERDR_ARGV_LOG="$TMP/agent-argv-p21o.log" HERDR_PROMPT_LOG="$TMP/agent-prompt-p21o" \
+    HERDR_STUB_START_WARN=1 PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21o --prompt "hi" 2>&1)"
+  rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'stub deprecation notice'; then
+    pass "stub: agent start 成功時も herdr の警告を表示する"
+  else
+    fail "stub: agent start 成功時も herdr の警告を表示する (rc=$rc out=$out)"
+  fi
 
   # JSON でない失敗 (CLI 構文エラー等) は出力をそのまま添えて落とす
   out="$(start_fail_out p21j raw --prompt "hi")"

@@ -347,7 +347,8 @@ save_initial_prompt() { # worktree_path prompt
   local gitdir file
   gitdir="$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null)" || return 0
   file="$gitdir/wt-initial-prompt.txt"
-  { printf '%s' "$2" >"$file"; } 2>/dev/null || return 0
+  # 非公開 repo の issue 本文を含みうるので所有者だけが読める権限で書く (umask はサブシェルに閉じる)
+  (umask 077 && printf '%s' "$2" >"$file") 2>/dev/null || return 0
   printf '%s' "$file"
 }
 

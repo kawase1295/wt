@@ -563,6 +563,9 @@ STUB
     "$out" "$ML21"
   assert_eq "stub: 退避したプロンプトは作業ツリーに置かない" "" \
     "$(git -C "$R21/.claude/worktrees/p21k" status --porcelain --ignored | grep wt-initial-prompt)"
+  # 本文は非公開 repo の issue 本文を含みうるので、呼び出し元 (issue-board は 0600) より緩めない
+  assert_eq "stub: 退避したプロンプトは所有者だけが読める (0600)" "600" \
+    "$(stat -c %a "$(git -C "$R21/.claude/worktrees/p21k" rev-parse --absolute-git-dir)/wt-initial-prompt.txt")"
 
   # 初期プロンプトが無ければ再投入の案内は出さない (承認すれば終わり)
   out="$(start_fail_out p21l agent_not_ready)"

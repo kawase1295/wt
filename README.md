@@ -329,9 +329,40 @@ Target selection:
 - one issue at a time. After a pass that merged something the driver re-selects, so children unblocked by that merge are picked up in the same run. This also applies when issues are named on the command line: `wt loop <parent>` re-selects from the same numbers and runs every child in dependency order (issues merged in this run and CLOSED ones are excluded, so naming standalone issues just ends after one pass). `--max-issues` caps the run; `wt loop --stop` ends it at the next boundary (right after a claude call, before push, between issues)
 - a second `wt loop` on the same repo refuses to start (lock)
 
-State lives in `~/.cache/wt/loop/<repo>-<key>/<N>/` (`WT_LOOP_STATE` to relocate): per-round worker prompt and output, reviewer JSON, `scripts/check` log, diff, session id, PR URL. Progress is appended to `loop.log` next to them. `wt loop status` lists each issue's state (`running` / `merged` / `needs-human` / `stopped` / `failed`).
+State lives in `~/.cache/wt/loop/<repo>-<key>/<N>/` (`WT_LOOP_STATE` to relocate): per-round worker prompt and output, reviewer JSON, `scripts/check` log, diff, session id, PR URL. Progress is appended to `loop.log` next to them. `wt loop status` lists each issue's state (`running` / `merged` / `needs-human` / `stopped` / `failed`) and the latest 5 entries of `events.jsonl`.
 
 Requires `gh` (authenticated), `jq` and `claude`. "no checks reported" is treated as "checks not registered yet" in a repo that has `.github/workflows` (the driver keeps waiting up to the CI timeout); only a repo without workflows is merged on the strength of the local `scripts/check` after one re-check. A repo with no `scripts/check` has no gate at all, so add one before putting it on the loop ([Pre-merge check](#pre-merge-check-scriptscheck)).
+
+#### Events (events.jsonl) and notifications (WT_LOOP_NOTIFY)
+
+To let another session or script watch the loop without regex-scraping `loop.log`, the driver appends one JSON object per line to `~/.cache/wt/loop/<repo>-<key>/events.jsonl`.
+
+```json
+{"at":"2026-09-28T01:23:45Z","event":"merged","repo":"owner/repo","issue":10,"round":1,"stage":null,"reason":null,"pr":"https://github.com/owner/repo/pull/12","message":"#10 Add greeting をマージした (https://github.com/owner/repo/pull/12)","state":"/home/me/.cache/wt/loop/repo-123"}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `at` | ISO 8601 in UTC (`YYYY-MM-DDThh:mm:ssZ`) |
+| `event` | `run_started` / `issue_started` / `round` / `stage` / `merged` / `needs_human` / `failed` / `stopped` / `run_finished` |
+| `repo` | `owner/repo` |
+| `issue` | issue number; `null` for run-wide events (`run_started` / `run_finished`, a `stopped` between issues) |
+| `round` | round number (`null` before the first round) |
+| `stage` | `stage` events only: `worker` / `check` / `reviewer` / `pr` / `ci` / `merge` |
+| `reason` | one-line reason for `needs_human` / `failed` / `stopped` |
+| `pr` | PR URL, once created |
+| `message` | one-line human-readable summary (Japanese) |
+| `state` | path of the state directory |
+
+Missing values are `null`; every line carries every key. `run_finished` is emitted even when the driver dies abnormally.
+
+Set `WT_LOOP_NOTIFY` to a command and it runs on `merged` / `needs_human` / `failed` / `run_finished`, with the event JSON on stdin (interpreted by `sh -c`, so arguments are fine). It runs in the background with a 10-second limit; a failure only adds one line to `loop.log` and never stops the loop. The command's output goes to `notify.log` in the state directory. An existing notifier that reads `{"message": ...}` works as is.
+
+```bash
+WT_LOOP_NOTIFY="$HOME/.claude/hooks/notify.sh" wt loop
+# follow the events
+tail -f ~/.cache/wt/loop/<repo>-<key>/events.jsonl | jq -r .message
+```
 
 ### Guarding the main checkout (hook)
 

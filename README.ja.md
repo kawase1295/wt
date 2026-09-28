@@ -312,7 +312,7 @@ Claude が担うのは「実装」と「レビュー判定」だけで、どち�
 
 防いでいるのは「気を利かせて push してしまう」誤操作までで、`Bash(git *)` を許す以上、実 git を絶対パスで呼ぶ・環境を組み直す・`git -c alias.x='!…'` で任意のシェルを実行するといった意図的な回避は防げない。悪意のある worker を想定する場合は、この driver ではなくネットワークや認証の外側で塞ぐ必要がある。push / PR / merge は driver が自分の環境の git / gh で行う。
 
-repo をループに乗せる前に `wt loop doctor` を実行する。本体 checkout で次を検査し、項目ごとに `OK` / `NG` と直し方を 1 行で出す: `scripts/check` が実行可能 / `.github/workflows/ci.yml` がある / `.claude/worktrees/` が ignore 済み / `gh` が認証済みで default branch を取得できる / ラベル `wt-loop`（`--label` で変更）と `needs-human` がある / 本体が default branch 上でクリーン（追跡ファイルに未コミットの変更が無い）/ `claude` CLI がある。NG が 1 つでもあれば exit 1。`wt loop` は起動前に同じ検査を走らせ、NG なら始めない。`--dry-run` は診断を出したうえで対象の一覧まで見せる（NG があれば exit 1）。`wt loop doctor --fix-labels` は無いラベルだけを作る（他の項目は直さず、repo のファイルにも触らない）。
+repo をループに乗せる前に `wt loop doctor` を実行する。本体 checkout で次を検査し、項目ごとに `OK` / `WARN` / `NG` と直し方を 1 行で出す: `scripts/check` が実行可能 / `.github/workflows/ci.yml` がある / `.claude/worktrees/` が ignore 済み / `gh` が認証済みで default branch を取得できる / ラベル `wt-loop`（`--label` で変更）と `needs-human` がある / 本体に未コミットの変更が無い（追跡ファイルが対象）/ `claude` CLI がある。NG が 1 つでもあれば exit 1。本体が default branch 以外にいるのは `WARN`（exit code に影響しない）: worktree は `origin/<default>` から切るので base は変わらず、マージ後の本体 pull がスキップされるだけ（plugin 配布のために main を checkout している repo など）。`wt loop` は起動前に同じ検査を走らせ、NG なら始めない。`--dry-run` は診断を出したうえで対象の一覧まで見せる（NG があれば exit 1）。`wt loop doctor --fix-labels` は無いラベルだけを作る（他の項目は直さず、repo のファイルにも触らない）。
 
 対象の選び方:
 

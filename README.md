@@ -102,7 +102,17 @@ wt new <task> [--base <ref>] [--no-claude] [--prompt <text>|--prompt-file <path>
     would read it as a slash command / bash / memory / file mention.
     claude is invoked with --model opus --permission-mode auto by default
     (override via WT_CLAUDE_ARGS; empty string means no flags; values containing
-    spaces are not supported)
+    spaces are not supported).
+    If launching Claude Code or submitting the prompt fails, the worktree and
+    workspace are kept, and the error shows the next step for the herdr
+    error.code plus wt open <task> / wt rm <task>:
+      agent_not_ready         approve the trust dialog in the pane, then resubmit
+                              with the shown herdr agent prompt claude-<task> ...
+      invalid_agent_argument  review WT_CLAUDE_ARGS (the passed args are shown)
+      other / no code         herdr's raw output
+    The initial prompt is saved as wt-initial-prompt.txt in the worktree's git
+    directory, and the resubmit command reads it from there, so it still works
+    after the caller deletes its --prompt-file (removed together by wt rm)
 
 wt bootstrap [<path>]
     Backfill the gitignored files a worktree did not inherit.

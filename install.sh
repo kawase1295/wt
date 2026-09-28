@@ -16,6 +16,10 @@ echo "[install] $PREFIX/wt に配置した"
 install -m 755 "$(dirname "$src")/wt-review-serve.py" "$PREFIX/wt-review-serve.py"
 echo "[install] $PREFIX/wt-review-serve.py に配置した"
 
+# 無人ループの driver (wt loop)。これも wt が自分の隣を探す。
+install -m 755 "$(dirname "$src")/wt-loop" "$PREFIX/wt-loop"
+echo "[install] $PREFIX/wt-loop に配置した"
+
 # Claude Code skill を配置する (WT_INSTALL_SKILLS=0 でスキップ)。
 # skill は wt の管理物として常に上書きする。SKILL.md 以外の同梱物
 # (wt-review の assets/ など) も要るのでディレクトリごとコピーする。

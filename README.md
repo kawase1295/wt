@@ -102,7 +102,19 @@ wt new <task> [--base <ref>] [--no-claude] [--prompt <text>|--prompt-file <path>
     would read it as a slash command / bash / memory / file mention.
     claude is invoked with --model opus --permission-mode auto by default
     (override via WT_CLAUDE_ARGS; empty string means no flags; values containing
-    spaces are not supported)
+    spaces are not supported).
+    If launching Claude Code or submitting the prompt fails, the worktree and
+    workspace are kept, and the error shows the next step for the herdr
+    error.code plus wt open <task> / wt rm <task>:
+      agent_not_ready         approve the trust dialog in the pane, then resubmit
+                              with the shown herdr agent prompt claude-<task> ...
+      invalid_agent_argument  review WT_CLAUDE_ARGS (the passed args are shown)
+      other / no code         herdr's raw output
+    The initial prompt is saved as wt-initial-prompt.txt in the worktree's git
+    directory, and the resubmit command reads it from there, so it still works
+    after the caller deletes its --prompt-file (removed together by wt rm).
+    The file doubles as the "initial prompt not yet delivered" marker (shared
+    with issue-board); the resubmit command deletes it only on success
 
 wt bootstrap [<path>]
     Backfill the gitignored files a worktree did not inherit.
@@ -147,6 +159,14 @@ wt merge [<task>] [--no-check]
 wt rm [<task>] [--force]
     Remove the worktree, workspace and branch (aborts on uncommitted changes).
     Inside a worktree, omit task to clean up after yourself
+
+wt loop [<issue>...] [--label <name>] [--max-issues <n>] [--max-rounds <n>] [--dry-run]
+wt loop --stop / wt loop status
+    Drive labelled (default: wt-loop) open issues to merge with no human in the
+    loop: worktree → headless claude implements → scripts/check → a separate
+    AI reviewer → PR → CI → merge → cleanup → next issue. A failed step is fed
+    back to the same worker (up to --max-rounds); past that the issue is
+    parked with a needs-human label and the loop moves on. See "Unattended loop"
 ```
 
 ### Examples
@@ -237,7 +257,7 @@ npm test
 
 ## Claude Code integration
 
-[`skills/`](skills/) ships 10 skills, installed into `~/.claude/skills/` by `install.sh` or supplied by the [plugin](#from-the-plugin-marketplace-claude-code) (where they are namespaced: `/wt:wt-review`). They let a session in the dev (main) checkout throw work at a worktree, and let the worktree session review, land and clean up on its own. The two sides can talk while the work is in flight.
+[`skills/`](skills/) ships 11 skills, installed into `~/.claude/skills/` by `install.sh` or supplied by the [plugin](#from-the-plugin-marketplace-claude-code) (where they are namespaced: `/wt:wt-review`). They let a session in the dev (main) checkout throw work at a worktree, and let the worktree session review, land and clean up on its own. The two sides can talk while the work is in flight.
 
 A skill is not always a lone `SKILL.md`. `/wt-review` bundles the review page's HTML template and its renderer under [`skills/wt-review/assets/`](skills/wt-review/assets/), which is why `install.sh` copies each skill directory whole.
 
@@ -251,6 +271,7 @@ A skill is not always a lone `SKILL.md`. `/wt-review` bundles the review page's 
 | `/wt-merge` | worktree | On GitHub repos: `scripts/check` → push → open a PR with `Fixes #N` → if the approval gate has passed, wait for CI, `gh pr merge --merge`, and delete the remote branch (without it, stops at the PR). Without a remote: merges its own branch into the main checkout's current branch (reports conflicts and stops) |
 | `/wt-clean` | worktree | Verifies nothing is uncommitted and the work has landed (PR merged, or merged into the main checkout), then removes its own worktree and closes the workspace |
 | `/wt-ask <message>` | both | Resolves the other session's address via `wt peers`, sends a question or status report, and waits for the reply |
+| `/wt-loop` | dev | Runs labelled issues to merge unattended via `wt loop`: shows the targets with `--dry-run`, starts the driver in the background, watches it, stops it ([Unattended loop](#unattended-loop-wt-loop)) |
 | `worktree-parallel` | both | Policy for choosing between `wt` and native worktrees, plus the `.worktreeinclude` contract ([skills/worktree-parallel/SKILL.md](skills/worktree-parallel/SKILL.md)) |
 | `local-artifact` | both | Contract for building HTML with the same design rules as Artifacts but publishing locally instead of to claude.ai. `/wt-review` no longer loads it — its template already carries the skeleton, theme toggle and mermaid |
 
@@ -270,6 +291,42 @@ Task = issue = branch (`worktree-42-fix-login-validation`) = PR, one-to-one, and
 worktree: (implement, commit) -> /wt-review -> (you review and approve) -> /wt-merge -> /wt-clean
            -> work lands on the main branch; worktree, workspace and branch disappear
 ```
+
+### Unattended loop (wt loop)
+
+In the flow above a human approves the review, decides the merge and moves on to the next issue. `wt loop` hands those to a bash driver ([`wt-loop`](wt-loop)) and runs labelled issues to merge with nobody watching.
+
+```
+wt loop (dev side, bash)
+  pick issue → create worktree (from origin/<default>)
+  → worker:   claude -p (implement + commit; cannot push)
+  → clean tree? → merge origin/<default> → scripts/check
+  → reviewer: claude -p (diff + issue body + criteria → PASS / FAIL)
+  → push → PR (Fixes #N) → wait for CI → gh pr merge → delete remote branch → pull main checkout → wt rm
+  → next issue
+```
+
+Claude only does two things, "implement" and "judge", each in its own headless (`claude -p`) session. The reviewer gets nothing but the diff, the issue body and the criteria (the author never grades its own work). Minor-only findings pass; blocker / major fail; when in doubt, fail.
+
+Whatever fails (uncommitted changes / merge conflict / `scripts/check` / review FAIL / CI) is fed back to the same worker session with `--resume` as the next round. Past the round limit (`--max-rounds`, default 3), when the worker opens its final report with `BLOCKED:` (needs production access, a human decision, a missing tool), when push or merge is refused, or when CI does not finish within `WT_LOOP_CI_TIMEOUT` (default 1800 s), the driver labels the issue `needs-human`, comments why (with the worktree and state paths) and moves on. The worktree stays: fix the cause, drop the label and run `wt loop <N>` with the number, and the driver reuses the worktree and the session to carry on. If the worker dies right after starting (under `WT_LOOP_INFRA_SECS`, default 60 s) that is treated as a usage limit or API outage rather than a failed task: the issue is marked `failed` and the whole loop stops instead of parking the entire queue as `needs-human`.
+
+**Permission settings are left alone.** The worker runs with `--permission-mode acceptEdits` plus an allowlist (git, test runners, package managers, read-only shell commands; `bash` / `sh` and `gh` are deliberately absent; extend with `WT_LOOP_EXTRA_TOOLS`, replace with `WT_LOOP_ALLOWED_TOOLS`). Headless `--permission-mode auto` refuses writes, so it is not used.
+
+**The worker cannot push.** That is not enforced by permission rules (which `git -C` or `bash -c` slip past) but by an environment only the worker process sees: git's `url.<bogus path>.pushInsteadOf` is injected through `GIT_CONFIG_*` variables, so a push by remote name, via `-C`, or to an explicit URL is rewritten to a nonexistent path and fails (fetch / pull still work). Because `git -c` or a `GIT_CONFIG_COUNT` override could undo the environment, a `git` shim at the front of the worker's PATH also refuses `push` / `send-pack` and any `-c` that overrides `alias.*`, `remote.*.pushurl`, `url.*`, `credential.*` or `core.hooksPath`, delegating everything else to the real git. `GH_CONFIG_DIR` points at an empty directory, leaving `gh` unauthenticated (`gh pr merge` and friends fail). Code the worker wrote and the driver later runs gets the same treatment: `scripts/check` runs inside the same sandbox, the driver's own git operations (merge / push / pull) run with `core.hooksPath=/dev/null` so hooks in the worktree never fire, and if the shared `.git/config` differs before and after a worker run (a `pushurl` or `hooksPath` set by the worker, say) the issue is parked as `needs-human` instead of landed.
+
+This stops a worker that helpfully pushes. It does not stop a deliberate bypass: with `Bash(git *)` allowed, the worker can call the real git by absolute path, rebuild its environment, or run arbitrary shell through `git -c alias.x='!…'`. If you need to defend against a hostile worker, do it outside this driver, at the network or credential layer. Push, PR and merge are done by the driver with its own git / gh.
+
+Target selection:
+
+- issue numbers on the command line, or else open issues carrying the `wt-loop` label (`--label` to change; created if missing)
+- skipped: `needs-human` label, CLOSED, unmet dependencies. An issue that already has a `worktree-<N>-*` branch is skipped as in-progress when selecting by label, and resumed (worktree and session reused) when named explicitly
+- a parent issue with a `## 子タスク` checklist is expanded into its children, and only children whose "（#M のあと）" dependencies are CLOSED are taken (same notation as `/wt-split`). A child named or labelled on its own gets the same dependency check through the `親 issue: #P` line in its body. The parent itself is never closed
+- one issue at a time. After a pass that merged something the driver re-selects, so children unblocked by that merge are picked up in the same run. `--max-issues` caps the run; `wt loop --stop` ends it at the next boundary (right after a claude call, before push, between issues)
+- a second `wt loop` on the same repo refuses to start (lock)
+
+State lives in `~/.cache/wt/loop/<repo>-<key>/<N>/` (`WT_LOOP_STATE` to relocate): per-round worker prompt and output, reviewer JSON, `scripts/check` log, diff, session id, PR URL. Progress is appended to `loop.log` next to them. `wt loop status` lists each issue's state (`running` / `merged` / `needs-human` / `stopped` / `failed`).
+
+Requires `gh` (authenticated), `jq` and `claude`. "no checks reported" is treated as "checks not registered yet" in a repo that has `.github/workflows` (the driver keeps waiting up to the CI timeout); only a repo without workflows is merged on the strength of the local `scripts/check` after one re-check. A repo with no `scripts/check` has no gate at all, so add one before putting it on the loop ([Pre-merge check](#pre-merge-check-scriptscheck)).
 
 ### Guarding the main checkout (hook)
 
@@ -334,6 +391,7 @@ Sessions started by older versions of Claude Code do not appear in the peer regi
 ```bash
 scripts/check     # shellcheck + manifest validation + tests — the same gate wt merge and CI run
 tests/wt_test.sh  # 34 tests; needs only git and coreutils (no bats)
+tests/loop_test.sh # wt loop: stubs claude and gh, real git against a bare origin for push / merge / pull (needs jq)
 ```
 
 `scripts/check` runs `claude plugin validate .` when the `claude` CLI is around, so a broken `.claude-plugin/` manifest fails before it reaches the marketplace. It also byte-compiles the bundled python (`skills/wt-review/assets/render.py` and `wt-review-serve.py`) when `python3` is present; both stick to the standard library, so there is no linter to add. The plugin entries deliberately carry no `version`: setting one pins the plugin until you bump the string, and users would stop receiving commits pushed to `main`.

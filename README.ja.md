@@ -101,7 +101,11 @@ wt new <task> [--base <ref>] [--no-claude] [--prompt <text>|--prompt-file <path>
     本文の先頭（空白・改行を除く）が / ! # @ なら Claude Code が
     slash command / bash / memory / file mention として解釈するため拒否する。
     claude には既定で --model opus --permission-mode auto を渡す
-    （WT_CLAUDE_ARGS で差し替え、空文字でフラグ無し。空白を含む値は不可）
+    （WT_CLAUDE_ARGS で差し替え、空文字でフラグ無し。空白を含む値は不可）。
+    Claude Code の起動・プロンプト投入に失敗しても worktree / workspace は残し、
+    herdr の error.code ごとの次の手（agent_not_ready なら pane で信頼ダイアログを
+    承認し、herdr agent prompt claude-<task> … で再投入。それ以外は herdr の出力を
+    そのまま表示）と wt open <task> / wt rm <task> を案内する
 
 wt bootstrap [<path>]
     既存 worktree に、gitignore されて入らないファイルを補完する。

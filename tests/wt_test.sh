@@ -378,6 +378,24 @@ case "$cmd" in
     shift 2
     : >"$HERDR_ARGV_LOG"
     for a in "$@"; do printf '%s\n' "$a" >>"$HERDR_ARGV_LOG"; done
+    # HERDR_STUB_START_FAIL=<code> で server エラー (JSON on stderr + exit 1) を、
+    # =raw で JSON でない失敗 (CLI 構文エラー相当) を再現する。
+    case "${HERDR_STUB_START_FAIL:-}" in
+      "") ;;
+      raw)
+        printf 'error: unexpected argument found\n' >&2
+        exit 2
+        ;;
+      agent_not_ready)
+        printf '{"error":{"code":"agent_not_ready","message":"agent %s is blocked during startup and is not ready for prompts"},"id":"cli:agent:start"}\n' "$1" >&2
+        exit 1
+        ;;
+      *)
+        printf '{"error":{"code":"%s","message":"stub failure for %s"},"id":"cli:agent:start"}\n' \
+          "$HERDR_STUB_START_FAIL" "$1" >&2
+        exit 1
+        ;;
+    esac
     ;;
   "agent prompt")
     shift 2
@@ -450,11 +468,86 @@ STUB
     HERDR_PROMPT_LOG="$PLOG21F" HERDR_STUB_PROMPT_FAIL=1 \
     PATH="$TMP/bin:$SAFE_PATH" "$WT" new p21f --prompt "hi" 2>&1)"
   rc=$?
-  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'herdr agent prompt'; then
-    pass "stub: agent prompt 失敗時は die して再投入コマンドを案内する"
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'herdr agent prompt' &&
+    printf '%s' "$out" | grep -q 'wt rm p21f'; then
+    pass "stub: agent prompt 失敗時は die して再投入コマンドと破棄の仕方を案内する"
   else
-    fail "stub: agent prompt 失敗時は die して再投入コマンドを案内する (rc=$rc out=$out)"
+    fail "stub: agent prompt 失敗時は die して再投入コマンドと破棄の仕方を案内する (rc=$rc out=$out)"
   fi
+
+  # agent start の失敗は error.code ごとに案内を変える。原因で次の一手が違うため、
+  # 一律の「herdr が古いなら update」では pane を見るまで原因が分からない。
+  # 非 0 で終わり、pattern を全て含み、"!pat" の pattern は含まないことを検査する。
+  assert_start_fail() { # desc rc out pattern...
+    local desc="$1" rc="$2" out="$3" p ok=1
+    shift 3
+    [ "$rc" -ne 0 ] || ok=0
+    for p in "$@"; do
+      case "$p" in
+        "!"*) printf '%s' "$out" | grep -qF -- "${p#!}" && ok=0 ;;
+        *) printf '%s' "$out" | grep -qF -- "$p" || ok=0 ;;
+      esac
+    done
+    if [ "$ok" -eq 1 ]; then pass "$desc"; else fail "$desc (rc=$rc out=$out)"; fi
+  }
+  start_fail_out() { # task code [wt new の追加引数...]
+    local t="$1" code="$2"
+    shift 2
+    (cd "$R21" && env -u WT_HOME -u WT_CLAUDE_ARGS HOME="$TMP/home" \
+      HERDR_ARGV_LOG="$TMP/agent-argv-$t.log" HERDR_PROMPT_LOG="$TMP/agent-prompt-$t" \
+      HERDR_STUB_START_FAIL="$code" PATH="$TMP/bin:$SAFE_PATH" "$WT" new "$t" "$@" 2>&1)
+  }
+
+  # agent_not_ready: Claude Code が信頼ダイアログ等で止まっている。pane で承認する以外に
+  # 前進できないので、原因・workspace / pane・承認後のプロンプト再投入コマンドを出す
+  out="$(start_fail_out p21g agent_not_ready --prompt "hi")"
+  rc=$?
+  assert_start_fail "stub: agent_not_ready は信頼ダイアログが原因と示し、pane で承認させる" \
+    "$rc" "$out" 'agent_not_ready' 'Is this a project you created or one you trust?' \
+    'ws-stub' 'ws-stub:p1' '!herdr update'
+  assert_start_fail "stub: agent_not_ready は承認後の初期プロンプト再投入コマンドを示す" \
+    "$rc" "$out" 'herdr agent prompt claude-p21g'
+  assert_start_fail "stub: agent_not_ready でも残した worktree の入り直し方 / 破棄の仕方を示す" \
+    "$rc" "$out" 'wt open p21g' 'wt rm p21g'
+  assert_dir "$R21/.claude/worktrees/p21g" "stub: 起動失敗でも worktree は残す"
+  if [ -e "$TMP/agent-prompt-p21g.text" ]; then
+    fail "stub: agent start 失敗後は agent prompt を投げない"
+  else
+    pass "stub: agent start 失敗後は agent prompt を投げない"
+  fi
+
+  # --prompt-file 経路の再投入はファイルから読み直す形にする (長文を再入力させない)
+  PF21K="$TMP/prompt-p21k.txt"
+  printf 'plan body' >"$PF21K"
+  out="$(start_fail_out p21k agent_not_ready --prompt-file "$PF21K")"
+  rc=$?
+  assert_start_fail "stub: agent_not_ready の再投入は --prompt-file を読み直す" \
+    "$rc" "$out" "herdr agent prompt claude-p21k \"\$(cat $PF21K)\""
+
+  # 初期プロンプトが無ければ再投入の案内は出さない (承認すれば終わり)
+  out="$(start_fail_out p21l agent_not_ready)"
+  rc=$?
+  assert_start_fail "stub: 初期プロンプト無しの agent_not_ready は再投入を案内しない" \
+    "$rc" "$out" 'agent_not_ready' 'ws-stub:p1' 'wt open p21l' '!herdr agent prompt'
+
+  # 未知の error.code: 信頼ダイアログの話を混ぜず、herdr の出力をそのまま見せる
+  out="$(start_fail_out p21h pane_not_found --prompt "hi")"
+  rc=$?
+  assert_start_fail "stub: 未知の error.code は herdr の出力をそのまま見せて pane の確認を促す" \
+    "$rc" "$out" 'pane_not_found' 'stub failure for claude-p21h' 'ws-stub:p1' \
+    'wt open p21h' 'wt rm p21h' '!trust'
+
+  # invalid_agent_argument: argv は wt (WT_CLAUDE_ARGS) が組むので、そこを指す
+  out="$(start_fail_out p21i invalid_agent_argument --prompt "hi")"
+  rc=$?
+  assert_start_fail "stub: invalid_agent_argument は WT_CLAUDE_ARGS を指す" \
+    "$rc" "$out" 'invalid_agent_argument' 'WT_CLAUDE_ARGS' 'wt rm p21i' '!trust'
+
+  # JSON でない失敗 (CLI 構文エラー等) は出力をそのまま添えて落とす
+  out="$(start_fail_out p21j raw --prompt "hi")"
+  rc=$?
+  assert_start_fail "stub: JSON でない失敗は herdr の出力を添える" \
+    "$rc" "$out" 'unexpected argument' 'wt open p21j' 'wt rm p21j' '!trust'
 
   # WT_CLAUDE_ARGS でフラグを差し替える (-n は残る)
   LOG21B="$TMP/agent-argv-b.log"

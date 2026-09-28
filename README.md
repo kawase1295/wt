@@ -102,7 +102,12 @@ wt new <task> [--base <ref>] [--no-claude] [--prompt <text>|--prompt-file <path>
     would read it as a slash command / bash / memory / file mention.
     claude is invoked with --model opus --permission-mode auto by default
     (override via WT_CLAUDE_ARGS; empty string means no flags; values containing
-    spaces are not supported)
+    spaces are not supported).
+    If launching Claude Code or submitting the prompt fails, the worktree and
+    workspace are kept, and the error shows the next step for the herdr
+    error.code (agent_not_ready: approve the trust dialog in the pane, then
+    resubmit with herdr agent prompt claude-<task> ...; other codes: herdr's raw
+    output) plus wt open <task> / wt rm <task>
 
 wt bootstrap [<path>]
     Backfill the gitignored files a worktree did not inherit.

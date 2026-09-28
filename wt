@@ -13,6 +13,9 @@
 #       bash / memory / file mention として解釈するため拒否する。平叙文で始めること
 #       claude には既定で --model opus --permission-mode auto を渡す
 #       (WT_CLAUDE_ARGS で差し替え、空文字でフラグ無し。空白を含む値は不可)
+#       Claude Code の起動・プロンプト投入に失敗しても worktree / workspace は残し、
+#       原因ごとの次の手 (信頼ダイアログの承認、プロンプト再投入) と
+#       wt open <task> / wt rm <task> を案内する
 #   wt bootstrap [<path>]
 #       既存 worktree に gitignore されて入らないファイルを補完する。
 #       Claude Code が作る .claude/worktrees/* にも使える
@@ -347,6 +350,88 @@ prompt_retry_arg() { # prompt_file
   fi
 }
 
+# herdr の失敗出力から error.code を取り出す。herdr は server エラーを JSON で
+# stderr に出すが、CLI 構文エラーや警告は JSON でない行として混ざるので、行ごとに
+# 試して最初に取れた code を返す。取れなければ空を返す。
+herdr_error_code() { # herdr_output
+  local line code
+  while IFS= read -r line; do
+    code="$(jq -re 'if type == "object" then .error.code // empty else empty end' \
+      <<<"$line" 2>/dev/null)" || continue
+    printf '%s' "$code"
+    return 0
+  done <<<"${1:-}"
+}
+
+# 1 行目をエラー、2 行目以降を次の手として出して終了する。案内が長いので
+# 1 行に詰めず、コマンドをそのままコピーできるよう行を分ける。
+die_with_hints() { # message hint...
+  printf '[wt] ERROR: %s\n' "$1" >&2
+  shift
+  local h
+  for h in "$@"; do printf '[wt]   %s\n' "$h" >&2; done
+  exit 1
+}
+
+# 以下の *_hints は呼び出し側が local -a HINTS=() で用意した配列に案内行を足す
+# (bash の動的スコープで呼び出し元の local を参照する)。組み立てた HINTS は
+# die_with_hints に渡して出す。
+
+# herdr の出力を案内行に埋め込む形 (1 行ずつ字下げ) にする。
+herdr_output_hints() { # herdr_output
+  local line
+  HINTS+=("herdr の出力:")
+  while IFS= read -r line; do
+    [ -n "$line" ] && HINTS+=("  $line")
+  done <<<"${1:-}"
+}
+
+# Claude Code の起動系が失敗したとき、作った worktree / workspace は消さずに残す。
+# bootstrap 済みの worktree を捨てるほうが損失が大きく、信頼ダイアログのように
+# pane で承認すればそのまま続けられる失敗があるため。残骸を放置と誤解させない
+# よう、入り直す / 破棄するコマンドを必ず添える。
+leftover_hints() { # task
+  HINTS+=("worktree と workspace は残してある。入り直す: wt open $1 / 破棄する: wt rm $1")
+}
+
+# herdr agent start の失敗を error.code で分けて案内し、終了する。原因で次の一手が
+# 変わるため、一律に herdr update を促さない (典型ケースの信頼ダイアログは pane を
+# 見れば承認で進める)。新しい code への対応はこの case に足す。
+die_agent_start() { # task ws pane herdr_output prompt prompt_file claude_args...
+  local task="$1" ws="$2" pane="$3" start_out="$4" prompt="$5" prompt_file="$6" code
+  shift 6
+  local -a HINTS=()
+  code="$(herdr_error_code "$start_out")"
+  case "$code" in
+    agent_not_ready)
+      # 信頼済みでないディレクトリ (新しい worktree など) では、claude が起動直後の
+      # 信頼ダイアログで止まり、herdr はプロンプトを受け付けない状態として返す。
+      HINTS+=("典型的な原因は起動直後の信頼ダイアログ「Quick safety check: Is this a project you created or one you trust?」")
+      HINTS+=("1. workspace $ws の pane $pane を開いて (wt open $task) ダイアログを承認する")
+      if [ -n "$prompt" ]; then
+        HINTS+=("2. 承認後に初期プロンプトを再投入する: herdr agent prompt claude-$task $(prompt_retry_arg "$prompt_file")")
+      fi
+      leftover_hints "$task"
+      die_with_hints "new: Claude Code がプロンプトを受け付ける状態にならなかった (herdr: agent_not_ready)" "${HINTS[@]}"
+      ;;
+    invalid_agent_argument)
+      # argv は wt が組む (-n wt-<task> + 既定フラグ or WT_CLAUDE_ARGS)。
+      HINTS+=("WT_CLAUDE_ARGS の値を見直す (今回渡した claude の引数: $*)")
+      herdr_output_hints "$start_out"
+      leftover_hints "$task"
+      die_with_hints "new: herdr が claude の起動引数を受け付けなかった (herdr: invalid_agent_argument)" "${HINTS[@]}"
+      ;;
+    *)
+      # code が取れない (JSON でない失敗) / 未知の code は、推測で案内せず
+      # herdr の出力をそのまま見せる。
+      herdr_output_hints "$start_out"
+      HINTS+=("workspace $ws の pane $pane を開いて (wt open $task) 状態を確認する")
+      leftover_hints "$task"
+      die_with_hints "new: Claude Code の起動に失敗した (herdr: ${code:-error.code なし})" "${HINTS[@]}"
+      ;;
+  esac
+}
+
 cmd_new() {
   local task="" base="" start_claude=1 prompt="" prompt_file=""
   while [ $# -gt 0 ]; do
@@ -433,8 +518,11 @@ cmd_new() {
   cmd_bootstrap "$path"
 
   if [ -n "$ws" ] && [ "$start_claude" -eq 1 ]; then
-    [ -n "$pane" ] ||
-      die "new: workspace $ws の root pane を特定できなかった (herdr agent start に渡す pane が必要)"
+    if [ -z "$pane" ]; then
+      local -a HINTS=()
+      leftover_hints "$task"
+      die_with_hints "new: workspace $ws の root pane を特定できなかった (herdr agent start に渡す pane が必要)" "${HINTS[@]}"
+    fi
     # 実行ファイルは --kind が決めるので argv には渡さない。-- 以降が claude の
     # 引数になる。
     # 起動フラグは WT_CLAUDE_ARGS で差し替え可能。単語分割で argv 化するため、
@@ -446,8 +534,11 @@ cmd_new() {
     local -a claude_args=(-n "wt-$task") claude_flags=()
     read -r -a claude_flags <<<"${WT_CLAUDE_ARGS---model opus --permission-mode auto}"
     [ "${#claude_flags[@]}" -gt 0 ] && claude_args+=("${claude_flags[@]}")
-    herdr agent start "claude-$task" --kind claude --pane "$pane" -- "${claude_args[@]}" >/dev/null ||
-      die "new: Claude Code の起動に失敗した (herdr が古い場合は herdr update)"
+    # 失敗時の案内は herdr の出力 (JSON on stderr) で分けるので捨てずに拾う。
+    local start_out
+    start_out="$(herdr agent start "claude-$task" --kind claude --pane "$pane" \
+      -- "${claude_args[@]}" 2>&1)" ||
+      die_agent_start "$task" "$ws" "$pane" "$start_out" "$prompt" "$prompt_file" "${claude_args[@]}"
     # prompt は argv ではなく agent prompt で投げる。herdr 0.8 は agent 引数を
     # target shell 向けにエンコードするため、改行を含む argv を
     # invalid_agent_argument で拒む。agent prompt は本文をそのまま提出でき、
@@ -456,8 +547,11 @@ cmd_new() {
     # 追加の待機なしにそのまま投げてよい。--wait は状態遷移の観測に依存して
     # 誤って timeout することがあるため使わない。
     if [ -n "$prompt" ]; then
-      herdr agent prompt "claude-$task" "$prompt" >/dev/null ||
-        die "new: 初期プロンプトの投入に失敗した (worktree と Claude は作成済み)。再投入: herdr agent prompt claude-$task $(prompt_retry_arg "$prompt_file")"
+      if ! herdr agent prompt "claude-$task" "$prompt" >/dev/null; then
+        local -a HINTS=("再投入: herdr agent prompt claude-$task $(prompt_retry_arg "$prompt_file")")
+        leftover_hints "$task"
+        die_with_hints "new: Claude Code は起動したが、初期プロンプトの投入に失敗した" "${HINTS[@]}"
+      fi
     fi
     herdr workspace focus "$ws" >/dev/null
     log "Claude Code を workspace $ws で起動した"

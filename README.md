@@ -162,11 +162,14 @@ wt rm [<task>] [--force]
 
 wt loop [<issue>...] [--label <name>] [--max-issues <n>] [--max-rounds <n>] [--dry-run]
 wt loop --stop / wt loop status
+wt loop doctor [--label <name>] [--fix-labels]
     Drive labelled (default: wt-loop) open issues to merge with no human in the
     loop: worktree → headless claude implements → scripts/check → a separate
     AI reviewer → PR → CI → merge → cleanup → next issue. A failed step is fed
     back to the same worker (up to --max-rounds); past that the issue is
-    parked with a needs-human label and the loop moves on. See "Unattended loop"
+    parked with a needs-human label and the loop moves on. wt loop doctor
+    checks the repo can go on the loop (wt loop runs the same check first
+    and refuses to start on any NG). See "Unattended loop"
 ```
 
 ### Examples
@@ -316,9 +319,11 @@ Whatever fails (uncommitted changes / merge conflict / `scripts/check` / review 
 
 This stops a worker that helpfully pushes. It does not stop a deliberate bypass: with `Bash(git *)` allowed, the worker can call the real git by absolute path, rebuild its environment, or run arbitrary shell through `git -c alias.x='!…'`. If you need to defend against a hostile worker, do it outside this driver, at the network or credential layer. Push, PR and merge are done by the driver with its own git / gh.
 
+Before putting a repo on the loop, run `wt loop doctor`. It checks the main checkout and prints one `OK` / `NG` line per item, with the fix for each NG: `scripts/check` is executable / `.github/workflows/ci.yml` exists / `.claude/worktrees/` is ignored / `gh` is authenticated and the default branch resolves / labels `wt-loop` (or `--label`) and `needs-human` exist / the main checkout sits clean (no tracked changes) on the default branch / the `claude` CLI is on PATH. Any NG exits 1. `wt loop` runs the same check before starting and refuses on any NG; `--dry-run` prints the diagnosis and still lists the targets (exiting 1 on NG). `wt loop doctor --fix-labels` creates missing labels and nothing else — it never touches repo files.
+
 Target selection:
 
-- issue numbers on the command line, or else open issues carrying the `wt-loop` label (`--label` to change; created if missing)
+- issue numbers on the command line, or else open issues carrying the `wt-loop` label (`--label` to change; create it with `wt loop doctor --fix-labels`)
 - skipped: `needs-human` label, CLOSED, unmet dependencies. An issue that already has a `worktree-<N>-*` branch is skipped as in-progress when selecting by label, and resumed (worktree and session reused) when named explicitly
 - a parent issue with a `## 子タスク` checklist is expanded into its children, and only children whose "（#M のあと）" dependencies are CLOSED are taken (same notation as `/wt-split`). A child named or labelled on its own gets the same dependency check through the `親 issue: #P` line in its body. The parent itself is never closed
 - one issue at a time. After a pass that merged something the driver re-selects, so children unblocked by that merge are picked up in the same run. `--max-issues` caps the run; `wt loop --stop` ends it at the next boundary (right after a claude call, before push, between issues)

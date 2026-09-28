@@ -18,7 +18,7 @@ description: ラベル付き issue を人間の操作なしに worktree → head
 ## 手順（起動）
 
 1. `gh repo view --json nameWithOwner` が失敗する repo では使えない。その旨を伝えて止まる。
-2. まず `wt loop --dry-run <引数>` を実行し、対象の一覧と飛ばした理由をユーザーに見せる。対象が無ければそこで終わる。対象があれば起動に進む（確認は求めない — ループの停止は `/wt-loop stop` でいつでもできる）。
+2. まず `wt loop --dry-run <引数>` を実行し、起動前の診断（`wt loop doctor` と同じ検査）と対象の一覧・飛ばした理由をユーザーに見せる。診断に `NG` がある（exit 1）なら起動しない — `NG` 行の直し方を示して止まる（ラベルが無いだけなら `wt loop doctor --fix-labels` で作れる、と添える。他の項目は repo の変更なのでユーザーに任せる）。対象が無ければそこで終わる。対象があれば起動に進む（確認は求めない — ループの停止は `/wt-loop stop` でいつでもできる）。
 3. `wt loop <引数>` を Bash tool の `run_in_background` で起動する（数時間かかる。foreground で待たない）。標準出力・標準エラーは Bash tool の出力ファイルに残る。
 4. 進捗は state ディレクトリの `loop.log` に追記される。パスは `--dry-run` と起動直後の出力にある `state: <path>` の行から取る。Monitor tool で `tail -f <path>/loop.log` し、行動が要る行だけを流す（`grep --line-buffered -E 'マージ完了|needs-human|stopped|failed|終了:|ERROR'`）。
 5. 起動を報告する: 対象 issue、state の場所、止め方（`/wt-loop stop`）。以降は Monitor の通知が届いたときに要点だけ伝える（マージされた PR の URL、needs-human に切り出された issue とその理由、`failed` で loop が止まったこと）。

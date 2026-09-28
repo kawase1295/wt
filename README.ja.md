@@ -110,7 +110,8 @@ wt new <task> [--base <ref>] [--no-claude] [--prompt <text>|--prompt-file <path>
       それ以外・code なし     herdr の出力をそのまま表示
     初期プロンプトは worktree の git ディレクトリに wt-initial-prompt.txt として
     退避し、再投入コマンドはそこから読む。呼び出し元が --prompt-file を消しても
-    使える（wt rm で一緒に消える）
+    使える（wt rm で一緒に消える）。このファイルは「初期プロンプト未投入」の目印を
+    兼ね（issue-board と共有）、再投入コマンドは投入に成功したときだけ消す
 
 wt bootstrap [<path>]
     既存 worktree に、gitignore されて入らないファイルを補完する。

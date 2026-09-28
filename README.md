@@ -112,7 +112,9 @@ wt new <task> [--base <ref>] [--no-claude] [--prompt <text>|--prompt-file <path>
       other / no code         herdr's raw output
     The initial prompt is saved as wt-initial-prompt.txt in the worktree's git
     directory, and the resubmit command reads it from there, so it still works
-    after the caller deletes its --prompt-file (removed together by wt rm)
+    after the caller deletes its --prompt-file (removed together by wt rm).
+    The file doubles as the "initial prompt not yet delivered" marker (shared
+    with issue-board); the resubmit command deletes it only on success
 
 wt bootstrap [<path>]
     Backfill the gitignored files a worktree did not inherit.

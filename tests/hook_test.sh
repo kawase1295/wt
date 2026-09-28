@@ -8,6 +8,11 @@
 # git 状態に依存するため、temp repo を作って検証する。
 set -uo pipefail
 
+# wt loop の sandbox (push 禁止の GIT_CONFIG_* / 無認証の GH_CONFIG_DIR) の中で
+# scripts/check として走らされても、外の環境に左右されないよう最初に隔離する。
+# テストが必要とする環境は各ヘルパーが明示的に組み立てる。
+unset GIT_CONFIG_COUNT GH_CONFIG_DIR GIT_TERMINAL_PROMPT
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOOK="$ROOT/hooks/main-checkout-guard.sh"
 

@@ -153,6 +153,14 @@ wt merge [<task>] [--no-check]
 wt rm [<task>] [--force]
     worktree / workspace / ブランチを削除する（未コミット変更があれば中断）。
     worktree 内から task 省略で自分を片付けられる
+
+wt loop [<issue>...] [--label <name>] [--max-issues <n>] [--max-rounds <n>] [--dry-run]
+wt loop --stop / wt loop status
+    ラベル付き（既定 wt-loop）の open issue を、人間の操作なしに
+    worktree 作成 → headless claude で実装 → scripts/check → 別セッションの AI レビュー
+    → PR → CI → マージ → 片付け → 次の issue、と回す driver。落ちた工程は同じ worker に
+    渡して再試行（上限 --max-rounds）、超えたら needs-human ラベルで切り出して次へ進む。
+    詳細は「無人ループ」の節
 ```
 
 ### 例
@@ -243,7 +251,7 @@ npm test
 
 ## Claude Code 連携
 
-[`skills/`](skills/) に 10 の skill を同梱しており、`install.sh` が `~/.claude/skills/` に配置する（[plugin](#plugin-マーケットプレイス経由claude-code) 経由なら plugin 側が供給し、名前は `/wt:wt-review` のようにプレフィックスが付く）。dev（本体 checkout）側のセッションから作業を worktree に投げ、worktree 側のセッションでレビュー・取り込み・片付けを完結させる。作業中は両者が直接会話できる。
+[`skills/`](skills/) に 11 の skill を同梱しており、`install.sh` が `~/.claude/skills/` に配置する（[plugin](#plugin-マーケットプレイス経由claude-code) 経由なら plugin 側が供給し、名前は `/wt:wt-review` のようにプレフィックスが付く）。dev（本体 checkout）側のセッションから作業を worktree に投げ、worktree 側のセッションでレビュー・取り込み・片付けを完結させる。作業中は両者が直接会話できる。
 
 skill は `SKILL.md` 1 枚に限らない。`/wt-review` はレビューページの HTML テンプレートと生成スクリプトを [`skills/wt-review/assets/`](skills/wt-review/assets/) に同梱している。`install.sh` が skill ディレクトリごとコピーするのはこのため。
 
@@ -257,6 +265,7 @@ skill は `SKILL.md` 1 枚に限らない。`/wt-review` はレビューペー�
 | `/wt-merge` | worktree | GitHub リポジトリでは `scripts/check` → push → `Fixes #N` 付きの PR を作成 → 承認ゲートを通っていれば CI の完了を待って `gh pr merge --merge` → remote ブランチを削除（未通過なら PR 作成で停止）。remote が無ければ本体の現在ブランチへローカルマージ（コンフリクトは報告して停止） |
 | `/wt-clean` | worktree | 未コミットと取り込み状態（PR の MERGED / 本体への未マージ）を検査し、クリーンなら自分の worktree を片付けて workspace を閉じる |
 | `/wt-ask <内容>` | 両方 | `wt peers` で相手セッションの宛先を解決し、質問・報告を送って返答を受ける |
+| `/wt-loop` | dev | ラベル付き issue を `wt loop` で人間の操作なしにマージまで回す。起動（`--dry-run` で対象を見せてから background 起動）・監視・停止（[無人ループ](#無人ループwt-loop)） |
 | `worktree-parallel` | 両方 | `wt` と native worktree の使い分け方針・`.worktreeinclude` の契約（[skills/worktree-parallel/SKILL.md](skills/worktree-parallel/SKILL.md)） |
 | `local-artifact` | 両方 | Artifact と同一の設計規約で HTML を作り、claude.ai に publish せずローカル公開する契約。`/wt-review` はもうロードしない（skeleton・テーマトグル・mermaid をテンプレートが内包しているため） |
 
@@ -276,6 +285,40 @@ worktree 側: (実装・コミット) → /wt-review → (ユーザーがレビ�
 worktree 側: (実装・コミット) → /wt-review → (ユーザーがレビュー・承認) → /wt-merge → /wt-clean
               → 本体に取り込まれ、worktree / workspace / ブランチが消えて閉じる
 ```
+
+### 無人ループ（wt loop）
+
+上のフローは、レビューの承認・マージ判断・次の issue への移行を人間が担う。`wt loop` はそこを bash の driver（[`wt-loop`](wt-loop)）に置き換え、ラベル付きの issue を人間の操作なしにマージまで回す。
+
+```
+wt loop（dev 側、bash）
+  issue 選択 → worktree 作成（origin/<default> から）
+  → worker:   claude -p（実装・コミット。push はできない）
+  → 未コミット無し? → origin/<default> 取り込み → scripts/check
+  → reviewer: claude -p（diff + issue 本文 + 合否基準 → PASS / FAIL）
+  → push → PR（Fixes #N）→ CI 待ち → gh pr merge → remote ブランチ削除 → 本体 pull → wt rm
+  → 次の issue
+```
+
+Claude が担うのは「実装」と「レビュー判定」だけで、どちらも headless（`claude -p`）の別セッション。reviewer には diff と issue 本文と合否基準しか渡さない（書いた本人に合否を判定させない）。minor のみ PASS、blocker / major は FAIL、迷ったら FAIL。
+
+落ちた工程（未コミット / コンフリクト / `scripts/check` / レビュー FAIL / CI）は、その内容を同じ worker セッションに `--resume` で渡して次のラウンドにする。ラウンド上限（`--max-rounds`、既定 3）を超える、worker が最終報告を `BLOCKED:` で始める（本番環境が要る・人間の判断が要る等）、push / merge が拒否される、CI 待ちが上限（`WT_LOOP_CI_TIMEOUT`、既定 1800 秒）に達する、のどれかで issue に `needs-human` ラベルとコメント（理由・worktree・state の場所）を付けて次の issue へ進む。worktree は残るので、原因を直してラベルを外し、`wt loop <N>` と番号で指定すれば、残った worktree と session を再利用して続きから進む。worker が起動直後（`WT_LOOP_INFRA_SECS`、既定 60 秒未満）に異常終了したときは作業の失敗ではなく利用上限や API 障害とみなし、その issue を `failed` にして loop 全体を止める（キュー全体に `needs-human` を付けない）。
+
+**権限設定は変えない。** worker は `--permission-mode acceptEdits` と allowlist（git / テスト / パッケージマネージャ / 読み取り系のシェルコマンド。任意コードを実行できる `bash` / `sh` と `gh` は入れない。`WT_LOOP_EXTRA_TOOLS` で追記、`WT_LOOP_ALLOWED_TOOLS` で差し替え）で動く。headless では `--permission-mode auto` が書き込みを拒否するため使わない。
+
+**worker は push できない。** これは permission ルール（`git -C` や `bash -c` で回避できる）ではなく、worker プロセスだけに効く環境で保証する: git の `url.<無効なパス>.pushInsteadOf` を環境変数（`GIT_CONFIG_*`）で与え、remote 名・`-C`・URL 直指定のどれで push しても存在しないパスへ書き換えて失敗させる（fetch / pull は通る）。あわせて `GH_CONFIG_DIR` を空ディレクトリにして gh を無認証にする（`gh pr merge` 等が失敗する）。push / PR / merge は driver が自分の環境の git / gh で行う。
+
+対象の選び方:
+
+- 引数に番号を並べればそれ、無ければラベル `wt-loop`（`--label` で変更。無ければ作る）付きの open issue
+- `needs-human` ラベル付き、CLOSED、依存が未完了のものは飛ばす。ブランチ `worktree-<N>-*` が既にある issue は、ラベル選択では進行中として飛ばし、番号指定なら残っている worktree と session を再利用して再開する
+- 本文に `## 子タスク` のチェックリストを持つ親 issue は子に展開し、「（#M のあと）」の依存が CLOSED の子だけを対象にする（`/wt-split` の表記と同じ）。子を単体で指定・ラベル付けした場合も、本文の「親 issue: #P」から親を引いて同じ依存判定をする。親自体は閉じない
+- 直列で 1 issue ずつ。1 巡して何かマージできたら選び直し、依存が解けた子を同じ run で拾う。`--max-issues` で件数を区切れる。`wt loop --stop` は次の区切り（claude 呼び出しの直後 / push の前 / issue の間）で止める
+- 同じ repo で 2 本目の `wt loop` は起動できない（lock）
+
+state は `~/.cache/wt/loop/<repo>-<key>/<N>/`（`WT_LOOP_STATE` で変更）に残る: ラウンドごとの worker のプロンプトと出力、reviewer の JSON、`scripts/check` のログ、diff、session id、PR URL。進行は同じ場所の `loop.log` に追記される。`wt loop status` で issue ごとの状態（`running` / `merged` / `needs-human` / `stopped` / `failed`）を一覧できる。
+
+前提: `gh`（認証済み）、`jq`、`claude`。「no checks reported」は、`.github/workflows` がある repo では check の登録待ちとみなして上限まで待ち、無い repo だけ一度待って再確認してから CI 無しと判断する（ローカルの `scripts/check` を根拠にマージ）。`scripts/check` も無い repo はゲート無しになるので、乗せる前に用意する（[マージ前チェック](#マージ前チェックrepo-の-scriptscheck)）。
 
 ### 本体 checkout のガード（hook）
 
@@ -340,6 +383,7 @@ fix-login            wt-fix-login             interactive  idle            /home
 ```bash
 scripts/check     # shellcheck + マニフェスト検査 + テスト。wt merge のゲートと CI が叩くのと同じ入口
 tests/wt_test.sh  # 34 ケース。依存は git と coreutils のみ（bats 不要）
+tests/loop_test.sh # wt loop。claude と gh を stub に差し替え、bare の origin で push / merge / pull を実検証（要 jq）
 ```
 
 `scripts/check` は `claude` CLI があれば `claude plugin validate .` も走らせるので、`.claude-plugin/` のマニフェストが壊れた状態はマーケットプレイスに出る前に落ちる。`python3` があれば同梱 python（`skills/wt-review/assets/render.py` と `wt-review-serve.py`）の構文検査も走らせる。どちらも標準ライブラリだけで書いてあるので linter は入れない。plugin エントリに `version` を意図的に持たせていない点に注意する。付けると値を上げるまでその版に固定され、`main` に push したコミットがユーザーへ届かなくなる。

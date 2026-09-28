@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck wt bin/wt install.sh scripts/check tests/wt_test.sh tests/hook_test.sh hooks/main-checkout-guard.sh
+  shellcheck wt wt-loop bin/wt install.sh scripts/check tests/wt_test.sh tests/hook_test.sh tests/loop_test.sh hooks/main-checkout-guard.sh
 elif [ -n "${CI:-}" ]; then
   echo "[check] ERROR: CI では shellcheck が必須" >&2
   exit 1
@@ -35,3 +35,4 @@ fi
 
 tests/wt_test.sh
 tests/hook_test.sh
+tests/loop_test.sh

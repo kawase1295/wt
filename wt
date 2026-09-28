@@ -354,10 +354,12 @@ save_initial_prompt() { # worktree_path prompt
 
 # 初期プロンプトの再投入コマンド。退避したファイルを絶対パス + %q で指し、
 # 貼ればそのまま動く形にする。退避できなかったときは本文の再入力を促す。
+# 退避ファイルは「初期プロンプト未投入」の目印を兼ねる (issue-board と共有。届けた側が消す)。
+# 投入に成功したときだけ消し、失敗したら残して再投入できるようにする。
 prompt_retry_cmd() { # task saved_prompt_file
   if [ -n "${2:-}" ]; then
     # shellcheck disable=SC2016 # $(cat ...) はユーザーが貼った時点で展開させる
-    printf 'herdr agent prompt claude-%s "$(cat %q)"' "$1" "$2"
+    printf 'herdr agent prompt claude-%s "$(cat %q)" && rm -f %q' "$1" "$2" "$2"
   else
     printf 'herdr agent prompt claude-%s <プロンプト>' "$1"
   fi

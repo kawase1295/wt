@@ -559,13 +559,19 @@ STUB
   rm -r "$TMP/caller-tmp"
   assert_start_fail "stub: agent_not_ready の再投入は呼び出し元の一時ファイルを指さない" \
     "$rc" "$out" 'herdr agent prompt claude-p21k' "!$TMP/caller-tmp"
-  assert_retry_delivers "stub: prompt ファイルを消した後でも再投入コマンドで原文が届く" \
-    "$out" "$ML21"
   assert_eq "stub: 退避したプロンプトは作業ツリーに置かない" "" \
     "$(git -C "$R21/.claude/worktrees/p21k" status --porcelain --ignored | grep wt-initial-prompt)"
   # 本文は非公開 repo の issue 本文を含みうるので、呼び出し元 (issue-board は 0600) より緩めない
   assert_eq "stub: 退避したプロンプトは所有者だけが読める (0600)" "600" \
     "$(stat -c %a "$(git -C "$R21/.claude/worktrees/p21k" rev-parse --absolute-git-dir)/wt-initial-prompt.txt")"
+  # 退避ファイルは issue-board と共有する「初期プロンプト未投入」の目印。届けた側が消す
+  SAVED21K="$(git -C "$R21/.claude/worktrees/p21k" rev-parse --absolute-git-dir)/wt-initial-prompt.txt"
+  env HERDR_STUB_PROMPT_FAIL=1 PATH="$TMP/bin:$SAFE_PATH" bash -c "$(retry_cmd_of "$out")" >/dev/null 2>&1
+  assert_file "$SAVED21K" "stub: 再投入が失敗したら退避ファイル (目印) は残す"
+  assert_retry_delivers "stub: prompt ファイルを消した後でも再投入コマンドで原文が届く" \
+    "$out" "$ML21"
+  assert_eq "stub: 再投入に成功したら退避ファイル (目印) を消す" "gone" \
+    "$([ -e "$SAVED21K" ] && echo present || echo gone)"
 
   # 初期プロンプトが無ければ再投入の案内は出さない (承認すれば終わり)
   out="$(start_fail_out p21l agent_not_ready)"

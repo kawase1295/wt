@@ -546,14 +546,15 @@ EOF
 
 # 再開時の引き継ぎ: 前回から issue で起きたこと (本文の更新・エスカレーション後の
 # 人間の回答) を Markdown で出す。無ければ空。worker は gh が無認証で読めないので
-# driver が渡す。issue.body.md と handoff-at を更新し、次の再開では新しい分だけを出す。
+# driver が渡す。issue.body.md / handoff-at の新しい値は *.pending に置くだけにし、
+# worker が正常終了してから commit_handoff で確定する (直後に落ちたら次の再開で渡し直す)。
 resume_handoff() { # number sdir fresh_json (body,comments)
   local sdir="$2" j="$3" new_body esc ho comments
   new_body="$(jq -r '.body // ""' <<<"$j")"
   if [ -f "$sdir/issue.body.md" ] && [ "$new_body" != "$(cat "$sdir/issue.body.md")" ]; then
     printf '### issue 本文の更新\n\n前回の run のあとで issue 本文が更新された。新しい本文の全文:\n\n%s\n\n' "$new_body"
   fi
-  printf '%s\n' "$new_body" >"$sdir/issue.body.md"
+  printf '%s\n' "$new_body" >"$sdir/issue.body.md.pending"
   esc="$(cat "$sdir/escalated-at" 2>/dev/null || true)"
   [ -n "$esc" ] || return 0
   ho="$(cat "$sdir/handoff-at" 2>/dev/null || true)"
@@ -564,7 +565,14 @@ resume_handoff() { # number sdir fresh_json (body,comments)
   [ "$(jq length <<<"$comments")" -gt 0 ] || return 0
   printf '### 人間からの回答\n\nエスカレーションのあとで issue に付いたコメント。これを踏まえて進めること。\n\n'
   jq -r '.[] | "#### \(.author.login // "unknown")（\(.createdAt)）\n\n\(.body)\n"' <<<"$comments"
-  jq -r '.[-1].createdAt' <<<"$comments" >"$sdir/handoff-at"
+  jq -r '.[-1].createdAt' <<<"$comments" >"$sdir/handoff-at.pending"
+}
+
+commit_handoff() { # sdir
+  local f
+  for f in issue.body.md handoff-at; do
+    [ ! -f "$1/$f.pending" ] || mv "$1/$f.pending" "$1/$f"
+  done
 }
 
 # 最終報告が BLOCKED: で始まるか (太字や見出し記号が前に付いていても拾う)
@@ -593,8 +601,11 @@ run_issue() { # number title
     wt_path="$(worktree_path_of "$branch")"
     log "#$n $title → 再開 (worktree $task、前回の status: $(cat "$sdir/status" 2>/dev/null || echo 不明))"
     # 人間の回答 (コメント) と本文の更新を拾うため、issue を取り直す
+    rm -f "$sdir/issue.body.md.pending" "$sdir/handoff-at.pending"
     if fresh="$(gh_main issue view "$n" --json body,comments 2>/dev/null)"; then
       handoff="$(resume_handoff "$n" "$sdir" "$fresh")"
+      # 渡すものが無ければ失うものも無いので、すぐ確定する
+      [ -n "$handoff" ] || commit_handoff "$sdir"
       body="$(jq -r '.body // ""' <<<"$fresh")"
     else
       log "#$n: issue のコメントを取得できない。引き継ぎなしで再開する"
@@ -647,8 +658,8 @@ $(tail -5 "$sdir/log")"
     else
       {
         worker_prompt_retry "$round" "$feedback"
-        # 引き継ぎは再開直後のラウンドだけ (同じ session には以降も会話に残っている)
-        [ "$round" -gt 1 ] || [ -z "$handoff" ] || printf '\n## 前回からの引き継ぎ\n\n%s\n' "$handoff"
+        # 引き継ぎは worker が一度正常終了するまで付ける (以降は同じ session の会話に残っている)
+        [ -z "$handoff" ] || printf '\n## 前回からの引き継ぎ\n\n%s\n' "$handoff"
       } >"$prompt"
       log "#$n round $round: worker 再開 (--resume)"
       run_sandboxed "$wt_path" "$prompt" "$out" "$WORKER_TIMEOUT" \
@@ -670,6 +681,11 @@ $(tail -5 "$sdir/log")"
       fi
     fi
     elapsed=$((SECONDS - t0))
+    # 引き継ぎが worker に届いたので確定する
+    if [ -n "$handoff" ] && envelope_ok "$out"; then
+      commit_handoff "$sdir"
+      handoff=""
+    fi
     # worktree の .git/config は本体と共有される。worker が書き換えていたら (pushurl /
     # hooksPath / credential 等)、driver の git 操作に影響するので進めず人に返す
     local config_diff

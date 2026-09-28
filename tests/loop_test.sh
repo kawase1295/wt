@@ -791,6 +791,38 @@ assert_not_contains "handoff: 既出の回答を重複して渡さない" "$p3" 
 assert_not_contains "handoff: 本文が変わっていなければ本文更新を渡さない" "$p3" "### issue 本文の更新"
 assert_eq "handoff: handoff-at を進める" "2099-01-02T00:00:00Z" "$(cat "$sd/handoff-at" 2>/dev/null)"
 assert_eq "handoff: 完走して merged" "merged" "$(cat "$sd/status" 2>/dev/null)"
+# 引き継ぎを渡した worker が直後に落ちた (failed) ときは、引き継ぎを確定させず次の再開で渡し直す
+make_fixture t15d
+add_issue 133 "Handoff retry" OPEN "wt-loop" "元の本文"
+cat >"$CLAUDE_STUB_DIR/step-1.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"BLOCKED: 判断が要る"}'
+EOF
+chmod +x "$CLAUDE_STUB_DIR/step-1.sh"
+out="$(loop)"
+sd="$(state_dir 133)"
+add_comment 133 alice "2099-01-01T00:00:00Z" "落ちても消えない答え"
+set_issue 133 '.body = "直した本文" | .labels = [{"name":"wt-loop"}]'
+cat >"$CLAUDE_STUB_DIR/step-2.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "usage limit reached" >&2
+exit 1
+EOF
+chmod +x "$CLAUDE_STUB_DIR/step-2.sh"
+out="$(INFRA_SECS=60 loop 133)"
+assert_eq "handoff 失敗: worker が起動直後に落ちたら failed" "failed" "$(cat "$sd/status" 2>/dev/null)"
+assert_contains "handoff 失敗: 落ちた回にも回答を渡している" "$(cat "$CLAUDE_STUB_DIR/prompt-2.txt")" "落ちても消えない答え"
+assert_eq "handoff 失敗: handoff-at を進めない" "" "$(cat "$sd/handoff-at" 2>/dev/null)"
+assert_eq "handoff 失敗: 保存した本文を進めない" "元の本文" "$(cat "$sd/issue.body.md" 2>/dev/null)"
+worker_step 3 a.txt finished
+reviewer_step 4 PASS ok '[]'
+out="$(loop 133)"
+p3="$(cat "$CLAUDE_STUB_DIR/prompt-3.txt")"
+assert_contains "handoff 失敗: 次の再開で回答を渡し直す" "$p3" "落ちても消えない答え"
+assert_contains "handoff 失敗: 次の再開で本文更新を渡し直す" "$p3" "直した本文"
+assert_eq "handoff 失敗: 正常終了したら handoff-at を確定する" "2099-01-01T00:00:00Z" "$(cat "$sd/handoff-at" 2>/dev/null)"
+assert_eq "handoff 失敗: 正常終了したら本文を確定する" "直した本文" "$(cat "$sd/issue.body.md" 2>/dev/null)"
+assert_eq "handoff 失敗: 完走して merged" "merged" "$(cat "$sd/status" 2>/dev/null)"
 
 # --- test 16: ラベル付きの子 issue も依存判定を受ける (一覧は新しい順) ----------
 make_fixture t16

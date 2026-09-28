@@ -319,7 +319,7 @@ repo をループに乗せる前に `wt loop doctor` を実行する。本体 ch
 - 引数に番号を並べればそれ、無ければラベル `wt-loop`（`--label` で変更。無ければ `wt loop doctor --fix-labels` で作る）付きの open issue
 - `needs-human` ラベル付き、CLOSED、依存が未完了のものは飛ばす。ブランチ `worktree-<N>-*` が既にある issue は、ラベル選択では進行中として飛ばし、番号指定なら残っている worktree と session を再利用して再開する
 - 本文に `## 子タスク` のチェックリストを持つ親 issue は子に展開し、「（#M のあと）」の依存が CLOSED の子だけを対象にする（`/wt-split` の表記と同じ）。子を単体で指定・ラベル付けした場合も、本文の「親 issue: #P」から親を引いて同じ依存判定をする。親自体は閉じない
-- 直列で 1 issue ずつ。1 巡して何かマージできたら選び直し、依存が解けた子を同じ run で拾う。`--max-issues` で件数を区切れる。`wt loop --stop` は次の区切り（claude 呼び出しの直後 / push の前 / issue の間）で止める
+- 直列で 1 issue ずつ。1 巡して何かマージできたら選び直し、依存が解けた子を同じ run で拾う。番号指定でも同じで、`wt loop <親>` は同じ番号から選び直して子を依存順にすべて回す（この run でマージ済みと CLOSED は除外されるので、単体の番号だけなら 1 巡で終わる）。`--max-issues` で件数を区切れる。`wt loop --stop` は次の区切り（claude 呼び出しの直後 / push の前 / issue の間）で止める
 - 同じ repo で 2 本目の `wt loop` は起動できない（lock）
 
 state は `~/.cache/wt/loop/<repo>-<key>/<N>/`（`WT_LOOP_STATE` で変更）に残る: ラウンドごとの worker のプロンプトと出力、reviewer の JSON、`scripts/check` のログ、diff、session id、PR URL。進行は同じ場所の `loop.log` に追記される。`wt loop status` で issue ごとの状態（`running` / `merged` / `needs-human` / `stopped` / `failed`）を一覧できる。

@@ -770,6 +770,47 @@ out="$(loop)"
 unset GH_STUB_NO_AUTOCLOSE
 assert_contains "reselect: Fixes で閉じなくても明示的に閉じる" "$(cat "$GH_STUB_DIR/gh.log")" "issue close 5"
 assert_contains "reselect: 同じ issue を拾い直さない" "$out" "処理 1 件 / マージ 1 件"
+# 番号指定で親を渡しても、子 A のマージ後に依存の解けた子 B を 2 巡目で拾う
+make_fixture t17c
+add_issue 5 "A" OPEN "" "親 issue: #4"
+add_issue 6 "B" OPEN "" "親 issue: #4"
+add_issue 4 "Parent" OPEN "" "## 子タスク
+- [ ] #5 A
+- [ ] #6 B（#5 のあと）"
+worker_step 1 a.txt v1
+reviewer_step 2 PASS ok '[]'
+worker_step 3 b.txt v1
+reviewer_step 4 PASS ok '[]'
+out="$(loop 4)"
+assert_contains "reselect(番号指定): 1 巡目は #6 を待つ" "$out" "skip #6: 依存 #5 が未完了"
+assert_contains "reselect(番号指定): 2 巡目で #6 を拾う" "$out" "対象 (2 巡目)"
+assert_eq "reselect(番号指定): #6 も merged" "merged" "$(cat "$(state_dir 6)/status" 2>/dev/null)"
+assert_contains "reselect(番号指定): 合計 2 件" "$out" "処理 2 件 / マージ 2 件"
+# 番号指定の親でも --max-issues は効く
+make_fixture t17d
+add_issue 5 "A" OPEN "" "親 issue: #4"
+add_issue 6 "B" OPEN "" "親 issue: #4"
+add_issue 4 "Parent" OPEN "" "## 子タスク
+- [ ] #5 A
+- [ ] #6 B（#5 のあと）"
+worker_step 1 a.txt v1
+reviewer_step 2 PASS ok '[]'
+out="$(loop --max-issues 1 4)"
+assert_contains "reselect(番号指定): --max-issues で止まる" "$out" "--max-issues 1 に達した"
+assert_eq "reselect(番号指定): --max-issues 後は #6 を始めない" "" "$(state_dir 6)"
+# 単体の番号を 2 つ渡したとき、2 巡目で同じ issue を拾い直さない
+make_fixture t17e
+add_issue 5 "A" OPEN "" "x"
+add_issue 6 "B" OPEN "" "x"
+worker_step 1 a.txt v1
+reviewer_step 2 PASS ok '[]'
+worker_step 3 b.txt v1
+reviewer_step 4 PASS ok '[]'
+export GH_STUB_NO_AUTOCLOSE=1
+out="$(loop 5 6)"
+unset GH_STUB_NO_AUTOCLOSE
+assert_contains "reselect(単体番号): 2 件とも処理して終わる" "$out" "処理 2 件 / マージ 2 件"
+assert_not_contains "reselect(単体番号): 2 巡目の対象は無い" "$out" "対象 (2 巡目)"
 
 # --- test 18: worktree を作れない issue は needs-human にして次へ進む -------------
 make_fixture t18

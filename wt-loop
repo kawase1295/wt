@@ -42,6 +42,7 @@
 #   番号指定なら残っている worktree と session を再利用して続きから進める
 #   (needs-human で止めた issue の再開経路。ラベルを外してから番号で指定する)。
 #   1 巡して何かマージできたら再選択し、対象が尽きるまで繰り返す (依存が解けた子を拾う)。
+#   番号指定でも同じ番号リストで再選択する (親を渡せば子を依存順にすべて回す)。
 #
 # 1 issue の流れ (ラウンド = worker の呼び出し 1 回。上限 --max-rounds、既定 3):
 #   worktree 作成 (origin/<default> から) → worker (実装・コミット) → 未コミット無し? →
@@ -1078,10 +1079,9 @@ cmd_loop() {
       [ "$stop" -ne 0 ] && break
     done <<<"$selected"
     # 何かマージできたら依存が解けた子が出ている可能性があるので選び直す。
-    # 番号指定のときは指定分だけで終わる。
+    # 番号指定でも同じ番号リストで選び直す (この run でマージ済みと CLOSED は除外される)。
     [ "$stop" -ne 0 ] && break
     [ "$pass_merged" -gt 0 ] || break
-    [ "$EXPLICIT" -eq 0 ] || break
   done
   log "終了: 処理 $total 件 / マージ $merged 件 / $HUMAN_LABEL $human 件 (state: $STATE)"
   [ "$stop" -eq 2 ] && return 1

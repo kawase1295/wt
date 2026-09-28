@@ -15,6 +15,8 @@ set -uo pipefail
 # scripts/check として走らされても、外の環境に左右されないよう最初に隔離する。
 # テストが必要とする環境は各ヘルパーが明示的に組み立てる。
 unset GIT_CONFIG_COUNT GH_CONFIG_DIR GIT_TERMINAL_PROMPT
+# 外の環境の通知コマンドをテストの loop に拾わせない (必要なテストだけ明示的に与える)
+unset WT_LOOP_NOTIFY
 # PATH 先頭の git shim (push を拒否する) も外す。fixture は temp の bare origin に push する。
 if [ -n "${WT_LOOP_REAL_GIT:-}" ]; then
   PATH="$(dirname "$WT_LOOP_REAL_GIT"):$PATH"
@@ -198,6 +200,24 @@ esac
 STUB
 chmod +x "$TMP/bin/gh"
 
+# --- stub: WT_LOOP_NOTIFY に与える通知コマンド -----------------------------------
+# stdin の JSON を 1 行に詰めて第 1 引数のファイルに追記する。
+# ~/.claude/hooks/notify.sh と同じく .message を読めることも確かめる (message の抜き出し)。
+cat >"$TMP/notify-stub" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+j="$(cat)"
+jq -c . <<<"$j" >>"$1"
+jq -r '.message' <<<"$j" >>"$1.messages"
+STUB
+chmod +x "$TMP/notify-stub"
+cat >"$TMP/notify-fail" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 7
+STUB
+chmod +x "$TMP/notify-fail"
+
 # --- fixture: origin + 本体 checkout --------------------------------------------
 # scripts/check は worktree に bad というファイルがあれば失敗する (check 失敗の再現用)。
 make_fixture() { # name → $REPO $ORIGIN を設定
@@ -289,6 +309,17 @@ state_dir() { # number
   find "$STATE_ROOT" -mindepth 2 -maxdepth 2 -type d -name "$1" 2>/dev/null | head -1
 }
 claude_calls() { cat "$CLAUDE_STUB_DIR/count" 2>/dev/null || echo 0; }
+# repo ごとの state (events.jsonl / loop.log の置き場)
+state_root_dir() { find "$STATE_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1; }
+events_file() { printf '%s/events.jsonl' "$(state_root_dir)"; }
+# events.jsonl の event を空白区切りで並べる (stage / round を除く版は milestones)
+event_seq() { jq -r '.event' "$(events_file)" 2>/dev/null | tr '\n' ' ' | sed 's/ $//'; }
+milestones() { jq -r 'select(.event != "stage" and .event != "round") | .event' "$(events_file)" 2>/dev/null | tr '\n' ' ' | sed 's/ $//'; }
+event_field() { # event jq_expr → 最初に一致したイベントのフィールド
+  jq -r --arg e "$1" "select(.event == \$e) | $2" "$(events_file)" 2>/dev/null | head -1
+}
+# 通知コマンドは background で走るので、呼ばれた event を並び順に依存せず比べる
+notified() { jq -r '.event' "$1" 2>/dev/null | sort | tr '\n' ' ' | sed 's/ $//'; }
 
 # --- test 1: 対象の選択と --dry-run ---------------------------------------------
 make_fixture t1
@@ -375,6 +406,59 @@ fi
 assert_no_dir "$REPO/.claude/worktrees/10-add-greeting" "loop: worktree を片付ける"
 if has_branch "$REPO" worktree-10-add-greeting; then fail "loop: ローカルブランチを削除する"; else pass "loop: ローカルブランチを削除する"; fi
 assert_contains "loop: 終了サマリ" "$out" "処理 1 件 / マージ 1 件"
+# events.jsonl: 1 イベント 1 行の JSON
+ev="$(events_file)"
+assert_eq "events: すべての行が JSON" "$(wc -l <"$ev" | tr -d ' ')" "$(jq -c . "$ev" 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "events: 正常系の並び" "run_started issue_started round stage stage stage stage stage stage merged run_finished" "$(event_seq)"
+assert_eq "events: stage の並び" "worker check reviewer pr ci merge" "$(jq -r 'select(.event == "stage") | .stage' "$ev" | tr '\n' ' ' | sed 's/ $//')"
+assert_eq "events: 全行が同じキーを持つ" "at,event,issue,message,pr,reason,repo,round,stage,state" "$(jq -r 'keys | join(",")' "$ev" | sort -u)"
+assert_eq "events: at は UTC ISO 8601" "0" "$(jq -r '.at' "$ev" | grep -cvE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$')"
+assert_eq "events: repo は owner/repo" "t/repo" "$(event_field run_started .repo)"
+assert_eq "events: state は state のパス" "$(state_root_dir)" "$(event_field run_started .state)"
+assert_eq "events: run 全体のイベントは issue が null" "null null" "$(jq -c 'select(.event == "run_started" or .event == "run_finished") | .issue' "$ev" | tr '\n' ' ' | sed 's/ $//')"
+assert_eq "events: issue は番号" "10" "$(jq -c 'select(.event == "merged") | .issue' "$ev")"
+assert_eq "events: round は番号" "1" "$(jq -c 'select(.event == "merged") | .round' "$ev")"
+assert_eq "events: stage は stage イベントだけ" "null" "$(jq -c 'select(.event != "stage") | .stage' "$ev" | sort -u)"
+assert_eq "events: 正常系では reason が null" "null" "$(jq -c '.reason' "$ev" | sort -u)"
+assert_eq "events: merged に PR の URL" "https://example.test/pr/1" "$(event_field merged .pr)"
+assert_contains "events: merged の message" "$(event_field merged .message)" "#10 Add greeting をマージした"
+assert_contains "events: issue_started の message" "$(event_field issue_started .message)" "#10 Add greeting に着手した"
+assert_contains "events: run_finished の message に件数" "$(event_field run_finished .message)" "処理 1 件 / マージ 1 件"
+assert_eq "events: message は 1 行" "0" "$(jq -r '.message | test("\n")' "$ev" | grep -c true)"
+
+# WT_LOOP_NOTIFY: merged / needs_human / failed / run_finished で stdin に JSON を渡して呼ぶ
+make_fixture t2n
+add_issue 12 "Notify me" OPEN "wt-loop" "x"
+worker_step 1 a.txt v1
+reviewer_step 2 PASS ok '[]'
+nlog="$TMP/t2n-notify.log"
+out="$(WT_LOOP_NOTIFY="$TMP/notify-stub $nlog" loop)"
+assert_eq "notify: merged と run_finished で呼ぶ (stage 等では呼ばない)" "merged run_finished" "$(notified "$nlog")"
+assert_eq "notify: stdin の JSON は events.jsonl の行と同じ" "$(jq -c 'select(.event == "merged")' "$(events_file)")" "$(jq -c 'select(.event == "merged")' "$nlog")"
+assert_contains "notify: .message を読むスクリプトをそのまま使える" "$(cat "$nlog.messages")" "#12 Notify me をマージした"
+# 通知コマンドが失敗しても loop は止めず、log に 1 行出すだけ
+make_fixture t2f
+add_issue 13 "Notify fails" OPEN "wt-loop" "x"
+worker_step 1 a.txt v1
+reviewer_step 2 PASS ok '[]'
+out="$(WT_LOOP_NOTIFY="$TMP/notify-fail" loop; echo "rc=$?")"
+assert_eq "notify 失敗: loop は止めずに merged" "merged" "$(cat "$(state_dir 13)/status" 2>/dev/null)"
+assert_contains "notify 失敗: 終了コードに影響しない" "$out" "rc=0"
+assert_eq "notify 失敗: event ごとに log に 1 行" "2" "$(grep -c '通知コマンドが失敗した' "$(state_root_dir)/loop.log")"
+assert_contains "notify 失敗: 終了コードを log に出す" "$(cat "$(state_root_dir)/loop.log")" "exit 7"
+# 通知コマンドが返ってこなくても 10 秒で打ち切る
+if command -v timeout >/dev/null 2>&1; then
+  make_fixture t2s
+  add_issue 14 "Notify hangs" OPEN "wt-loop" "x"
+  worker_step 1 a.txt v1
+  reviewer_step 2 PASS ok '[]'
+  t_start=$SECONDS
+  out="$(WT_LOOP_NOTIFY="sleep 60" loop)"
+  t_took=$((SECONDS - t_start))
+  if [ "$t_took" -lt 30 ]; then pass "notify 上限: 10 秒で打ち切る"; else fail "notify 上限: 10 秒で打ち切る (${t_took}s)"; fi
+  assert_eq "notify 上限: loop は merged まで進む" "merged" "$(cat "$(state_dir 14)/status" 2>/dev/null)"
+  assert_contains "notify 上限: 打ち切りを log に出す" "$(cat "$(state_root_dir)/loop.log")" "exit 124"
+fi
 
 # --- test 3: check 失敗 → 同じ session に指摘を渡して次ラウンド ------------------
 make_fixture t3
@@ -424,8 +508,16 @@ worker_step 1 a.txt v1
 reviewer_step 2 FAIL "だめ" '[{"severity":"blocker","file":"a.txt","summary":"壊れている"}]'
 worker_step 3 b.txt v1
 reviewer_step 4 PASS ok '[]'
-out="$(loop --max-rounds 1)"
+nlog="$TMP/t5-notify.log"
+out="$(WT_LOOP_NOTIFY="$TMP/notify-stub $nlog" loop --max-rounds 1)"
 sd="$(state_dir 40)"
+assert_eq "events(needs-human): 並び" "run_started issue_started needs_human issue_started merged run_finished" "$(milestones)"
+assert_eq "events(needs-human): issue" "40" "$(event_field needs_human .issue)"
+assert_contains "events(needs-human): reason" "$(event_field needs_human .reason)" "ラウンド上限 (1) に達した"
+assert_eq "events(needs-human): reason は 1 行" "1" "$(jq -r 'select(.event == "needs_human") | .reason' "$(events_file)" | wc -l | tr -d ' ')"
+assert_contains "events(needs-human): message" "$(event_field needs_human .message)" "#40 Hard one は人間の判断が必要"
+assert_eq "events(needs-human): 最後の stage は reviewer" "reviewer" "$(jq -r 'select(.event == "stage" and .issue == 40) | .stage' "$(events_file)" | tail -1)"
+assert_eq "notify(needs-human): needs_human / merged / run_finished で呼ぶ" "merged needs_human run_finished" "$(notified "$nlog")"
 assert_eq "上限: status が needs-human" "needs-human" "$(cat "$sd/status" 2>/dev/null)"
 assert_contains "上限: needs-human ラベルを付ける" "$(cat "$GH_STUB_DIR/gh.log")" "issue edit 40 --add-label needs-human"
 assert_contains "上限: 経緯を issue にコメントする" "$(cat "$GH_STUB_DIR/comment-40-1.md")" "ラウンド上限 (1) に達した"
@@ -565,12 +657,22 @@ git -c user.email=w@example.com -c user.name=worker commit -qm add
 printf '{"type":"result","subtype":"success","is_error":false,"result":"ok"}\n'
 EOF
 chmod +x "$CLAUDE_STUB_DIR/step-1.sh"
-out="$(loop)"
+nlog="$TMP/t11-notify.log"
+out="$(WT_LOOP_NOTIFY="$TMP/notify-stub $nlog" loop)"
+assert_eq "events(stop): 並び" "run_started issue_started round stage stopped run_finished" "$(event_seq)"
+assert_eq "events(stop): issue" "100" "$(event_field stopped .issue)"
+assert_contains "events(stop): reason" "$(event_field stopped .reason)" "停止指示"
+assert_contains "events(stop): message" "$(event_field stopped .message)" "#100 First を止めた"
+assert_eq "notify(stop): stopped では呼ばず run_finished だけ" "run_finished" "$(notified "$nlog")"
 assert_eq "stop: 今の issue を stopped にする" "stopped" "$(cat "$(state_dir 100)/status" 2>/dev/null)"
 assert_eq "stop: 次の issue に進まない" "" "$(state_dir 101)"
 assert_dir "$REPO/.claude/worktrees/100-first" "stop: worktree を残す"
 out="$(loop status)"
 assert_contains "status: issue ごとの状態を出す" "$out" "#100	stopped"
+assert_eq "status: events.jsonl の最新 5 件を出す" "5" "$(printf '%s\n' "$out" | grep -cE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T')"
+assert_contains "status: 最新のイベントまで出す" "$out" "run_finished"
+assert_not_contains "status: 古いイベントは出さない" "$out" "run_started"
+assert_contains "status: message を出す" "$out" "#100 First を止めた"
 make_fixture t12
 add_issue 110 "A" OPEN "wt-loop" "x"
 add_issue 111 "B" OPEN "wt-loop" "x"
@@ -940,7 +1042,13 @@ printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":tr
 exit 1
 EOF
 chmod +x "$CLAUDE_STUB_DIR/step-1.sh"
-out="$(INFRA_SECS=60 loop; echo "rc=$?")"
+nlog="$TMP/t19-notify.log"
+out="$(INFRA_SECS=60 WT_LOOP_NOTIFY="$TMP/notify-stub $nlog" loop; echo "rc=$?")"
+assert_eq "events(failed): 並び" "run_started issue_started round stage failed run_finished" "$(event_seq)"
+assert_eq "events(failed): issue" "150" "$(event_field failed .issue)"
+assert_contains "events(failed): reason" "$(event_field failed .reason)" "異常終了した"
+assert_contains "events(failed): message" "$(event_field failed .message)" "#150 First が失敗した"
+assert_eq "notify(failed): failed と run_finished で呼ぶ" "failed run_finished" "$(notified "$nlog")"
 assert_eq "infra: status が failed" "failed" "$(cat "$(state_dir 150)/status" 2>/dev/null)"
 assert_contains "infra: loop を止める" "$out" "claude か gh が動いていない疑い"
 assert_eq "infra: 次の issue を始めない" "" "$(state_dir 151)"

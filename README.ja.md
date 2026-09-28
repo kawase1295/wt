@@ -323,7 +323,7 @@ repo をループに乗せる前に `wt loop doctor` を実行する。本体 ch
 - 直列で 1 issue ずつ。1 巡して何かマージできたら選び直し、依存が解けた子を同じ run で拾う。番号指定でも同じで、`wt loop <親>` は同じ番号から選び直して子を依存順にすべて回す（この run でマージ済みと CLOSED は除外されるので、単体の番号だけなら 1 巡で終わる）。`--max-issues` で件数を区切れる。`wt loop --stop` は次の区切り（claude 呼び出しの直後 / push の前 / issue の間）で止める
 - 同じ repo で 2 本目の `wt loop` は起動できない（lock）
 
-state は `~/.cache/wt/loop/<repo>-<key>/<N>/`（`WT_LOOP_STATE` で変更）に残る: ラウンドごとの worker のプロンプトと出力、reviewer の JSON、`scripts/check` のログ、diff、session id、PR URL。進行は同じ場所の `loop.log` に追記される。`wt loop status` で issue ごとの状態（`running` / `merged` / `needs-human` / `stopped` / `failed`）を一覧できる。
+state は `~/.cache/wt/loop/<repo>-<key>/<N>/`（`WT_LOOP_STATE` で変更）に残る: ラウンドごとの worker のプロンプトと出力、reviewer の JSON、`scripts/check` のログ、diff、session id、PR URL。進行は同じ場所の `loop.log` に追記される。`wt loop status` で issue ごとの状態（`running` / `merged` / `needs-human` / `stopped` / `failed`）と、`events.jsonl` の最新 5 件を一覧できる。
 
 **オーケストレーション（`/wt-pm`）。** loop は「何を回すか」を決めず、worker の問いにも自分では答えない。`/wt-pm` はユーザーと対話しているメインのセッション（dev 側）を loop の外側のオーケストレータにする。メインは起票・投入・監視・仲介・報告だけを行い、実装しない。
 
@@ -340,6 +340,37 @@ state は `~/.cache/wt/loop/<repo>-<key>/<N>/`（`WT_LOOP_STATE` で変更）に
 ```
 
 前提: `gh`（認証済み）、`jq`、`claude`。「no checks reported」は、`.github/workflows` がある repo では check の登録待ちとみなして上限まで待ち、無い repo だけ一度待って再確認してから CI 無しと判断する（ローカルの `scripts/check` を根拠にマージ）。`scripts/check` も無い repo はゲート無しになるので、乗せる前に用意する（[マージ前チェック](#マージ前チェックrepo-の-scriptscheck)）。
+
+#### イベント（events.jsonl）と通知（WT_LOOP_NOTIFY）
+
+loop を別のセッションやスクリプトから監視するために、`~/.cache/wt/loop/<repo>-<key>/events.jsonl` に 1 イベント 1 行の JSON を追記する（`loop.log` を正規表現で追う必要はない）。
+
+```json
+{"at":"2026-09-28T01:23:45Z","event":"merged","repo":"owner/repo","issue":10,"round":1,"stage":null,"reason":null,"pr":"https://github.com/owner/repo/pull/12","message":"#10 Add greeting をマージした (https://github.com/owner/repo/pull/12)","state":"/home/me/.cache/wt/loop/repo-123"}
+```
+
+| フィールド | 内容 |
+| --- | --- |
+| `at` | UTC の ISO 8601（`YYYY-MM-DDThh:mm:ssZ`） |
+| `event` | `run_started` / `issue_started` / `round` / `stage` / `merged` / `needs_human` / `failed` / `stopped` / `run_finished` |
+| `repo` | `owner/repo` |
+| `issue` | issue 番号。run 全体のイベント（`run_started` / `run_finished`、issue の間での `stopped`）では `null` |
+| `round` | ラウンド番号（ラウンド開始前は `null`） |
+| `stage` | `stage` イベントのみ: `worker` / `check` / `reviewer` / `pr` / `ci` / `merge` |
+| `reason` | `needs_human` / `failed` / `stopped` の理由（1 行） |
+| `pr` | PR の URL（作成後） |
+| `message` | 人間向けの 1 行の要約（日本語） |
+| `state` | state ディレクトリのパス |
+
+値の無いフィールドは `null`（キーは常に全部そろう）。die などで異常終了したときも `run_finished` を出す。
+
+環境変数 `WT_LOOP_NOTIFY` にコマンドを設定すると、`merged` / `needs_human` / `failed` / `run_finished` のイベントで、その JSON を stdin に渡して実行する（`sh -c` で解釈するので引数も書ける）。background で走らせ、10 秒で打ち切る。失敗しても loop は止めず、`loop.log` に 1 行出すだけ。コマンドの出力は state の `notify.log` に残る。`{"message": ...}` を読む既存の通知スクリプトをそのまま指定できる。
+
+```bash
+WT_LOOP_NOTIFY="$HOME/.claude/hooks/notify.sh" wt loop
+# 最新のイベントを追う
+tail -f ~/.cache/wt/loop/<repo>-<key>/events.jsonl | jq -r .message
+```
 
 ### 本体 checkout のガード（hook）
 

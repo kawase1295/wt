@@ -57,6 +57,9 @@
 #
 # 状態: $WT_LOOP_STATE (既定 ~/.cache/wt/loop)/<repo>-<key>/<N>/ にラウンドごとの
 #   worker 出力・review JSON・check ログ・session id を残す。loop.log に進行を追記する。
+#   同じ場所の events.jsonl に機械可読なイベントを 1 行 1 JSON で追記する
+#   (run_started / issue_started / round / stage / merged / needs_human / failed /
+#   stopped / run_finished。フィールドは emit_event を参照)。
 #
 # 環境変数:
 #   WT_LOOP_LABEL           対象ラベル (既定 wt-loop)
@@ -68,6 +71,9 @@
 #   WT_LOOP_ALLOWED_TOOLS   worker の --allowedTools を丸ごと差し替える
 #   WT_LOOP_EXTRA_TOOLS     worker の --allowedTools に追記する (カンマ区切り)
 #   WT_LOOP_STATE           state の置き場
+#   WT_LOOP_NOTIFY          merged / needs_human / failed / run_finished のイベントで実行する
+#                           コマンド (sh -c で解釈)。イベントの JSON を stdin に渡す。
+#                           background で走らせ、上限 10 秒。失敗は log に 1 行出すだけ
 set -euo pipefail
 
 # ログは stderr に出す (stdout は select_issues 等の機械可読な出力に使う)。
@@ -131,6 +137,59 @@ state_root() {
 # issue ごとの state。status は 1 語: running / merged / needs-human / stopped / failed
 set_status() { printf '%s\n' "$2" >"$1/status"; }
 
+# --- イベント ------------------------------------------------------------------
+# $STATE/events.jsonl に 1 イベント 1 行の JSON を追記する。JSON は jq で組み立てる。
+# フィールド: at (UTC ISO 8601) / event / repo (owner/repo) / issue (番号。run 全体の
+# イベントでは null) / round / stage (stage イベントのみ: worker / check / reviewer / pr /
+# ci / merge) / reason (needs_human / failed / stopped の理由。1 行) / pr (URL) /
+# message (人間向け 1 行の要約) / state (state のパス)。空の値は null にする。
+# pr は issue の state に PR の URL があればそれを入れる。
+REPO_SLUG=""
+NOTIFY_EVENTS=" merged needs_human failed run_finished "
+NOTIFY_TIMEOUT=10
+
+emit_event() { # event issue round stage reason message
+  local pr=""
+  [ -n "$2" ] && pr="$(cat "$STATE/$2/pr-url" 2>/dev/null || true)"
+  local json
+  json="$(jq -nc \
+    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg event "$1" --arg repo "$REPO_SLUG" \
+    --arg issue "$2" --arg round "$3" --arg stage "$4" --arg reason "$5" \
+    --arg pr "$pr" --arg message "$6" --arg state "$STATE" '
+    def nz: if . == "" then null else . end;
+    def oneline: if . == null then null else gsub("[\r\n]+"; " ") end;
+    {at: $at, event: $event, repo: ($repo | nz), issue: ($issue | nz | if . then tonumber else . end),
+     round: ($round | nz | if . then tonumber else . end), stage: ($stage | nz),
+     reason: ($reason | nz | oneline), pr: ($pr | nz), message: ($message | oneline), state: $state}')" || {
+    log "イベント $1 を組み立てられなかった"
+    return 0
+  }
+  printf '%s\n' "$json" >>"$STATE/events.jsonl"
+  case "$NOTIFY_EVENTS" in *" $1 "*) notify "$1" "$json" ;; esac
+  return 0
+}
+
+# WT_LOOP_NOTIFY があれば、イベントの JSON を stdin に渡して background で実行する。
+# 上限 NOTIFY_TIMEOUT 秒。失敗しても loop は止めない (log に 1 行出すだけ)。
+notify() { # event json
+  [ -n "${WT_LOOP_NOTIFY:-}" ] || return 0
+  (
+    local -a pre=()
+    local rc=0
+    command -v timeout >/dev/null 2>&1 && pre=(timeout -k 2 "$NOTIFY_TIMEOUT")
+    printf '%s\n' "$2" | "${pre[@]}" sh -c "$WT_LOOP_NOTIFY" >>"$STATE/notify.log" 2>&1 || rc=$?
+    [ "$rc" -eq 0 ] || log "通知コマンドが失敗した ($1、exit $rc。WT_LOOP_NOTIFY を確認)"
+  ) </dev/null &
+  return 0
+}
+
+# issue のイベント。round は issue の state の round (この run で書いたもの) を使う。
+emit_issue_event() { # event number stage reason message
+  emit_event "$1" "$2" "$(cat "$STATE/$2/round" 2>/dev/null || true)" "$3" "$4" "$5"
+}
+
+issue_title() { jq -r '.title // ""' <<<"$(issue_json "$1" 2>/dev/null)" 2>/dev/null || true; }
+
 # 同じ repo で loop を二重に走らせない (後発が STOP を消したり worktree を取り合う)
 acquire_lock() {
   local lock="$STATE/lock" pid
@@ -141,7 +200,18 @@ acquire_lock() {
     fi
   fi
   printf '%s\n' "$$" >"$lock"
-  trap 'rm -f "$STATE/lock"' EXIT
+  trap on_exit EXIT
+}
+
+# run_finished を出さずに抜けた (die 等) ときも、監視側が終わりを知れるようにする
+RUN_OPEN=0
+on_exit() {
+  local rc=$?
+  if [ "$RUN_OPEN" -eq 1 ]; then
+    RUN_OPEN=0
+    emit_event run_finished "" "" "" "" "wt loop が異常終了した (exit $rc。loop.log を確認)"
+  fi
+  rm -f "$STATE/lock"
 }
 
 # --- GitHub --------------------------------------------------------------------
@@ -585,13 +655,16 @@ report_blocked() { # report
 # 戻り値: 0 = merged、1 = needs-human、2 = stopped、3 = failed (インフラ側の障害。loop を止める)
 run_issue() { # number title
   local n="$1" title="$2" j body task wt_path branch sdir session resume=0 handoff="" fresh
+  sdir="$STATE/$n"
+  mkdir -p "$sdir"
+  # round は この run で書き直す (前回の run の値をイベントに載せない)
+  rm -f "$sdir/round"
   j="$(issue_json "$n")" || {
     log "#$n: issue を取得できない (gh の一時的な失敗?)。飛ばす"
+    emit_issue_event failed "$n" "" "issue を取得できない (gh の一時的な失敗?)" "#$n が失敗した: issue を取得できない"
     return 3
   }
   body="$(jq -r .body <<<"$j")"
-  sdir="$STATE/$n"
-  mkdir -p "$sdir"
 
   branch="$(branch_for_issue "$n")"
   if [ -n "$branch" ] && [ -n "$(worktree_path_of "$branch")" ]; then
@@ -610,11 +683,13 @@ run_issue() { # number title
     else
       log "#$n: issue のコメントを取得できない。引き継ぎなしで再開する"
     fi
+    emit_issue_event issue_started "$n" "" "" "#$n $title を再開した (worktree $task)"
   else
     printf '%s\n' "$body" >"$sdir/issue.body.md"
     task="$(task_name "$n" "$title")"
     branch="worktree-$task"
     log "#$n $title → worktree $task (base origin/$DEFAULT)"
+    emit_issue_event issue_started "$n" "" "" "#$n $title に着手した (worktree $task)"
     if ! "$WT_BIN" new "$task" --base "origin/$DEFAULT" --no-claude >>"$sdir/log" 2>&1; then
       escalate "$n" "$sdir" "" "worktree を作れなかった:
 $(tail -5 "$sdir/log")"
@@ -642,10 +717,12 @@ $(tail -5 "$sdir/log")"
   while [ "$round" -lt "$MAX_ROUNDS" ]; do
     round=$((round + 1))
     printf '%s\n' "$round" >"$sdir/round"
+    emit_issue_event round "$n" "" "" "#$n ラウンド $round/$MAX_ROUNDS を始めた"
     local prompt="$sdir/round-$round.prompt.md" out="$sdir/round-$round.worker.json"
     rm -f "$out" "$out.err"
     config_snapshot "$wt_path" >"$sdir/round-$round.config.before"
     t0=$SECONDS
+    emit_issue_event stage "$n" worker "" "#$n ラウンド $round: worker を起動した"
     if [ "$round" -eq 1 ] && [ "$resume" -eq 0 ]; then
       {
         worker_prompt_first "$n" "$title" "$body" "$task"
@@ -698,12 +775,14 @@ $config_diff"
     if stop_requested; then
       set_status "$sdir" stopped
       log "#$n: stopped (停止指示。worktree は残す: $wt_path。再開は wt loop $n)"
+      emit_issue_event stopped "$n" "" "停止指示 (wt loop --stop) を worker の終了後に受けた" "#$n $title を止めた (worktree は残す。再開は wt loop $n)"
       return 2
     fi
     if ! envelope_ok "$out"; then
       if [ "$elapsed" -lt "$INFRA_SECS" ]; then
         set_status "$sdir" failed
         log "#$n: failed — worker が ${elapsed}s で異常終了した (利用上限や API 障害の疑い): $(tail -c 300 "$out.err" 2>/dev/null | tr '\n' ' ')"
+        emit_issue_event failed "$n" "" "worker が ${elapsed}s で異常終了した (利用上限や API 障害の疑い): $(tail -c 200 "$out.err" 2>/dev/null)" "#$n $title が失敗した (worker が ${elapsed}s で異常終了。loop を止める)"
         return 3
       fi
       feedback="前回のセッションは正常に終了しなかった（timeout か異常終了）。$(tail -c 800 "$out.err" 2>/dev/null) worktree の状態を git status / git log で確認し、続きから進めること。"
@@ -746,6 +825,7 @@ $conflicts"
     # 検証 4: scripts/check
     if [ -x "$wt_path/scripts/check" ]; then
       log "#$n round $round: scripts/check"
+      emit_issue_event stage "$n" check "" "#$n ラウンド $round: scripts/check を実行する"
       if ! run_check_sandboxed "$wt_path" "$sdir/round-$round.check.log"; then
         feedback="scripts/check が失敗した。ログ末尾:
 $(tail -60 "$sdir/round-$round.check.log")"
@@ -761,6 +841,7 @@ $(tail -60 "$sdir/round-$round.check.log")"
     git -C "$wt_path" diff "origin/$DEFAULT...HEAD" >"$diff_file"
     reviewer_prompt "$n" "$title" "$body" "$diff_file" >"$rprompt"
     log "#$n round $round: reviewer 起動"
+    emit_issue_event stage "$n" reviewer "" "#$n ラウンド $round: reviewer を起動した"
     run_sandboxed "$wt_path" "$rprompt" "$review_json" "$REVIEW_TIMEOUT" \
       --no-session-persistence --permission-mode default --max-turns 40 --add-dir "$sdir" \
       --allowedTools "Read,Glob,Grep,Bash(git diff *),Bash(git log *),Bash(git show *)" \
@@ -780,10 +861,12 @@ $(review_field "$review_json" '.findings[] | select(.severity != "minor") | "- [
     if stop_requested; then
       set_status "$sdir" stopped
       log "#$n: stopped (停止指示。push 前で止めた。worktree は残す: $wt_path。再開は wt loop $n)"
+      emit_issue_event stopped "$n" "" "停止指示 (wt loop --stop) を push の前に受けた" "#$n $title を止めた (push 前。worktree は残す。再開は wt loop $n)"
       return 2
     fi
 
     # 着地: push → PR → CI → merge
+    emit_issue_event stage "$n" pr "" "#$n ラウンド $round: push して PR を用意する"
     if ! gitq -C "$wt_path" push -u origin "$branch" >>"$sdir/log" 2>&1; then
       escalate "$n" "$sdir" "$wt_path" "git push が失敗した:
 $(tail -10 "$sdir/log")"
@@ -804,6 +887,7 @@ $(tail -10 "$sdir/log")"
     printf '%s\n' "$pr_url" >"$sdir/pr-url"
     post_review_record "$n" "$round" "$review_json" "$pr_url"
     local ci_rc=0
+    emit_issue_event stage "$n" ci "" "#$n ラウンド $round: CI を待つ ($pr_url)"
     wait_checks "$pr_url" "$sdir/round-$round.checks.log" "$wt_path" || ci_rc=$?
     if [ "$ci_rc" -eq 2 ]; then
       escalate "$n" "$sdir" "$wt_path" "CI の完了を ${CI_TIMEOUT}s 待っても終わらなかった（PR: $pr_url）。承認待ちの workflow や報告されない check が無いか確認する。"
@@ -816,6 +900,7 @@ $(grep -iE 'fail|error|✗|^X' "$sdir/round-$round.checks.log" | head -20)
       log "#$n round $round: CI 失敗"
       continue
     fi
+    emit_issue_event stage "$n" merge "" "#$n ラウンド $round: PR をマージする ($pr_url)"
     if ! gh_main pr merge "$pr_url" --merge >>"$sdir/log" 2>&1; then
       escalate "$n" "$sdir" "$wt_path" "gh pr merge が拒否された（PR: $pr_url）:
 $(tail -10 "$sdir/log")"
@@ -834,6 +919,7 @@ $(tail -10 "$sdir/log")"
     update_main_checkout
     "$WT_BIN" rm "$task" --force >>"$sdir/log" 2>&1 || log "#$n: wt rm に失敗 (手動で wt rm $task --force)"
     set_status "$sdir" merged
+    emit_issue_event merged "$n" "" "" "#$n $title をマージした ($pr_url)"
     return 0
   done
   escalate "$n" "$sdir" "$wt_path" "ラウンド上限 ($MAX_ROUNDS) に達した。最後の問題:
@@ -922,6 +1008,9 @@ escalate() { # number sdir wt_path reason
   gh_main issue comment "$1" --body-file "$f" >/dev/null 2>&1 || log "#$1: コメントに失敗"
   set_status "$2" needs-human
   log "#$1: needs-human に切り出した ($(head -1 <<<"$4"))"
+  local title
+  title="$(issue_title "$1")"
+  emit_issue_event needs_human "$1" "" "$(head -1 <<<"$4")" "#$1${title:+ $title} は人間の判断が必要 ($HUMAN_LABEL を付けた): $(head -1 <<<"$4")"
 }
 
 new_session_id() {
@@ -955,6 +1044,10 @@ cmd_status() {
     printf '#%s\t%s\tround %s\t%s\n' "$(basename "$d")" "$(cat "$d/status")" "$(cat "$d/round" 2>/dev/null || echo 0)" "$(cat "$d/task" 2>/dev/null)"
   done
   [ -e "$STATE/STOP" ] && log "STOP が置かれている (次回 wt loop の開始時に消える)"
+  if [ -s "$STATE/events.jsonl" ]; then
+    log "最近のイベント (events.jsonl の最新 5 件):"
+    tail -n 5 "$STATE/events.jsonl" | jq -r '[.at, .event, .message] | @tsv' 2>/dev/null || true
+  fi
   return 0
 }
 
@@ -1089,6 +1182,11 @@ cmd_loop() {
   if [ "$DRY_RUN" -eq 0 ]; then
     acquire_lock
     rm -f "$STATE/STOP"
+    REPO_SLUG="$(gh_main repo view --json nameWithOwner 2>/dev/null | jq -r '.nameWithOwner // ""' 2>/dev/null || true)"
+    local target="ラベル $LABEL"
+    [ "${#ISSUES[@]}" -gt 0 ] && target="$(printf '#%s ' "${ISSUES[@]}")" && target="${target% }"
+    emit_event run_started "" "" "" "" "wt loop を開始した (対象: $target)"
+    RUN_OPEN=1
   fi
 
   local total=0 merged=0 human=0 pass=0 selected n t rc pass_merged stop=0
@@ -1116,6 +1214,7 @@ cmd_loop() {
       fi
       if stop_requested; then
         log "停止指示があったため次の issue に進まない"
+        emit_event stopped "" "" "" "停止指示 (wt loop --stop) を issue の間で受けた" "停止指示で止めた (次の issue #$n には進まない)"
         stop=1
         break
       fi
@@ -1142,6 +1241,10 @@ cmd_loop() {
     [ "$pass_merged" -gt 0 ] || break
   done
   log "終了: 処理 $total 件 / マージ $merged 件 / $HUMAN_LABEL $human 件 (state: $STATE)"
+  if [ "$RUN_OPEN" -eq 1 ]; then
+    RUN_OPEN=0
+    emit_event run_finished "" "" "" "" "wt loop が終了した: 処理 $total 件 / マージ $merged 件 / $HUMAN_LABEL $human 件"
+  fi
   [ "$stop" -eq 2 ] && return 1
   return "$PREFLIGHT_NG"
 }

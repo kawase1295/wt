@@ -1,0 +1,1029 @@
+#!/usr/bin/env bash
+# wt-loop — Issue → worktree → 実装 → check → AI レビュー → PR → CI → マージ → 片付け →
+# 次の Issue、を人間の操作なしに回す driver。wt loop から呼ばれる (単体でも動く)。
+#
+# 設計:
+#   決定論的な工程 (issue 選択 / worktree 作成 / check / base 取り込み / push / PR 作成 /
+#   CI 待ち / merge / 本体 pull / 片付け) はこの bash が行い、Claude は headless
+#   (claude -p) で「実装」(worker) と「レビュー判定」(reviewer) だけを担う。
+#   worker と reviewer は別セッション (書いた本人に合否を判定させない)。
+#   permission 設定は変えない。worker は --permission-mode acceptEdits + allowlist で
+#   動き、push / merge は driver が git / gh で直接行う。worker が push できないことは
+#   permission ルールではなく、worker プロセスだけに効く環境で保証する:
+#     - git の url.<無効>.pushInsteadOf を環境変数 (GIT_CONFIG_*) で与え、あらゆる
+#       push 先 URL を存在しないパスに書き換える (fetch / pull は通る)
+#     - GH_CONFIG_DIR を空ディレクトリにして gh を無認証にする (gh pr merge 等が失敗する)
+#   headless では --permission-mode auto が書き込みを拒否するため使わない。
+#
+# 使い方 (対象リポジトリ内の任意の場所から実行する。本体 checkout に対して動く):
+#   wt loop [<issue>...] [--label <name>] [--max-issues <n>] [--max-rounds <n>]
+#           [--model <model>] [--worker-timeout <sec>] [--dry-run]
+#   wt loop --stop      進行中の loop を次の区切り (claude 呼び出しの直後 / push の前 /
+#                       issue の間) で止める
+#   wt loop status      state ディレクトリの issue ごとの状態を一覧する
+#
+# 対象 issue: 引数で番号を与えればそれ、無ければラベル (既定 wt-loop) 付きの open issue。
+#   needs-human ラベル付き / CLOSED / 依存が未完了のものは飛ばす。
+#   本文に「## 子タスク」のチェックリストを持つ親 issue は子に展開し、
+#   「（#M のあと）」の依存が CLOSED の子だけを対象にする。子 issue を単体で
+#   指定・ラベル付けした場合も、本文の「親 issue: #P」から親を引いて同じ依存判定を行う。
+#   ブランチ worktree-<N>-* が既にある issue は、ラベル選択では進行中として飛ばし、
+#   番号指定なら残っている worktree と session を再利用して続きから進める
+#   (needs-human で止めた issue の再開経路。ラベルを外してから番号で指定する)。
+#   1 巡して何かマージできたら再選択し、対象が尽きるまで繰り返す (依存が解けた子を拾う)。
+#
+# 1 issue の流れ (ラウンド = worker の呼び出し 1 回。上限 --max-rounds、既定 3):
+#   worktree 作成 (origin/<default> から) → worker (実装・コミット) → 未コミット無し? →
+#   origin/<default> 取り込み (コンフリクトは worker に解決させる) → コミットあり? →
+#   scripts/check → reviewer (diff + issue → PASS/FAIL) → push → PR (Fixes #N) →
+#   CI 待ち → gh pr merge → remote ブランチ削除 → 本体 pull → wt rm
+#   どこかで落ちたら、その内容を同じ worker セッションに --resume で渡して次ラウンド。
+#   上限超過 / worker が BLOCKED: を返した / push・merge が拒否された / CI 待ちが上限 →
+#   needs-human ラベル + コメント、worktree は残す。
+#   worker がすぐに異常終了した (利用上限や API 障害の疑い) → その issue を failed にして
+#   loop 全体を止める (キュー全体に needs-human を付けない)。
+#
+# 状態: $WT_LOOP_STATE (既定 ~/.cache/wt/loop)/<repo>-<key>/<N>/ にラウンドごとの
+#   worker 出力・review JSON・check ログ・session id を残す。loop.log に進行を追記する。
+#
+# 環境変数:
+#   WT_LOOP_LABEL           対象ラベル (既定 wt-loop)
+#   WT_LOOP_MODEL           claude の --model (既定 opus)
+#   WT_LOOP_MAX_ROUNDS      ラウンド上限 (既定 3)
+#   WT_LOOP_WORKER_TIMEOUT  worker 1 回の上限秒 (既定 3600)
+#   WT_LOOP_REVIEW_TIMEOUT  reviewer 1 回の上限秒 (既定 900)
+#   WT_LOOP_CI_TIMEOUT      CI 待ちの上限秒 (既定 1800)
+#   WT_LOOP_ALLOWED_TOOLS   worker の --allowedTools を丸ごと差し替える
+#   WT_LOOP_EXTRA_TOOLS     worker の --allowedTools に追記する (カンマ区切り)
+#   WT_LOOP_STATE           state の置き場
+set -euo pipefail
+
+# ログは stderr に出す (stdout は select_issues 等の機械可読な出力に使う)。
+# STATE が決まっていればファイルにも残す。
+log() {
+  printf '[wt loop] %s\n' "$*" >&2
+  [ -n "${STATE:-}" ] && [ -d "$STATE" ] && printf '%s [wt loop] %s\n' "$(date '+%F %T')" "$*" >>"$STATE/loop.log"
+  return 0
+}
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+# 同梱の wt 本体 (worktree の作成 / 削除はそちらに委譲する)
+WT_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/wt"
+[ -x "$WT_BIN" ] || die "wt 本体が見つからない: $WT_BIN"
+
+resolve_repo() {
+  local common_dir
+  common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
+    die "git リポジトリ内で実行する必要がある"
+  MAIN_ROOT="$(dirname "$common_dir")"
+  REPO_NAME="$(basename "$MAIN_ROOT")"
+}
+
+# --- 設定 ---------------------------------------------------------------------
+LABEL="${WT_LOOP_LABEL:-wt-loop}"
+HUMAN_LABEL="needs-human"
+MODEL="${WT_LOOP_MODEL:-opus}"
+MAX_ROUNDS="${WT_LOOP_MAX_ROUNDS:-3}"
+MAX_ISSUES=0
+WORKER_TIMEOUT="${WT_LOOP_WORKER_TIMEOUT:-3600}"
+REVIEW_TIMEOUT="${WT_LOOP_REVIEW_TIMEOUT:-900}"
+CI_TIMEOUT="${WT_LOOP_CI_TIMEOUT:-1800}"
+# worker がこの秒数未満で異常終了したら、作業の失敗ではなくインフラ側の障害とみなす
+INFRA_SECS="${WT_LOOP_INFRA_SECS:-60}"
+DRY_RUN=0
+ISSUES=()
+EXPLICIT=0
+
+# worker に許す Bash。実装・テスト・コミットに要るものに限る。任意コードを実行できる
+# bash / sh は入れない (push の禁止は環境で保証するが、allowlist の意味を保つため)。
+# gh は無認証にするので入れない。Edit / Write は --permission-mode acceptEdits が通す。
+DEFAULT_ALLOWED_TOOLS="Bash(git *),Bash(scripts/*),Bash(./scripts/*),Bash(tests/*),Bash(./tests/*),Bash(npm *),Bash(npx *),Bash(pnpm *),Bash(yarn *),Bash(bun *),Bash(node *),Bash(python3 *),Bash(python *),Bash(uv *),Bash(pytest *),Bash(cargo *),Bash(go *),Bash(make *),Bash(cat *),Bash(ls *),Bash(mkdir *),Bash(cp *),Bash(mv *),Bash(touch *),Bash(chmod *),Bash(shellcheck *),Bash(jq *),Bash(diff *),Bash(wc *),Bash(head *),Bash(tail *),Bash(find *),Bash(grep *),Bash(sed *),Bash(awk *),Bash(sort *),Bash(tr *),Bash(command -v *)"
+ALLOWED_TOOLS="${WT_LOOP_ALLOWED_TOOLS:-$DEFAULT_ALLOWED_TOOLS}"
+[ -n "${WT_LOOP_EXTRA_TOOLS:-}" ] && ALLOWED_TOOLS="$ALLOWED_TOOLS,$WT_LOOP_EXTRA_TOOLS"
+
+REVIEW_SCHEMA='{"type":"object","required":["verdict","summary","findings"],"properties":{"verdict":{"type":"string","enum":["PASS","FAIL"]},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"object","required":["severity","summary"],"properties":{"severity":{"type":"string","enum":["blocker","major","minor"]},"file":{"type":"string"},"summary":{"type":"string"}}}}}}'
+
+# push 先の書き換え先。存在しないパスなので、どの URL への push も失敗する。
+PUSH_BLOCK="/nonexistent/wt-loop-push-blocked/"
+
+# --- state ---------------------------------------------------------------------
+state_root() {
+  local key
+  key="$(printf '%s' "$MAIN_ROOT" | cksum | awk '{print $1}')"
+  printf '%s/%s-%s' "${WT_LOOP_STATE:-$HOME/.cache/wt/loop}" "$REPO_NAME" "$key"
+}
+
+# issue ごとの state。status は 1 語: running / merged / needs-human / stopped / failed
+set_status() { printf '%s\n' "$2" >"$1/status"; }
+
+# 同じ repo で loop を二重に走らせない (後発が STOP を消したり worktree を取り合う)
+acquire_lock() {
+  local lock="$STATE/lock" pid
+  if [ -f "$lock" ]; then
+    pid="$(cat "$lock" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      die "この repo で別の wt loop (pid $pid) が実行中。止めるなら wt loop --stop"
+    fi
+  fi
+  printf '%s\n' "$$" >"$lock"
+  trap 'rm -f "$STATE/lock"' EXIT
+}
+
+# --- GitHub --------------------------------------------------------------------
+gh_main() { (cd "$MAIN_ROOT" && gh "$@"); }
+
+default_branch() {
+  gh_main repo view --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null
+}
+
+# issue の JSON をキャッシュ付きで返す (1 回の選択で同じ issue を何度も引くため)
+declare -A ISSUE_CACHE=()
+issue_json() { # number → json (number,title,body,state,labels,url)
+  if [ -z "${ISSUE_CACHE[$1]:-}" ]; then
+    ISSUE_CACHE[$1]="$(gh_main issue view "$1" --json number,title,body,state,labels,url 2>/dev/null)" || return 1
+  fi
+  printf '%s' "${ISSUE_CACHE[$1]}"
+}
+issue_state() { jq -r .state <<<"$(issue_json "$1")" 2>/dev/null || echo UNKNOWN; }
+issue_state_fresh() { # number → キャッシュを使わずに state を引く
+  gh_main issue view "$1" --json state -q .state 2>/dev/null || echo UNKNOWN
+}
+
+# この run でマージ済みの issue。GitHub 側の close が遅れても再選択で拾わない。
+declare -A MERGED_NOW=()
+
+has_label() { # json label
+  jq -e --arg l "$2" '[.labels[]?.name] | index($l) != null' <<<"$1" >/dev/null
+}
+
+ensure_label() { # name color description
+  gh_main label list --limit 500 --json name -q '.[].name' 2>/dev/null | grep -qx "$1" && return 0
+  gh_main label create "$1" --color "$2" --description "$3" >/dev/null 2>&1 ||
+    log "警告: ラベル $1 を作れなかった (手動で作る: gh label create $1)"
+}
+
+# 本文の「## 子タスク」節 (見出しは 子タスク / 子 Issue / 子 issue / sub-issues) の
+# チェックリストから子番号と依存を取り出す。出力: 1 行 1 子 "<番号> <依存 (空白区切り)>"。
+# 依存は行末側の「（#M のあと）」「(#M の後)」表記。#M を複数並べたものも拾う。
+# コードフェンスの中は読まない。
+parse_children() { # body
+  printf '%s\n' "$1" | tr -d '\r' | awk '
+    /^[[:space:]]*```/ { fence = !fence; next }
+    fence { next }
+    /^#+[[:space:]]/ {
+      insec = ($0 ~ /^#+[[:space:]]*(子タスク|子 ?[Ii]ssue|[Ss]ub-?issues?)/)
+      next
+    }
+    insec && /^[[:space:]]*[-*][[:space:]]*\[[ xX]\][[:space:]]*#[0-9]+/ {
+      line = $0
+      match(line, /#[0-9]+/)
+      child = substr(line, RSTART + 1, RLENGTH - 1)
+      deps = ""
+      # 「のあと」「の後」の最後の出現 (依存表記は行末側にある) の直前の、最後の開き
+      # 括弧からの区間を依存表記とみなす (mawk でも動くよう、マルチバイト文字を
+      # bracket 式に入れない)
+      p = last_index(line, "のあと")
+      q = last_index(line, "の後")
+      if (q > p) p = q
+      if (p) {
+        pre = substr(line, 1, p - 1)
+        s = pre
+        off = 0
+        while ((k = match(s, /（|\(/)) > 0) {
+          off += k + RLENGTH - 1
+          s = substr(s, k + RLENGTH)
+        }
+        if (off > 0) {
+          dep = substr(pre, off + 1)
+          while (match(dep, /#[0-9]+/)) {
+            deps = deps " " substr(dep, RSTART + 1, RLENGTH - 1)
+            dep = substr(dep, RSTART + RLENGTH)
+          }
+        }
+      }
+      print child deps
+    }
+    function last_index(str, pat,    pos, rest, k, w) {
+      pos = 0
+      rest = str
+      w = length(pat)
+      while ((k = index(rest, pat)) > 0) {
+        pos += k
+        rest = substr(rest, k + w)
+        pos += w - 1
+      }
+      return pos ? pos - w + 1 : 0
+    }
+  '
+}
+
+is_parent() { # body
+  [ -n "$(parse_children "$1")" ]
+}
+
+# 子 issue 本文の「親 issue: #P」行から親番号を取る (無ければ空)
+parent_of() { # body
+  printf '%s\n' "$1" | tr -d '\r' | grep -oE '親 ?([Ii]ssue)?[:：][[:space:]]*#[0-9]+' | head -1 | grep -oE '[0-9]+$' || true
+}
+
+branch_for_issue() { # number → 既存の worktree-<N>-* ブランチ名 (無ければ空)
+  git -C "$MAIN_ROOT" for-each-ref --format='%(refname:short)' "refs/heads/worktree-$1-*" | head -1
+}
+
+worktree_path_of() { # branch → パス (無ければ空)
+  git -C "$MAIN_ROOT" worktree list --porcelain |
+    awk -v b="refs/heads/$1" '$1=="worktree"{p=substr($0,10)} $1=="branch" && $2==b{print p}'
+}
+
+# 依存 (子番号 → 依存番号の空白区切り)。親を展開したときに埋める。
+declare -A DEPS=()
+declare -A DEPS_KNOWN=()
+
+# 子 issue の依存を解決する。親の展開で分かっていなければ本文の親参照から引く。
+deps_of() { # number
+  if [ -z "${DEPS_KNOWN[$1]:-}" ]; then
+    DEPS_KNOWN[$1]=1
+    local body p line
+    body="$(jq -r .body <<<"$(issue_json "$1")" 2>/dev/null || true)"
+    p="$(parent_of "$body")"
+    if [ -n "$p" ] && issue_json "$p" >/dev/null 2>&1; then
+      while IFS= read -r line; do
+        [ "${line%% *}" = "$1" ] || continue
+        DEPS[$1]="${line#"$1"}"
+      done <<<"$(parse_children "$(jq -r .body <<<"$(issue_json "$p")")")"
+    fi
+  fi
+  printf '%s' "${DEPS[$1]:-}"
+}
+
+# issue 番号 → 対象にできるか。stdout に理由 (対象なら "ok" か "resume")。
+eligibility() { # number json
+  local n="$1" j="$2" state
+  state="$(jq -r .state <<<"$j")"
+  if [ "$state" != "OPEN" ]; then
+    printf '%s' "$state"
+    return
+  fi
+  if has_label "$j" "$HUMAN_LABEL"; then
+    printf '%s ラベル (外してから番号で指定すると再開する)' "$HUMAN_LABEL"
+    return
+  fi
+  local d
+  for d in $(deps_of "$n"); do
+    [ -n "${MERGED_NOW[$d]:-}" ] && continue
+    if [ "$(issue_state "$d")" != "CLOSED" ]; then
+      printf '依存 #%s が未完了' "$d"
+      return
+    fi
+  done
+  local b
+  b="$(branch_for_issue "$n")"
+  if [ -n "$b" ]; then
+    if [ "$EXPLICIT" -eq 1 ] && [ -n "$(worktree_path_of "$b")" ]; then
+      printf 'resume'
+      return
+    fi
+    printf '進行中 (%s)' "$b"
+    return
+  fi
+  printf 'ok'
+}
+
+# 対象 issue を選ぶ。stdout に 1 行 1 issue "<番号>\t<タイトル>"。飛ばした理由は log。
+select_issues() {
+  local -a cands=() picked=()
+  if [ "${#ISSUES[@]}" -gt 0 ]; then
+    cands=("${ISSUES[@]}")
+  else
+    local list
+    list="$(gh_main issue list --state open --label "$LABEL" --limit 200 --json number -q '.[].number')" ||
+      die "issue 一覧を取得できない (gh auth status を確認)"
+    while IFS= read -r n; do [ -n "$n" ] && cands+=("$n"); done <<<"$list"
+  fi
+  [ "${#cands[@]}" -gt 0 ] || return 0
+
+  # 先に親を展開して依存表を埋める (子が単体で候補に混ざっていても依存判定が効くように)
+  local -a leaves=()
+  local n j line c
+  for n in "${cands[@]}"; do
+    j="$(issue_json "$n")" || {
+      log "skip #$n: 取得できない"
+      continue
+    }
+    if is_parent "$(jq -r .body <<<"$j")"; then
+      log "#$n は親 issue。子に展開する"
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        c="${line%% *}"
+        DEPS[$c]="${line#"$c"}"
+        DEPS_KNOWN[$c]=1
+        leaves+=("$c")
+      done <<<"$(parse_children "$(jq -r .body <<<"$j")")"
+    else
+      leaves+=("$n")
+    fi
+  done
+
+  local -A seen=()
+  local why
+  for n in "${leaves[@]}"; do
+    [ -n "${seen[$n]:-}" ] && continue
+    seen[$n]=1
+    [ -n "${MERGED_NOW[$n]:-}" ] && continue
+    j="$(issue_json "$n")" || {
+      log "skip #$n: 取得できない"
+      continue
+    }
+    why="$(eligibility "$n" "$j")"
+    case "$why" in
+      ok) ;;
+      resume) log "#$n: 残っている worktree を再利用して続きから進める" ;;
+      *)
+        log "skip #$n: $why"
+        continue
+        ;;
+    esac
+    picked+=("$(printf '%s\t%s' "$n" "$(jq -r .title <<<"$j")")")
+  done
+  [ "${#picked[@]}" -gt 0 ] && printf '%s\n' "${picked[@]}" | sort -n -u
+  return 0
+}
+
+# --- worktree 名 ---------------------------------------------------------------
+# <N>-<slug>。slug はタイトルの ASCII 英数だけを kebab 化 (日本語だけなら issue)。
+# herdr の agent 名上限 (32 字、claude- を引いて 25 字) に収める。
+task_name() { # number title
+  local slug
+  slug="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-//' -e 's/-$//')"
+  [ -n "$slug" ] || slug="issue"
+  local task="$1-$slug"
+  task="${task:0:25}"
+  printf '%s' "${task%-}"
+}
+
+# --- claude 呼び出し -------------------------------------------------------------
+# headless で claude を 1 回走らせ、--output-format json の envelope を out に保存する。
+# stdin からプロンプトを渡す (argv 長の制限を避ける)。
+run_claude() { # cwd prompt_file out_json timeout_sec args...
+  local cwd="$1" prompt="$2" out="$3" tmo="$4"
+  shift 4
+  local -a pre=()
+  if [ "$tmo" -gt 0 ] 2>/dev/null && command -v timeout >/dev/null 2>&1; then
+    pre=(timeout -k 30 --foreground "$tmo")
+  fi
+  (cd "$cwd" && "${pre[@]}" claude -p --output-format json --model "$MODEL" "$@" <"$prompt" >"$out" 2>"$out.err")
+}
+
+# worker の PATH 先頭に置く git の shim。push / send-pack、および塞ぎや認証を
+# 上書きする -c (alias.* / remote.*.pushurl / url.* / credential.* / core.hooksPath) を
+# 拒否し、それ以外は実 git に委譲する。環境変数の塞ぎ (pushInsteadOf) は git -c や
+# GIT_CONFIG_COUNT の上書きで外せるので、コマンド経路でも止める。
+# 防ぐ対象は「気を利かせて push してしまう」誤操作であって、実 git を絶対パスで
+# 呼ぶ・環境を組み直すといった意図的な回避は対象外 (Bash(git *) を許す以上、塞ぎ切れない)。
+write_git_shim() { # dir
+  mkdir -p "$1"
+  cat >"$1/git" <<'SHIM'
+#!/usr/bin/env bash
+# wt loop の worker 用 git shim: push と、塞ぎを外す設定の上書きを拒否する
+deny() {
+  echo "wt loop: worker は $1 できない (push / PR / merge は driver が行う)" >&2
+  exit 1
+}
+sub=""
+expect=""
+for a in "$@"; do
+  if [ -n "$expect" ]; then
+    case "$expect" in
+      -c | --config-env)
+        case "$a" in
+          alias.* | remote.*.pushurl* | url.* | credential.* | core.hooksPath* | http.* | ssh.* | core.sshCommand*) deny "git 設定 ($a) を上書き" ;;
+        esac
+        ;;
+    esac
+    expect=""
+    continue
+  fi
+  case "$a" in
+    -c | --config-env) expect="$a" ;;
+    -C | --git-dir | --work-tree | --namespace | --super-prefix | --exec-path | --list-cmds) expect="$a" ;;
+    --config-env=* | -c*) deny "git 設定 ($a) を上書き" ;;
+    -*) ;;
+    *)
+      sub="$a"
+      break
+      ;;
+  esac
+done
+case "$sub" in
+  push | send-pack) deny "push" ;;
+esac
+exec "$WT_LOOP_REAL_GIT" "$@"
+SHIM
+  chmod +x "$1/git"
+}
+
+# push と gh の書き込みができない環境を、現在のシェルに設定する (subshell の中で呼ぶ)。
+# 環境変数は claude の Bash tool が起動する子プロセスにも引き継がれる。
+sandbox_env() {
+  local i=0 p
+  for p in 'https://' 'http://' 'git@' 'ssh://' 'git://' 'file://' '/' '.' '~'; do
+    export "GIT_CONFIG_KEY_$i=url.$PUSH_BLOCK.pushInsteadOf" "GIT_CONFIG_VALUE_$i=$p"
+    i=$((i + 1))
+  done
+  # worker が worktree に置いた hook は driver でも worker でも動かさない
+  export "GIT_CONFIG_KEY_$i=core.hooksPath" "GIT_CONFIG_VALUE_$i=/dev/null"
+  i=$((i + 1))
+  export GIT_CONFIG_COUNT="$i"
+  unset GH_TOKEN GITHUB_TOKEN
+  mkdir -p "$STATE/no-gh"
+  export GH_CONFIG_DIR="$STATE/no-gh" GIT_TERMINAL_PROMPT=0
+  WT_LOOP_REAL_GIT="$(command -v git)"
+  export WT_LOOP_REAL_GIT
+  write_git_shim "$STATE/shim"
+  export PATH="$STATE/shim:$PATH"
+}
+
+# worker / reviewer を sandbox 環境で走らせる。GIT_CONFIG_* / PATH はこのサブシェル
+# だけに効き、driver 自身の git には影響しない。
+run_sandboxed() { # cwd prompt_file out_json timeout_sec args...
+  (
+    sandbox_env
+    run_claude "$@"
+  )
+}
+
+# scripts/check は worker が書いたコードなので、driver の認証や git 設定で走らせない。
+run_check_sandboxed() { # wt_path log
+  (
+    sandbox_env
+    cd "$1" && scripts/check
+  ) >"$2" 2>&1
+}
+
+# driver 自身の git 操作。worktree 内の hook (worker が置けるもの) を実行しない。
+gitq() { git -c core.hooksPath=/dev/null "$@"; }
+
+# 共有される .git/config を worker が書き換えていないか (pushurl / hooksPath 等)。
+# 変更があれば escalate の材料にする。
+config_snapshot() { # wt_path
+  git -C "$1" config --local --list 2>/dev/null | sort
+}
+
+# envelope から結果本文を取り出す (無ければ空)
+envelope_result() { jq -r '.result // ""' "$1" 2>/dev/null || true; }
+
+envelope_ok() { # out_json → 0 なら正常終了
+  [ -s "$1" ] && jq -e '.type == "result" and (.is_error | not)' "$1" >/dev/null 2>&1
+}
+
+worker_prompt_first() { # number title body task
+  cat <<EOF
+この作業は wt loop により無人で起動された headless セッションで、ユーザーには質問できない。次の issue を、この worktree（ブランチ worktree-$4、base origin/$DEFAULT）で実装する。
+
+issue #$1 $2
+
+$3
+
+## 進め方の契約
+
+- TDD で進める（探索 → Red → Green → Refactoring）。受け入れ条件ごとに検証（テスト）を用意する。
+- 変更は受け入れ条件の範囲に限る。scripts/check・CI 設定・lint / test 設定を緩めて通すことはしない。
+- 作業は git commit で区切って残す。最後に未コミットの変更を残さない。
+- git push / PR 作成 / merge / ブランチ切替はしない（driver が行う。この環境では push できない）。
+- 仕様が曖昧なら安全側の解釈を選び、最終報告に「前提」として書く。
+- 実装できない（本番環境が要る / 人間の判断が要る / 環境が欠けている）と判断したら、それ以上進めず、最終報告の 1 行目を「BLOCKED: <理由>」にする。
+- 最終報告は Markdown で書く: 変更の概要（何を・なぜ）/ 実行したテストと結果 / 前提・見送った点。この報告がそのまま PR 本文になる。
+EOF
+}
+
+worker_prompt_retry() { # round feedback
+  cat <<EOF
+wt loop からの再実行（ラウンド $1/$MAX_ROUNDS）。前回の成果に対して次の問題が見つかった。修正してコミットすること。push / PR / merge はしない。判断できない場合は最終報告の 1 行目を「BLOCKED: <理由>」にする。
+
+--- 問題 ---
+$2
+--- ここまで ---
+
+最後に、今回の変更の要約と実行したテストを Markdown で報告する。
+EOF
+}
+
+reviewer_prompt() { # number title body diff_file
+  cat <<EOF
+あなたは独立したコードレビュアーである。実装者の経緯や意図は渡されない。次の issue に対する変更（diff）を、合否基準で判定する。
+
+issue #$1 $2
+
+$3
+
+## diff
+
+ファイル $4 に \`git diff origin/$DEFAULT...HEAD\` の全文がある。Read で読む。必要なら cwd（worktree）のファイルを Read / Grep / git log で確認してよい。ファイルの変更や実行はしない。
+
+## 合否基準
+
+1. 正しさ: バグ・エッジケース・回帰の有無。
+2. 受け入れ条件の充足: チェックボックスごとに diff のどこが満たすかを対応付ける。満たせない項目があれば FAIL。
+3. テストの妥当性: 受け入れ条件に対する検証があるか。テストを弱めたり skip したりしていないか。
+4. ゲートの維持: scripts/check・CI 設定・lint / test 設定を緩める変更は blocker。
+
+指摘は severity（blocker / major / minor）付きで列挙する。minor のみなら PASS、blocker / major があれば FAIL。**迷ったら FAIL に倒す。** summary には判定理由を 3 行以内で書く。
+EOF
+}
+
+# 最終報告が BLOCKED: で始まるか (太字や見出し記号が前に付いていても拾う)
+report_blocked() { # report
+  # shellcheck disable=SC2016 # 正規表現のバッククォート
+  printf '%s\n' "$1" | grep -v '^[[:space:]]*$' | head -1 | grep -qE '^[[:space:]*#_`>]*BLOCKED[*_`]*[:：]'
+}
+
+# --- 1 issue ---------------------------------------------------------------------
+# 戻り値: 0 = merged、1 = needs-human、2 = stopped、3 = failed (インフラ側の障害。loop を止める)
+run_issue() { # number title
+  local n="$1" title="$2" j body task wt_path branch sdir session resume=0
+  j="$(issue_json "$n")" || {
+    log "#$n: issue を取得できない (gh の一時的な失敗?)。飛ばす"
+    return 3
+  }
+  body="$(jq -r .body <<<"$j")"
+  sdir="$STATE/$n"
+  mkdir -p "$sdir"
+
+  branch="$(branch_for_issue "$n")"
+  if [ -n "$branch" ] && [ -n "$(worktree_path_of "$branch")" ]; then
+    # 番号指定での再開: 残っている worktree と session を使う
+    resume=1
+    task="${branch#worktree-}"
+    wt_path="$(worktree_path_of "$branch")"
+    log "#$n $title → 再開 (worktree $task、前回の status: $(cat "$sdir/status" 2>/dev/null || echo 不明))"
+  else
+    task="$(task_name "$n" "$title")"
+    branch="worktree-$task"
+    log "#$n $title → worktree $task (base origin/$DEFAULT)"
+    if ! "$WT_BIN" new "$task" --base "origin/$DEFAULT" --no-claude >>"$sdir/log" 2>&1; then
+      escalate "$n" "$sdir" "" "worktree を作れなかった:
+$(tail -5 "$sdir/log")"
+      return 1
+    fi
+    wt_path="$(worktree_path_of "$branch")"
+    if [ -z "$wt_path" ] || [ ! -d "$wt_path" ]; then
+      escalate "$n" "$sdir" "" "worktree のパスを特定できない (ブランチ $branch)"
+      return 1
+    fi
+  fi
+  printf '%s\n' "$task" >"$sdir/task"
+  set_status "$sdir" running
+
+  session="$(cat "$sdir/session-id" 2>/dev/null || true)"
+  if [ "$resume" -eq 0 ] || [ -z "$session" ]; then
+    session="$(new_session_id)"
+    printf '%s\n' "$session" >"$sdir/session-id"
+    resume=0
+  fi
+
+  local round=0 feedback="" report="" review_json="" pr_url="" t0 elapsed
+  [ "$resume" -eq 1 ] && feedback="前回の run は途中で止まった。git status / git log で worktree の状態を確認し、issue の受け入れ条件を満たすまで続きから進めること。"
+  pr_url="$(cat "$sdir/pr-url" 2>/dev/null || true)"
+  while [ "$round" -lt "$MAX_ROUNDS" ]; do
+    round=$((round + 1))
+    printf '%s\n' "$round" >"$sdir/round"
+    local prompt="$sdir/round-$round.prompt.md" out="$sdir/round-$round.worker.json"
+    rm -f "$out" "$out.err"
+    config_snapshot "$wt_path" >"$sdir/round-$round.config.before"
+    t0=$SECONDS
+    if [ "$round" -eq 1 ] && [ "$resume" -eq 0 ]; then
+      worker_prompt_first "$n" "$title" "$body" "$task" >"$prompt"
+      log "#$n round $round: worker 起動"
+      run_sandboxed "$wt_path" "$prompt" "$out" "$WORKER_TIMEOUT" \
+        --session-id "$session" --permission-mode acceptEdits --allowedTools "$ALLOWED_TOOLS" || true
+    else
+      worker_prompt_retry "$round" "$feedback" >"$prompt"
+      log "#$n round $round: worker 再開 (--resume)"
+      run_sandboxed "$wt_path" "$prompt" "$out" "$WORKER_TIMEOUT" \
+        --resume "$session" --permission-mode acceptEdits --allowedTools "$ALLOWED_TOOLS" || true
+      # 前回が session を残さず落ちていると resume できない。新しい session で続ける
+      # (worktree の状態は残っているので、続きから進められる)。
+      if ! envelope_ok "$out" && grep -qi 'no conversation found' "$out.err" 2>/dev/null; then
+        session="$(new_session_id)"
+        printf '%s\n' "$session" >"$sdir/session-id"
+        log "#$n round $round: session を再作成して続行"
+        # 新しい session は issue も契約も知らないので、初回プロンプトに引き継ぎを足して渡す
+        {
+          worker_prompt_first "$n" "$title" "$body" "$task"
+          printf '\n## 前回からの引き継ぎ\n\n%s\n' "$feedback"
+        } >"$prompt"
+        run_sandboxed "$wt_path" "$prompt" "$out" "$WORKER_TIMEOUT" \
+          --session-id "$session" --permission-mode acceptEdits --allowedTools "$ALLOWED_TOOLS" || true
+      fi
+    fi
+    elapsed=$((SECONDS - t0))
+    # worktree の .git/config は本体と共有される。worker が書き換えていたら (pushurl /
+    # hooksPath / credential 等)、driver の git 操作に影響するので進めず人に返す
+    local config_diff
+    config_diff="$(diff "$sdir/round-$round.config.before" <(config_snapshot "$wt_path") || true)"
+    if [ -n "$config_diff" ]; then
+      escalate "$n" "$sdir" "$wt_path" "worker が repo の git 設定 (.git/config、本体と共有) を変更した。内容を確認して元に戻すこと:
+$config_diff"
+      return 1
+    fi
+    if stop_requested; then
+      set_status "$sdir" stopped
+      log "#$n: stopped (停止指示。worktree は残す: $wt_path。再開は wt loop $n)"
+      return 2
+    fi
+    if ! envelope_ok "$out"; then
+      if [ "$elapsed" -lt "$INFRA_SECS" ]; then
+        set_status "$sdir" failed
+        log "#$n: failed — worker が ${elapsed}s で異常終了した (利用上限や API 障害の疑い): $(tail -c 300 "$out.err" 2>/dev/null | tr '\n' ' ')"
+        return 3
+      fi
+      feedback="前回のセッションは正常に終了しなかった（timeout か異常終了）。$(tail -c 800 "$out.err" 2>/dev/null) worktree の状態を git status / git log で確認し、続きから進めること。"
+      log "#$n round $round: worker が正常終了しなかった (${elapsed}s)"
+      continue
+    fi
+    report="$(envelope_result "$out")"
+    printf '%s\n' "$report" >"$sdir/round-$round.worker.md"
+    if report_blocked "$report"; then
+      escalate "$n" "$sdir" "$wt_path" "worker が BLOCKED を返した:
+$(printf '%s' "$report" | head -20)"
+      return 1
+    fi
+
+    # 検証 1: 未コミットが無い
+    local dirty
+    dirty="$(git -C "$wt_path" status --porcelain)"
+    if [ -n "$dirty" ]; then
+      feedback="未コミットの変更が残っている。内容を確認して、必要なものはコミットし、不要なものは元に戻すこと:
+$dirty"
+      log "#$n round $round: 未コミットあり"
+      continue
+    fi
+    # 検証 2: base の取り込み (コンフリクトは worker に解かせる)
+    git -C "$wt_path" fetch -q origin "$DEFAULT" 2>>"$sdir/log" || true
+    if ! gitq -C "$wt_path" merge --no-edit "origin/$DEFAULT" >>"$sdir/log" 2>&1; then
+      local conflicts
+      conflicts="$(git -C "$wt_path" diff --name-only --diff-filter=U)"
+      feedback="origin/$DEFAULT の取り込みでコンフリクトした（worktree は merge 中の状態）。次のファイルを解決して git add し、git commit で merge を完了させること:
+$conflicts"
+      log "#$n round $round: コンフリクト"
+      continue
+    fi
+    # 検証 3: コミットがある
+    if [ "$(git -C "$wt_path" rev-list --count "origin/$DEFAULT..HEAD")" -eq 0 ]; then
+      feedback="ブランチに base からのコミットが無い。実装をコミットすること。"
+      log "#$n round $round: コミット無し"
+      continue
+    fi
+    # 検証 4: scripts/check
+    if [ -x "$wt_path/scripts/check" ]; then
+      log "#$n round $round: scripts/check"
+      if ! run_check_sandboxed "$wt_path" "$sdir/round-$round.check.log"; then
+        feedback="scripts/check が失敗した。ログ末尾:
+$(tail -60 "$sdir/round-$round.check.log")"
+        log "#$n round $round: check 失敗"
+        continue
+      fi
+    else
+      log "#$n: scripts/check が無い (ローカルゲートをスキップ)"
+    fi
+    # 検証 5: AI レビュー (別セッション)
+    local diff_file="$sdir/round-$round.diff" rprompt="$sdir/round-$round.review.prompt.md"
+    review_json="$sdir/round-$round.review.json"
+    git -C "$wt_path" diff "origin/$DEFAULT...HEAD" >"$diff_file"
+    reviewer_prompt "$n" "$title" "$body" "$diff_file" >"$rprompt"
+    log "#$n round $round: reviewer 起動"
+    run_sandboxed "$wt_path" "$rprompt" "$review_json" "$REVIEW_TIMEOUT" \
+      --no-session-persistence --permission-mode default --max-turns 40 --add-dir "$sdir" \
+      --allowedTools "Read,Glob,Grep,Bash(git diff *),Bash(git log *),Bash(git show *)" \
+      --json-schema "$REVIEW_SCHEMA" || true
+    local verdict
+    verdict="$(review_field "$review_json" '.verdict')"
+    if [ "$verdict" != "PASS" ]; then
+      feedback="AI レビューの判定: ${verdict:-不明}
+$(review_field "$review_json" '.summary')
+指摘 (blocker / major):
+$(review_field "$review_json" '.findings[] | select(.severity != "minor") | "- [\(.severity)] \(.file // "")\t\(.summary)"')
+指摘が誤りだと判断した場合は、その根拠を最終報告に書くこと。"
+      log "#$n round $round: レビュー ${verdict:-不明}"
+      continue
+    fi
+    log "#$n round $round: レビュー PASS"
+    if stop_requested; then
+      set_status "$sdir" stopped
+      log "#$n: stopped (停止指示。push 前で止めた。worktree は残す: $wt_path。再開は wt loop $n)"
+      return 2
+    fi
+
+    # 着地: push → PR → CI → merge
+    if ! gitq -C "$wt_path" push -u origin "$branch" >>"$sdir/log" 2>&1; then
+      escalate "$n" "$sdir" "$wt_path" "git push が失敗した:
+$(tail -10 "$sdir/log")"
+      return 1
+    fi
+    if [ -z "$pr_url" ]; then
+      pr_url="$(gh_main pr list --head "$branch" --state open --json url -q '.[0].url' 2>/dev/null || true)"
+    fi
+    if [ -z "$pr_url" ]; then
+      pr_body "$n" "$report" "$review_json" >"$sdir/pr-body.md"
+      pr_url="$(gh_main pr create --base "$DEFAULT" --head "$branch" --title "$title" --body-file "$sdir/pr-body.md")" ||
+        {
+          escalate "$n" "$sdir" "$wt_path" "gh pr create が失敗した"
+          return 1
+        }
+      log "#$n: PR $pr_url"
+    fi
+    printf '%s\n' "$pr_url" >"$sdir/pr-url"
+    post_review_record "$n" "$round" "$review_json" "$pr_url"
+    local ci_rc=0
+    wait_checks "$pr_url" "$sdir/round-$round.checks.log" "$wt_path" || ci_rc=$?
+    if [ "$ci_rc" -eq 2 ]; then
+      escalate "$n" "$sdir" "$wt_path" "CI の完了を ${CI_TIMEOUT}s 待っても終わらなかった（PR: $pr_url）。承認待ちの workflow や報告されない check が無いか確認する。"
+      return 1
+    fi
+    if [ "$ci_rc" -ne 0 ]; then
+      feedback="CI が失敗した（PR: $pr_url）。同じ scripts/check を CI が叩いている。失敗した check:
+$(grep -iE 'fail|error|✗|^X' "$sdir/round-$round.checks.log" | head -20)
+ローカルで scripts/check を通し、環境差（CI のクリーン checkout に無いファイルなど）を疑うこと。"
+      log "#$n round $round: CI 失敗"
+      continue
+    fi
+    if ! gh_main pr merge "$pr_url" --merge >>"$sdir/log" 2>&1; then
+      escalate "$n" "$sdir" "$wt_path" "gh pr merge が拒否された（PR: $pr_url）:
+$(tail -10 "$sdir/log")"
+      return 1
+    fi
+    log "#$n: マージ完了 $pr_url"
+    MERGED_NOW[$n]=1
+    # PR 本文の Fixes #N で閉じるのが本筋だが、閉じ損ねる経路 (base が default でない、
+    # 連携の遅れ) があると次の巡で同じ issue を拾ってしまうので、明示的にも閉じる。
+    if [ "$(issue_state_fresh "$n")" = "OPEN" ]; then
+      gh_main issue close "$n" --comment "wt loop: $pr_url をマージした" >/dev/null 2>&1 ||
+        log "#$n: issue を閉じられなかった (PR の Fixes で閉じているはず)"
+    fi
+    git -C "$MAIN_ROOT" push origin --delete "$branch" >>"$sdir/log" 2>&1 ||
+      log "#$n: remote ブランチ $branch の削除に失敗 (マージは完了)"
+    update_main_checkout
+    "$WT_BIN" rm "$task" --force >>"$sdir/log" 2>&1 || log "#$n: wt rm に失敗 (手動で wt rm $task --force)"
+    set_status "$sdir" merged
+    return 0
+  done
+  escalate "$n" "$sdir" "$wt_path" "ラウンド上限 ($MAX_ROUNDS) に達した。最後の問題:
+$feedback"
+  return 1
+}
+
+review_field() { # review_json jq_expr
+  jq -r ".structured_output // (.result | fromjson? // {}) | $2" "$1" 2>/dev/null || true
+}
+
+pr_body() { # number report review_json
+  printf '%s\n\n' "$(printf '%s' "$2" | head -c 6000)"
+  printf '## AI レビュー\n\n%s\n\n' "$(review_field "$3" '.summary')"
+  printf 'Fixes #%s\n\n' "$1"
+  printf '🤖 Generated with [Claude Code](https://claude.com/claude-code)\n'
+}
+
+post_review_record() { # number round review_json pr_url
+  local f="$STATE/$1/round-$2.review.md"
+  {
+    printf '## wt loop: AI レビュー記録 (ラウンド %s)\n\n判定: PASS\n\n%s\n\n' "$2" "$(review_field "$3" '.summary')"
+    printf '指摘:\n%s\n\nPR: %s\n' "$(review_field "$3" '.findings[] | "- [\(.severity)] \(.file // "")\t\(.summary)"')" "$4"
+  } >"$f"
+  gh_main issue comment "$1" --body-file "$f" >/dev/null 2>&1 || log "#$1: レビュー記録のコメントに失敗"
+}
+
+# CI の完了を待つ。0 = 全 pass、1 = fail、2 = 上限まで待っても終わらない。
+# "no checks reported" は、PR 作成直後や再 push 直後に check run の登録が間に合っていない
+# だけのことがある。repo に workflow があれば登録されるまで待ち続け (上限まで)、
+# workflow が無い repo だけ一度待って再確認してから CI 無しと判断する。
+wait_checks() { # pr_url log wt_path
+  local deadline=$((SECONDS + CI_TIMEOUT)) has_wf=0 seen_none=0 remaining rc
+  [ -d "$3/.github/workflows" ] && has_wf=1
+  while :; do
+    remaining=$((deadline - SECONDS))
+    [ "$remaining" -gt 0 ] || return 2
+    rc=0
+    local -a pre=()
+    command -v timeout >/dev/null 2>&1 && pre=(timeout -k 10 "$remaining")
+    (cd "$MAIN_ROOT" && "${pre[@]}" gh pr checks "$1" --watch --fail-fast --interval 15) >"$2" 2>&1 || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    [ "$rc" -eq 124 ] && return 2
+    if grep -q 'no checks reported' "$2"; then
+      seen_none=$((seen_none + 1))
+      if [ "$has_wf" -eq 0 ] && [ "$seen_none" -ge 2 ]; then
+        log "CI の check が無い (workflow も無い repo。ローカルの scripts/check を根拠にマージへ進む)"
+        return 0
+      fi
+      sleep "${WT_LOOP_CHECKS_GRACE:-20}"
+      continue
+    fi
+    return 1
+  done
+}
+
+# 本体 checkout が default branch 上でクリーンなら ff で追随させる (依存子の base を新しく保つ)
+update_main_checkout() {
+  local cur
+  cur="$(git -C "$MAIN_ROOT" symbolic-ref --short -q HEAD || true)"
+  if [ "$cur" != "$DEFAULT" ]; then
+    log "本体は $cur 上のため pull しない (worktree は origin/$DEFAULT から切るので影響なし)"
+    return 0
+  fi
+  if [ -n "$(git -C "$MAIN_ROOT" status --porcelain -uno)" ]; then
+    log "本体に未コミットの変更があるため pull しない"
+    return 0
+  fi
+  gitq -C "$MAIN_ROOT" pull -q --ff-only origin "$DEFAULT" 2>/dev/null || log "本体の pull (ff-only) に失敗。手動で更新する"
+}
+
+escalate() { # number sdir wt_path reason
+  local f="$2/escalate.md"
+  {
+    printf '## wt loop: 人間の判断が必要\n\n%s\n\n' "$4"
+    # shellcheck disable=SC2016 # Markdown のバッククォート
+    [ -n "$3" ] && printf -- '- worktree: `%s`（残してある）\n' "$3"
+    # shellcheck disable=SC2016
+    printf -- '- state: `%s`\n' "$2"
+    # shellcheck disable=SC2016
+    printf -- '- 再開するときは、原因を直してからこの issue の `%s` ラベルを外し、`wt loop %s` と番号で指定する（残った worktree と session を再利用して続きから進む）\n' "$HUMAN_LABEL" "$1"
+  } >"$f"
+  gh_main issue edit "$1" --add-label "$HUMAN_LABEL" >/dev/null 2>&1 || log "#$1: ラベル付与に失敗"
+  gh_main issue comment "$1" --body-file "$f" >/dev/null 2>&1 || log "#$1: コメントに失敗"
+  set_status "$2" needs-human
+  log "#$1: needs-human に切り出した ($(head -1 <<<"$4"))"
+}
+
+new_session_id() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  elif [ -r /proc/sys/kernel/random/uuid ]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    python3 -c 'import uuid; print(uuid.uuid4())'
+  fi
+}
+
+stop_requested() { [ -e "$STATE/STOP" ]; }
+
+# --- サブモード ------------------------------------------------------------------
+cmd_stop() {
+  mkdir -p "$STATE"
+  : >"$STATE/STOP"
+  log "停止を指示した ($STATE/STOP)。進行中の loop は次の区切り (claude 呼び出しの直後 / push の前 / issue の間) で止まる"
+}
+
+cmd_status() {
+  [ -d "$STATE" ] || {
+    log "state が無い: $STATE"
+    return 0
+  }
+  log "state: $STATE"
+  local d
+  for d in "$STATE"/*/; do
+    [ -f "$d/status" ] || continue
+    printf '#%s\t%s\tround %s\t%s\n' "$(basename "$d")" "$(cat "$d/status")" "$(cat "$d/round" 2>/dev/null || echo 0)" "$(cat "$d/task" 2>/dev/null)"
+  done
+  [ -e "$STATE/STOP" ] && log "STOP が置かれている (次回 wt loop の開始時に消える)"
+  return 0
+}
+
+preflight() {
+  command -v gh >/dev/null 2>&1 || die "gh が無い"
+  command -v jq >/dev/null 2>&1 || die "jq が無い"
+  [ "$DRY_RUN" -eq 1 ] || command -v claude >/dev/null 2>&1 || die "claude CLI が無い"
+  gh_main repo view --json nameWithOwner >/dev/null 2>&1 || die "GitHub リポジトリではない (gh repo view が失敗)"
+  DEFAULT="$(default_branch)"
+  [ -n "$DEFAULT" ] || die "default branch を取得できない"
+  git -C "$MAIN_ROOT" fetch -q origin "$DEFAULT" || die "origin/$DEFAULT を fetch できない"
+}
+
+cmd_loop() {
+  mkdir -p "$STATE"
+  preflight
+  log "state: $STATE (進行は loop.log、停止は wt loop --stop)"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    acquire_lock
+    rm -f "$STATE/STOP"
+  fi
+  ensure_label "$LABEL" "1d76db" "wt loop が無人で進める issue"
+  ensure_label "$HUMAN_LABEL" "d93f0b" "wt loop が人間の判断待ちに切り出した issue"
+
+  local total=0 merged=0 human=0 pass=0 selected n t rc pass_merged stop=0
+  while :; do
+    pass=$((pass + 1))
+    ISSUE_CACHE=()
+    selected="$(select_issues)"
+    if [ -z "$selected" ]; then
+      [ "$pass" -eq 1 ] && log "対象の issue が無い (ラベル $LABEL)"
+      break
+    fi
+    log "対象 (${pass} 巡目):"
+    printf '%s\n' "$selected" | while IFS=$'\t' read -r n t; do printf '  #%s %s\n' "$n" "$t" >&2; done
+    if [ "$DRY_RUN" -eq 1 ]; then
+      log "--dry-run のためここで終わる"
+      return 0
+    fi
+    pass_merged=0
+    while IFS=$'\t' read -r n t; do
+      [ -n "$n" ] || continue
+      if [ "$MAX_ISSUES" -gt 0 ] && [ "$total" -ge "$MAX_ISSUES" ]; then
+        log "--max-issues $MAX_ISSUES に達した"
+        stop=1
+        break
+      fi
+      if stop_requested; then
+        log "停止指示があったため次の issue に進まない"
+        stop=1
+        break
+      fi
+      rc=0
+      run_issue "$n" "$t" </dev/null || rc=$?
+      total=$((total + 1))
+      case "$rc" in
+        0)
+          merged=$((merged + 1))
+          pass_merged=$((pass_merged + 1))
+          ;;
+        1) human=$((human + 1)) ;;
+        2) stop=1 ;;
+        3)
+          log "claude か gh が動いていない疑いがあるため loop を止める (直したら wt loop $n と番号指定で再開)"
+          stop=2
+          ;;
+      esac
+      [ "$stop" -ne 0 ] && break
+    done <<<"$selected"
+    # 何かマージできたら依存が解けた子が出ている可能性があるので選び直す。
+    # 番号指定のときは指定分だけで終わる。
+    [ "$stop" -ne 0 ] && break
+    [ "$pass_merged" -gt 0 ] || break
+    [ "$EXPLICIT" -eq 0 ] || break
+  done
+  log "終了: 処理 $total 件 / マージ $merged 件 / $HUMAN_LABEL $human 件 (state: $STATE)"
+  [ "$stop" -eq 2 ] && return 1
+  return 0
+}
+
+# --- 引数 ----------------------------------------------------------------------
+MODE=loop
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --stop) MODE=stop ;;
+    status) MODE=status ;;
+    --label)
+      [ $# -ge 2 ] || die "--label に値が必要"
+      LABEL="$2"
+      shift
+      ;;
+    --max-issues)
+      [ $# -ge 2 ] || die "--max-issues に値が必要"
+      MAX_ISSUES="$2"
+      shift
+      ;;
+    --max-rounds)
+      [ $# -ge 2 ] || die "--max-rounds に値が必要"
+      MAX_ROUNDS="$2"
+      shift
+      ;;
+    --model)
+      [ $# -ge 2 ] || die "--model に値が必要"
+      MODEL="$2"
+      shift
+      ;;
+    --worker-timeout)
+      [ $# -ge 2 ] || die "--worker-timeout に値が必要"
+      WORKER_TIMEOUT="$2"
+      shift
+      ;;
+    --dry-run) DRY_RUN=1 ;;
+    -h | --help)
+      awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"
+      exit 0
+      ;;
+    -*) die "不明なオプション: $1" ;;
+    *)
+      n="${1#\#}"
+      [[ "$n" =~ ^[0-9]+$ ]] || die "issue 番号として解釈できない: $1"
+      ISSUES+=("$n")
+      ;;
+  esac
+  shift
+done
+if ! [[ "$MAX_ROUNDS" =~ ^[0-9]+$ ]] || [ "$MAX_ROUNDS" -lt 1 ]; then
+  die "--max-rounds は 1 以上の整数"
+fi
+[[ "$MAX_ISSUES" =~ ^[0-9]+$ ]] || die "--max-issues は整数"
+[ "${#ISSUES[@]}" -gt 0 ] && EXPLICIT=1
+
+resolve_repo
+STATE="$(state_root)"
+DEFAULT=""
+
+case "$MODE" in
+  stop) cmd_stop ;;
+  status) cmd_status ;;
+  loop) cmd_loop ;;
+esac

@@ -15,6 +15,11 @@ set -uo pipefail
 # scripts/check として走らされても、外の環境に左右されないよう最初に隔離する。
 # テストが必要とする環境は各ヘルパーが明示的に組み立てる。
 unset GIT_CONFIG_COUNT GH_CONFIG_DIR GIT_TERMINAL_PROMPT
+# PATH 先頭の git shim (push を拒否する) も外す。fixture は temp の bare origin に push する。
+if [ -n "${WT_LOOP_REAL_GIT:-}" ]; then
+  PATH="$(dirname "$WT_LOOP_REAL_GIT"):$PATH"
+fi
+unset WT_LOOP_REAL_GIT
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WT="$REPO_ROOT/wt"
@@ -88,7 +93,10 @@ issues="$d/issues.json"
 case "${1:-} ${2:-}" in
   "repo view")
     case "$*" in
-      *defaultBranchRef*) echo dev ;;
+      *defaultBranchRef*)
+        [ -e "$d/no-default" ] && exit 1
+        echo dev
+        ;;
       *) echo '{"nameWithOwner":"t/repo"}' ;;
     esac
     ;;
@@ -122,8 +130,15 @@ case "${1:-} ${2:-}" in
       shift
     done
     ;;
+  "auth status")
+    [ -e "$d/auth-fail" ] && { echo "You are not logged into any GitHub hosts" >&2; exit 1; }
+    exit 0
+    ;;
   "label list") cat "$d/labels" 2>/dev/null ;;
-  "label create") printf '%s\n' "$3" >>"$d/labels" ;;
+  "label create")
+    [ -e "$d/label-create-fail" ] && exit 1
+    printf '%s\n' "$3" >>"$d/labels"
+    ;;
   "pr list")
     head=""
     while [ $# -gt 0 ]; do [ "$1" = "--head" ] && head="$2"; shift; done
@@ -198,6 +213,9 @@ pwd -P >>"${CHECK_LOG:-/dev/null}"
 CHK
   chmod +x "$REPO/scripts/check"
   printf 'base\n' >"$REPO/shared.txt"
+  # wt loop doctor を通る repo にする (ci.yml / ignore / ラベル)
+  mkdir -p "$REPO/.github/workflows"
+  printf 'name: ci\n' >"$REPO/.github/workflows/ci.yml"
   git -C "$REPO" add -A
   git -C "$REPO" commit -qm init
   git -C "$REPO" remote add origin "$ORIGIN"
@@ -210,6 +228,7 @@ CHK
   mkdir -p "$GH_STUB_DIR" "$CLAUDE_STUB_DIR" "$STATE_ROOT"
   printf '[]\n' >"$GH_STUB_DIR/issues.json"
   printf '{}\n' >"$GH_STUB_DIR/prs.json"
+  printf 'wt-loop\nneeds-human\n' >"$GH_STUB_DIR/labels"
   export GH_STUB_DIR CLAUDE_STUB_DIR
 }
 
@@ -245,7 +264,7 @@ EOF
 
 # wt loop を stub 付きで実行する (stdout + stderr をまとめて返す)
 loop() { # args...
-  (cd "$REPO" && env -u WT_HOME HOME="$TMP/home" PATH="$TMP/bin:$SAFE_PATH" \
+  (cd "${LOOP_CWD:-$REPO}" && env -u WT_HOME HOME="$TMP/home" PATH="${LOOP_BIN:-$TMP/bin}:$SAFE_PATH" \
     WT_LOOP_STATE="$STATE_ROOT" WT_LOOP_CHECKS_GRACE=0 WT_LOOP_INFRA_SECS="${INFRA_SECS:-0}" \
     GH_STUB_ORIGIN="$ORIGIN" CHECK_LOG="$TMP/check.log" \
     "$WT" loop "$@" 2>&1)
@@ -298,8 +317,7 @@ assert_no_dir "$REPO/.claude/worktrees/1-add-greeting" "dry-run: worktree を作
 out="$(loop 3 11 --dry-run)"
 assert_contains "dry-run: 番号指定はラベルを問わず対象にする" "$out" "#3 No label"
 assert_contains "dry-run: 番号指定でも CLOSED は飛ばす" "$out" "skip #11: CLOSED"
-assert_contains "dry-run: 無いラベルは作る" "$(cat "$GH_STUB_DIR/labels")" "wt-loop"
-assert_contains "dry-run: needs-human ラベルも作る" "$(cat "$GH_STUB_DIR/labels")" "needs-human"
+assert_contains "dry-run: 起動前の診断を出す" "$out" "OK   scripts/check"
 
 # --- test 2: 正常系 — worker → check → reviewer PASS → PR → CI → merge → 片付け ---
 make_fixture t2
@@ -790,12 +808,7 @@ out="$(loop 150)"
 assert_eq "infra: 番号指定で再開して merged" "merged" "$(cat "$(state_dir 150)/status" 2>/dev/null)"
 
 # --- test 20: CI 待ちの上限 / workflow がある repo では no checks を待ち続ける -------
-make_fixture t20
-mkdir -p "$REPO/.github/workflows"
-printf 'name: ci\n' >"$REPO/.github/workflows/ci.yml"
-git -C "$REPO" add -A
-git -C "$REPO" commit -qm ci
-git -C "$REPO" push -q origin dev
+make_fixture t20 # fixture は .github/workflows/ci.yml を持つ
 add_issue 160 "Slow CI" OPEN "wt-loop" "x"
 worker_step 1 a.txt v1
 reviewer_step 2 PASS ok '[]'
@@ -816,6 +829,134 @@ out="$(loop)"
 assert_contains "lock: 実行中の loop があれば止まる" "$out" "別の wt loop (pid $$) が実行中"
 assert_eq "lock: claude を呼ばない" "0" "$(claude_calls)"
 rm -f "$sd_root/lock"
+
+# --- test 22: wt loop doctor — ループに乗せられる repo かを診断する ----------------
+make_fixture t22
+out="$(loop doctor; echo "rc=$?")"
+assert_contains "doctor: scripts/check が実行可能なら OK" "$out" "OK   scripts/check が実行可能"
+assert_contains "doctor: ci.yml があれば OK" "$out" "OK   .github/workflows/ci.yml がある"
+assert_contains "doctor: .claude/worktrees/ が ignore 済みなら OK" "$out" "OK   .claude/worktrees/ が ignore 済み"
+assert_contains "doctor: gh 認証が通れば OK" "$out" "OK   gh が認証済み"
+assert_contains "doctor: default branch を出す" "$out" "OK   default branch を取得できる (dev)"
+assert_contains "doctor: ラベル wt-loop があれば OK" "$out" "OK   ラベル wt-loop がある"
+assert_contains "doctor: ラベル needs-human があれば OK" "$out" "OK   ラベル needs-human がある"
+assert_contains "doctor: 本体が default branch 上でクリーンなら OK" "$out" "OK   本体が dev 上でクリーン"
+assert_contains "doctor: claude CLI があれば OK" "$out" "OK   claude CLI がある"
+assert_not_contains "doctor: 全部 OK なら NG を出さない" "$out" "NG "
+assert_contains "doctor: 全部 OK なら exit 0" "$out" "rc=0"
+assert_eq "doctor: claude を呼ばない" "0" "$(claude_calls)"
+# worktree から実行しても本体 checkout を検査する
+git -C "$REPO" worktree add -q -b worktree-x "$REPO/.claude/worktrees/x" dev
+printf 'dirty\n' >"$REPO/.claude/worktrees/x/shared.txt"
+out="$(LOOP_CWD="$REPO/.claude/worktrees/x" loop doctor; echo "rc=$?")"
+assert_contains "doctor: worktree から実行しても本体を検査する" "$out" "OK   本体が dev 上でクリーン"
+assert_contains "doctor: worktree からでも exit 0" "$out" "rc=0"
+
+# NG ごとに直し方を 1 行で出し、exit 1
+make_fixture t22b
+git -C "$REPO" rm -q .github/workflows/ci.yml
+git -C "$REPO" update-index --chmod=-x scripts/check
+chmod -x "$REPO/scripts/check"
+git -C "$REPO" commit -qm "break"
+: >"$REPO/.git/info/exclude"
+: >"$GH_STUB_DIR/labels"
+: >"$GH_STUB_DIR/auth-fail"
+git -C "$REPO" switch -q -c feature
+out="$(loop doctor; echo "rc=$?")"
+assert_contains "doctor NG: scripts/check が実行可能でない" "$out" "NG   scripts/check が実行可能"
+assert_contains "doctor NG: scripts/check の直し方" "$out" "chmod +x scripts/check"
+assert_contains "doctor NG: ci.yml が無い" "$out" "NG   .github/workflows/ci.yml がある"
+assert_contains "doctor NG: ci.yml の直し方" "$out" "scripts/check を叩く workflow を .github/workflows/ci.yml に置く"
+assert_contains "doctor NG: ignore されていない" "$out" "NG   .claude/worktrees/ が ignore 済み"
+assert_contains "doctor NG: ignore の直し方" "$out" ".gitignore か .git/info/exclude に .claude/worktrees/ を足す"
+assert_contains "doctor NG: gh 未認証" "$out" "NG   gh が認証済み"
+assert_contains "doctor NG: gh の直し方" "$out" "gh auth login"
+assert_contains "doctor NG: ラベル wt-loop が無い" "$out" "NG   ラベル wt-loop がある"
+assert_contains "doctor NG: ラベルの直し方" "$out" "wt loop doctor --fix-labels"
+assert_contains "doctor NG: ラベル needs-human が無い" "$out" "NG   ラベル needs-human がある"
+assert_contains "doctor NG: 本体が default branch 上に無い" "$out" "NG   本体が dev 上でクリーン"
+assert_contains "doctor NG: ブランチの直し方" "$out" "git switch dev"
+assert_contains "doctor NG: exit 1" "$out" "rc=1"
+assert_eq "doctor NG: NG は 1 項目 1 行" "7" "$(printf '%s\n' "$out" | grep -c '^NG   ')"
+# WT_HOME で worktree を repo の外に作るなら ignore は要らない
+out="$(cd "$REPO" && env HOME="$TMP/home" PATH="$TMP/bin:$SAFE_PATH" WT_LOOP_STATE="$STATE_ROOT" WT_HOME="$TMP/wt-home" "$WT" loop doctor 2>&1)"
+assert_contains "doctor: WT_HOME 使用時は ignore を求めない" "$out" "OK   .claude/worktrees/ が ignore 済み (WT_HOME"
+# 本体の未コミット変更
+git -C "$REPO" switch -q dev
+printf 'dirty\n' >"$REPO/shared.txt"
+out="$(loop doctor; echo "rc=$?")"
+assert_contains "doctor NG: 本体に未コミットの変更" "$out" "NG   本体が dev 上でクリーン"
+assert_contains "doctor NG: 未コミットの直し方" "$out" "未コミットの変更がある"
+git -C "$REPO" checkout -q -- shared.txt
+# default branch を取得できない
+: >"$GH_STUB_DIR/no-default"
+out="$(loop doctor; echo "rc=$?")"
+assert_contains "doctor NG: default branch を取得できない" "$out" "NG   default branch を取得できる"
+assert_contains "doctor NG: default branch 不明なら本体の検査も NG" "$out" "NG   本体が default branch 上でクリーン"
+rm -f "$GH_STUB_DIR/no-default"
+# claude CLI が無い (PATH から外す。システムに claude があるならこのケースは検証できない)
+if PATH="$SAFE_PATH" command -v claude >/dev/null 2>&1; then
+  echo "skip - $SAFE_PATH に claude があるため claude 不在のケースをスキップ"
+else
+  mkdir -p "$TMP/bin-noclaude"
+  ln -sf "$TMP/bin/gh" "$TMP/bin-noclaude/gh"
+  out="$(LOOP_BIN="$TMP/bin-noclaude" loop doctor; echo "rc=$?")"
+  assert_contains "doctor NG: claude CLI が無い" "$out" "NG   claude CLI がある"
+  assert_contains "doctor NG: claude の直し方" "$out" "Claude Code を入れて PATH に通す"
+fi
+# --label で対象ラベルを変えたら、そのラベルを検査する
+out="$(loop doctor --label ready)"
+assert_contains "doctor: --label のラベルを検査する" "$out" "NG   ラベル ready がある"
+
+# --fix-labels はラベルだけ作る (repo のファイルは触らない)
+rm -f "$GH_STUB_DIR/auth-fail"
+out="$(loop doctor --fix-labels; echo "rc=$?")"
+assert_contains "fix-labels: wt-loop を作る" "$(cat "$GH_STUB_DIR/gh.log")" "label create wt-loop"
+assert_contains "fix-labels: needs-human を作る" "$(cat "$GH_STUB_DIR/gh.log")" "label create needs-human"
+assert_contains "fix-labels: 作ったラベルは OK になる" "$out" "OK   ラベル wt-loop がある"
+assert_contains "fix-labels: 作ったことを出す" "$out" "ラベル wt-loop がある (--fix-labels で作った)"
+assert_contains "fix-labels: 他の NG は残る" "$out" "NG   .github/workflows/ci.yml がある"
+assert_contains "fix-labels: 他の NG があれば exit 1" "$out" "rc=1"
+if [ -e "$REPO/.github/workflows/ci.yml" ]; then fail "fix-labels: ci.yml を作らない"; else pass "fix-labels: ci.yml を作らない"; fi
+if [ -x "$REPO/scripts/check" ]; then fail "fix-labels: scripts/check を変えない"; else pass "fix-labels: scripts/check を変えない"; fi
+assert_eq "fix-labels: exclude を触らない" "" "$(cat "$REPO/.git/info/exclude")"
+assert_eq "fix-labels: 本体の作業ツリーを触らない" "" "$(git -C "$REPO" status --porcelain)"
+out="$(loop doctor --fix-labels)"
+assert_eq "fix-labels: 既にあるラベルは作り直さない" "2" "$(grep -c '^label create' "$GH_STUB_DIR/gh.log")"
+# ラベルを作れなかったら NG のまま
+make_fixture t22c
+: >"$GH_STUB_DIR/labels"
+: >"$GH_STUB_DIR/label-create-fail"
+out="$(loop doctor --fix-labels; echo "rc=$?")"
+assert_contains "fix-labels: 作れなければ NG のまま" "$out" "NG   ラベル wt-loop がある"
+assert_contains "fix-labels: 作れなければ exit 1" "$out" "rc=1"
+# ラベル以外が全部 OK なら --fix-labels だけで exit 0 になる
+rm -f "$GH_STUB_DIR/label-create-fail"
+out="$(loop doctor --fix-labels; echo "rc=$?")"
+assert_contains "fix-labels: ラベルを作れば exit 0" "$out" "rc=0"
+
+# wt loop 本体は起動前に同じ検査を走らせ、NG なら始めない
+make_fixture t22d
+add_issue 180 "Blocked by doctor" OPEN "wt-loop" "x"
+: >"$GH_STUB_DIR/labels"
+out="$(loop; echo "rc=$?")"
+assert_contains "loop 前検査: 診断を出す" "$out" "NG   ラベル wt-loop がある"
+assert_contains "loop 前検査: NG なら始めない" "$out" "wt loop doctor"
+assert_contains "loop 前検査: exit 1" "$out" "rc=1"
+assert_eq "loop 前検査: claude を呼ばない" "0" "$(claude_calls)"
+assert_eq "loop 前検査: issue に手を付けない" "" "$(state_dir 180)"
+assert_not_contains "loop 前検査: ラベルを勝手に作らない" "$(cat "$GH_STUB_DIR/gh.log")" "label create"
+# --dry-run は診断を出すだけで、NG でも対象の一覧まで出す (何も作らない)
+out="$(loop --dry-run; echo "rc=$?")"
+assert_contains "dry-run 前検査: 診断を出す" "$out" "NG   ラベル wt-loop がある"
+assert_contains "dry-run 前検査: 対象の一覧も出す" "$out" "#180 Blocked by doctor"
+assert_contains "dry-run 前検査: NG があれば exit 1" "$out" "rc=1"
+assert_not_contains "dry-run 前検査: ラベルを作らない" "$(cat "$GH_STUB_DIR/gh.log")" "label create"
+assert_eq "dry-run 前検査: claude を呼ばない" "0" "$(claude_calls)"
+# 検査が全部 OK なら dry-run は exit 0
+printf 'wt-loop\nneeds-human\n' >"$GH_STUB_DIR/labels"
+out="$(loop --dry-run; echo "rc=$?")"
+assert_contains "dry-run 前検査: 全部 OK なら exit 0" "$out" "rc=0"
 
 # --- test 13: 引数の検証 ---------------------------------------------------------
 out="$(loop --max-rounds 0)"

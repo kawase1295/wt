@@ -50,11 +50,13 @@
 #       worktree 内から task 省略で自分を片付けられる (workspace close は最後)
 #   wt loop [<issue>...] [--label <name>] [--max-issues <n>] [--max-rounds <n>] [--dry-run]
 #   wt loop --stop / wt loop status
+#   wt loop doctor [--label <name>] [--fix-labels]
 #       ラベル付き (既定 wt-loop) の open issue を、人間の操作なしに
 #       worktree 作成 → headless claude で実装 → scripts/check → 別セッションの
 #       AI レビュー → PR → CI → マージ → 片付け → 次の issue、と回す driver。
 #       落ちた工程は同じ worker に渡して再試行 (上限 --max-rounds)、超えたら
-#       needs-human ラベルで切り出して次へ進む。詳細は wt loop --help
+#       needs-human ラベルで切り出して次へ進む。doctor は repo がループに乗せられる
+#       状態かを診断する (wt loop も起動前に同じ検査を走らせる)。詳細は wt loop --help
 #
 # bootstrap の共通処理: .worktreeinclude (gitignore 構文) に列挙されたファイルを
 # 本体から実体コピー (既存は上書きしない)、.env を本体へ symlink、

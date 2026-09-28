@@ -304,7 +304,7 @@ wt loop（dev 側、bash）
 
 Claude が担うのは「実装」と「レビュー判定」だけで、どちらも headless（`claude -p`）の別セッション。reviewer には diff と issue 本文と合否基準しか渡さない（書いた本人に合否を判定させない）。minor のみ PASS、blocker / major は FAIL、迷ったら FAIL。
 
-落ちた工程（未コミット / コンフリクト / `scripts/check` / レビュー FAIL / CI）は、その内容を同じ worker セッションに `--resume` で渡して次のラウンドにする。ラウンド上限（`--max-rounds`、既定 3）を超える、worker が最終報告を `BLOCKED:` で始める（本番環境が要る・人間の判断が要る等）、push / merge が拒否される、CI 待ちが上限（`WT_LOOP_CI_TIMEOUT`、既定 1800 秒）に達する、のどれかで issue に `needs-human` ラベルとコメント（理由・worktree・state の場所）を付けて次の issue へ進む。worktree は残るので、原因を直してラベルを外し、`wt loop <N>` と番号で指定すれば、残った worktree と session を再利用して続きから進む。worker が起動直後（`WT_LOOP_INFRA_SECS`、既定 60 秒未満）に異常終了したときは作業の失敗ではなく利用上限や API 障害とみなし、その issue を `failed` にして loop 全体を止める（キュー全体に `needs-human` を付けない）。
+落ちた工程（未コミット / コンフリクト / `scripts/check` / レビュー FAIL / CI）は、その内容を同じ worker セッションに `--resume` で渡して次のラウンドにする。ラウンド上限（`--max-rounds`、既定 3）を超える、worker が最終報告を `BLOCKED:` で始める（本番環境が要る・人間の判断が要る等）、push / merge が拒否される、CI 待ちが上限（`WT_LOOP_CI_TIMEOUT`、既定 1800 秒）に達する、のどれかで issue に `needs-human` ラベルとコメント（理由・worktree・state の場所）を付けて次の issue へ進む。worktree は残るので、原因を直してラベルを外し、`wt loop <N>` と番号で指定すれば、残った worktree と session を再利用して続きから進む。worker の問いには issue コメントで答えれば worker に届く（エスカレーション後に付いたコメントと、書き直した issue 本文を、driver が再開時のプロンプトに「前回からの引き継ぎ」として渡す。driver 自身のコメントと、前回の再開で渡したコメントは除く）。worker が起動直後（`WT_LOOP_INFRA_SECS`、既定 60 秒未満）に異常終了したときは作業の失敗ではなく利用上限や API 障害とみなし、その issue を `failed` にして loop 全体を止める（キュー全体に `needs-human` を付けない）。
 
 **権限設定は変えない。** worker は `--permission-mode acceptEdits` と allowlist（git / テスト / パッケージマネージャ / 読み取り系のシェルコマンド。任意コードを実行できる `bash` / `sh` と `gh` は入れない。`WT_LOOP_EXTRA_TOOLS` で追記、`WT_LOOP_ALLOWED_TOOLS` で差し替え）で動く。headless では `--permission-mode auto` が書き込みを拒否するため使わない。
 

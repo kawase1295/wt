@@ -840,7 +840,9 @@ assert_contains "doctor: gh 認証が通れば OK" "$out" "OK   gh が認証済�
 assert_contains "doctor: default branch を出す" "$out" "OK   default branch を取得できる (dev)"
 assert_contains "doctor: ラベル wt-loop があれば OK" "$out" "OK   ラベル wt-loop がある"
 assert_contains "doctor: ラベル needs-human があれば OK" "$out" "OK   ラベル needs-human がある"
-assert_contains "doctor: 本体が default branch 上でクリーンなら OK" "$out" "OK   本体が dev 上でクリーン"
+assert_contains "doctor: 本体が default branch 上なら OK" "$out" "OK   本体が dev 上にある"
+assert_contains "doctor: 本体がクリーンなら OK" "$out" "OK   本体に未コミットの変更が無い"
+assert_not_contains "doctor: 全部 OK なら WARN を出さない" "$out" "WARN "
 assert_contains "doctor: claude CLI があれば OK" "$out" "OK   claude CLI がある"
 assert_not_contains "doctor: 全部 OK なら NG を出さない" "$out" "NG "
 assert_contains "doctor: 全部 OK なら exit 0" "$out" "rc=0"
@@ -849,8 +851,24 @@ assert_eq "doctor: claude を呼ばない" "0" "$(claude_calls)"
 git -C "$REPO" worktree add -q -b worktree-x "$REPO/.claude/worktrees/x" dev
 printf 'dirty\n' >"$REPO/.claude/worktrees/x/shared.txt"
 out="$(LOOP_CWD="$REPO/.claude/worktrees/x" loop doctor; echo "rc=$?")"
-assert_contains "doctor: worktree から実行しても本体を検査する" "$out" "OK   本体が dev 上でクリーン"
+assert_contains "doctor: worktree から実行しても本体を検査する" "$out" "OK   本体に未コミットの変更が無い"
 assert_contains "doctor: worktree からでも exit 0" "$out" "rc=0"
+
+# 本体が default branch 以外にいるだけなら WARN で exit 0 (plugin 配布で main を checkout している repo など)
+git -C "$REPO" switch -q -c release
+out="$(loop doctor; echo "rc=$?")"
+assert_contains "doctor WARN: 本体が別ブランチなら WARN" "$out" "WARN 本体が dev 上にある"
+assert_contains "doctor WARN: いまのブランチを示す" "$out" "本体は release 上にある"
+assert_not_contains "doctor WARN: NG を出さない" "$out" "NG "
+assert_contains "doctor WARN: exit code に影響しない" "$out" "rc=0"
+# 別ブランチかつ dirty なら、クリーンさだけ NG で exit 1
+printf 'dirty\n' >"$REPO/shared.txt"
+out="$(loop doctor; echo "rc=$?")"
+assert_contains "doctor: 別ブランチでも dirty は NG" "$out" "NG   本体に未コミットの変更が無い"
+assert_contains "doctor: 別ブランチの WARN も併記する" "$out" "WARN 本体が dev 上にある"
+assert_contains "doctor: dirty なら exit 1" "$out" "rc=1"
+git -C "$REPO" checkout -q -- shared.txt
+git -C "$REPO" switch -q dev
 
 # NG ごとに直し方を 1 行で出し、exit 1
 make_fixture t22b
@@ -874,10 +892,11 @@ assert_contains "doctor NG: gh の直し方" "$out" "gh auth login"
 assert_contains "doctor NG: ラベル wt-loop が無い" "$out" "NG   ラベル wt-loop がある"
 assert_contains "doctor NG: ラベルの直し方" "$out" "wt loop doctor --fix-labels"
 assert_contains "doctor NG: ラベル needs-human が無い" "$out" "NG   ラベル needs-human がある"
-assert_contains "doctor NG: 本体が default branch 上に無い" "$out" "NG   本体が dev 上でクリーン"
-assert_contains "doctor NG: ブランチの直し方" "$out" "git switch dev"
+assert_contains "doctor WARN: 本体が default branch 上に無い" "$out" "WARN 本体が dev 上にある"
+assert_contains "doctor WARN: 本体 pull がスキップされる旨" "$out" "マージ後の本体 pull はスキップされる"
+assert_not_contains "doctor WARN: ブランチ違いは NG にしない" "$out" "NG   本体が"
 assert_contains "doctor NG: exit 1" "$out" "rc=1"
-assert_eq "doctor NG: NG は 1 項目 1 行" "7" "$(printf '%s\n' "$out" | grep -c '^NG   ')"
+assert_eq "doctor NG: NG は 1 項目 1 行" "6" "$(printf '%s\n' "$out" | grep -c '^NG   ')"
 # WT_HOME で worktree を repo の外に作るなら ignore は要らない
 out="$(cd "$REPO" && env HOME="$TMP/home" PATH="$TMP/bin:$SAFE_PATH" WT_LOOP_STATE="$STATE_ROOT" WT_HOME="$TMP/wt-home" "$WT" loop doctor 2>&1)"
 assert_contains "doctor: WT_HOME 使用時は ignore を求めない" "$out" "OK   .claude/worktrees/ が ignore 済み (WT_HOME"
@@ -885,14 +904,16 @@ assert_contains "doctor: WT_HOME 使用時は ignore を求めない" "$out" "OK
 git -C "$REPO" switch -q dev
 printf 'dirty\n' >"$REPO/shared.txt"
 out="$(loop doctor; echo "rc=$?")"
-assert_contains "doctor NG: 本体に未コミットの変更" "$out" "NG   本体が dev 上でクリーン"
-assert_contains "doctor NG: 未コミットの直し方" "$out" "未コミットの変更がある"
+assert_contains "doctor NG: 本体に未コミットの変更" "$out" "NG   本体に未コミットの変更が無い"
+assert_contains "doctor NG: 未コミットの直し方" "$out" "commit するか退避する"
+assert_contains "doctor NG: 未コミットなら exit 1" "$out" "rc=1"
 git -C "$REPO" checkout -q -- shared.txt
 # default branch を取得できない
 : >"$GH_STUB_DIR/no-default"
 out="$(loop doctor; echo "rc=$?")"
 assert_contains "doctor NG: default branch を取得できない" "$out" "NG   default branch を取得できる"
-assert_contains "doctor NG: default branch 不明なら本体の検査も NG" "$out" "NG   本体が default branch 上でクリーン"
+assert_contains "doctor: default branch 不明ならブランチは検査できない旨を WARN" "$out" "WARN 本体が default branch 上にある"
+assert_contains "doctor: default branch 不明でもクリーンさは検査する" "$out" "OK   本体に未コミットの変更が無い"
 rm -f "$GH_STUB_DIR/no-default"
 # claude CLI が無い (PATH から外す。システムに claude があるならこのケースは検証できない)
 if PATH="$SAFE_PATH" command -v claude >/dev/null 2>&1; then
@@ -957,6 +978,22 @@ assert_eq "dry-run 前検査: claude を呼ばない" "0" "$(claude_calls)"
 printf 'wt-loop\nneeds-human\n' >"$GH_STUB_DIR/labels"
 out="$(loop --dry-run; echo "rc=$?")"
 assert_contains "dry-run 前検査: 全部 OK なら exit 0" "$out" "rc=0"
+
+# 本体が default branch 以外にいても起動する (WARN を出すだけ)
+make_fixture t22e
+git -C "$REPO" switch -q -c release
+out="$(loop --dry-run; echo "rc=$?")"
+assert_contains "dry-run 前検査: 本体が別ブランチなら WARN を出す" "$out" "WARN 本体が dev 上にある"
+assert_contains "dry-run 前検査: 本体が別ブランチでも exit 0" "$out" "rc=0"
+out="$(loop; echo "rc=$?")"
+assert_not_contains "loop 前検査: 本体が別ブランチでも止めない" "$out" "NG があるため始めない"
+assert_contains "loop 前検査: 本体が別ブランチでも exit 0" "$out" "rc=0"
+# 本体が dirty なら起動しない
+printf 'dirty\n' >"$REPO/shared.txt"
+out="$(loop; echo "rc=$?")"
+assert_contains "loop 前検査: 本体が dirty なら始めない" "$out" "NG があるため始めない"
+assert_contains "loop 前検査: dirty なら exit 1" "$out" "rc=1"
+git -C "$REPO" checkout -q -- shared.txt
 
 # --- test 13: 引数の検証 ---------------------------------------------------------
 out="$(loop --max-rounds 0)"

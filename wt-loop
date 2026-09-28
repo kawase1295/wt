@@ -23,10 +23,12 @@
 #   wt loop status      state ディレクトリの issue ごとの状態を一覧する
 #   wt loop doctor [--label <name>] [--fix-labels]
 #                       repo が loop に乗せられる状態かを本体 checkout で診断し、項目ごとに
-#                       OK / NG と直し方を 1 行で出す (NG があれば exit 1)。検査項目:
-#                       scripts/check が実行可能 / .github/workflows/ci.yml / .claude/worktrees/
-#                       の ignore / gh 認証 / default branch / ラベル (対象と needs-human) /
-#                       本体が default branch 上でクリーン / claude CLI。
+#                       OK / WARN / NG と直し方を 1 行で出す (NG があれば exit 1。WARN は
+#                       exit code に影響しない)。検査項目: scripts/check が実行可能 /
+#                       .github/workflows/ci.yml / .claude/worktrees/ の ignore / gh 認証 /
+#                       default branch / ラベル (対象と needs-human) / 本体に未コミットの
+#                       変更が無い / claude CLI。本体が default branch 以外にいるのは WARN
+#                       (マージ後の本体 pull がスキップされるだけ)。
 #                       --fix-labels は無いラベルだけ作る (repo のファイルには触らない)
 #   wt loop は起動前に同じ検査を走らせ、NG なら始めない。--dry-run は診断を出して対象の
 #   一覧まで見せる (NG があれば exit 1)。
@@ -899,19 +901,22 @@ cmd_status() {
 
 # --- doctor ----------------------------------------------------------------------
 # repo が loop に乗せられる状態かを本体 checkout で検査する。1 項目 1 行で
-# "OK   <項目>" か "NG   <項目> — <直し方>" を stdout に出し、NG が 1 つでもあれば 1 を返す。
+# "OK   <項目>" / "WARN <項目> — <影響>" / "NG   <項目> — <直し方>" を stdout に出し、
+# NG が 1 つでもあれば 1 を返す (WARN は返り値に影響しない)。
 # 直すのは FIX_LABELS=1 のときのラベルだけ (repo のファイルや git の状態には触らない)。
 # 副作用として DEFAULT を埋める。
 FIX_LABELS=0
 DOCTOR_NG=0
 
-doctor_line() { # ok|ng item [fix]
-  if [ "$1" = ok ]; then
-    printf 'OK   %s\n' "$2"
-  else
-    printf 'NG   %s — %s\n' "$2" "$3"
-    DOCTOR_NG=1
-  fi
+doctor_line() { # ok|warn|ng item [fix]
+  case "$1" in
+    ok) printf 'OK   %s\n' "$2" ;;
+    warn) printf 'WARN %s — %s\n' "$2" "$3" ;;
+    *)
+      printf 'NG   %s — %s\n' "$2" "$3"
+      DOCTOR_NG=1
+      ;;
+  esac
 }
 
 doctor_label() { # name color description
@@ -964,17 +969,22 @@ run_doctor() {
   fi
   doctor_label "$LABEL" "1d76db" "wt loop が無人で進める issue"
   doctor_label "$HUMAN_LABEL" "d93f0b" "wt loop が人間の判断待ちに切り出した issue"
+  # 本体のブランチは WARN 止まり: worktree は origin/<default> から切るので、default 以外に
+  # いても失うのはマージ後の本体 pull だけ (plugin 配布で main を checkout している repo など)
   if [ -z "$DEFAULT" ]; then
-    doctor_line ng "本体が default branch 上でクリーン" "default branch が分からないため検査できない。先に default branch の NG を直す"
+    doctor_line warn "本体が default branch 上にある" "default branch が分からないため検査できない"
   else
     cur="$(git -C "$m" symbolic-ref --short -q HEAD || true)"
-    if [ "$cur" != "$DEFAULT" ]; then
-      doctor_line ng "本体が $DEFAULT 上でクリーン" "本体は ${cur:-detached HEAD} 上にある。本体 ($m) で git switch $DEFAULT する"
-    elif [ -n "$(git -C "$m" status --porcelain -uno)" ]; then
-      doctor_line ng "本体が $DEFAULT 上でクリーン" "本体 ($m) に未コミットの変更がある。commit するか退避する"
+    if [ "$cur" = "$DEFAULT" ]; then
+      doctor_line ok "本体が $DEFAULT 上にある"
     else
-      doctor_line ok "本体が $DEFAULT 上でクリーン"
+      doctor_line warn "本体が $DEFAULT 上にある" "本体は ${cur:-detached HEAD} 上にある。マージ後の本体 pull はスキップされる (worktree は origin/$DEFAULT から切るので影響なし)"
     fi
+  fi
+  if [ -n "$(git -C "$m" status --porcelain -uno)" ]; then
+    doctor_line ng "本体に未コミットの変更が無い" "本体 ($m) に未コミットの変更がある。commit するか退避する"
+  else
+    doctor_line ok "本体に未コミットの変更が無い"
   fi
   if command -v claude >/dev/null 2>&1; then
     doctor_line ok "claude CLI がある"

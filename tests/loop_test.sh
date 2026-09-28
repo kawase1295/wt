@@ -120,6 +120,10 @@ case "${1:-} ${2:-}" in
     n="$3"
     k=$(( $(ls "$d"/comment-"$n"-* 2>/dev/null | wc -l) + 1 ))
     while [ $# -gt 0 ]; do [ "$1" = "--body-file" ] && cp "$2" "$d/comment-$n-$k.md"; shift; done
+    # 本物と同じく issue view --json comments で読めるよう、issues.json にも追記する
+    jq --argjson n "$n" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --rawfile b "$d/comment-$n-$k.md" \
+      'map(if .number == $n then .comments = ((.comments // []) + [{author: {login: "wt-bot"}, createdAt: $t, body: $b}]) else . end)' \
+      "$issues" >"$issues.tmp" && mv "$issues.tmp" "$issues"
     ;;
   "issue edit")
     n="$3"
@@ -238,6 +242,18 @@ add_issue() { # number title state labels(csv) body
   jq --argjson n "$1" --arg t "$2" --arg s "$3" --argjson l "$labels" --arg b "$5" \
     '. + [{number: $n, title: $t, state: $s, labels: $l, body: $b, url: ("https://example.test/issues/" + ($n|tostring))}]' \
     "$GH_STUB_DIR/issues.json" >"$GH_STUB_DIR/issues.json.tmp"
+  mv "$GH_STUB_DIR/issues.json.tmp" "$GH_STUB_DIR/issues.json"
+}
+
+# 人間が issue にコメントする (author / createdAt / body)
+add_comment() { # number author createdAt body
+  jq --argjson n "$1" --arg a "$2" --arg t "$3" --arg b "$4" \
+    'map(if .number == $n then .comments = ((.comments // []) + [{author: {login: $a}, createdAt: $t, body: $b}]) else . end)' \
+    "$GH_STUB_DIR/issues.json" >"$GH_STUB_DIR/issues.json.tmp"
+  mv "$GH_STUB_DIR/issues.json.tmp" "$GH_STUB_DIR/issues.json"
+}
+set_issue() { # number jq_update (例: '.labels = []')
+  jq --argjson n "$1" "map(if .number == \$n then $2 else . end)" "$GH_STUB_DIR/issues.json" >"$GH_STUB_DIR/issues.json.tmp"
   mv "$GH_STUB_DIR/issues.json.tmp" "$GH_STUB_DIR/issues.json"
 }
 
@@ -691,6 +707,7 @@ out="$(loop 130)"
 assert_contains "resume: 残っている worktree を再利用する" "$out" "再開 (worktree 130-resume-me"
 assert_contains "resume: 前回の session を --resume する" "$(tr '\n' ' ' <"$CLAUDE_STUB_DIR/argv-2.txt")" "--resume $first_session "
 assert_contains "resume: 続きから進める指示を渡す" "$(cat "$CLAUDE_STUB_DIR/prompt-2.txt")" "前回の run は途中で止まった"
+assert_not_contains "resume: 回答も本文更新も無ければ引き継ぎ節を付けない" "$(cat "$CLAUDE_STUB_DIR/prompt-2.txt")" "## 前回からの引き継ぎ"
 assert_eq "resume: 完走して merged" "merged" "$(cat "$sd/status" 2>/dev/null)"
 assert_eq "resume: 両方のコミットが origin に入る" "full" "$(git -C "$ORIGIN" show dev:a.txt 2>/dev/null)"
 # session が残っていない (resume が No conversation found) ときは、issue 本文込みの新 session で続ける
@@ -713,11 +730,67 @@ EOF
 chmod +x "$CLAUDE_STUB_DIR/step-2.sh"
 worker_step 3 a.txt v1
 reviewer_step 4 PASS ok '[]'
+add_comment 131 bob "2099-01-01T00:00:00Z" "新しい session にも届く回答"
 out="$(loop 131)"
+assert_contains "resume: session 再作成時も人間の回答を渡す" "$(cat "$CLAUDE_STUB_DIR/prompt-3.txt")" "新しい session にも届く回答"
+assert_contains "resume: session 再作成時の回答は見出し付き" "$(cat "$CLAUDE_STUB_DIR/prompt-3.txt")" "### 人間からの回答"
 assert_contains "resume: session 再作成時は issue 本文を渡す" "$(cat "$CLAUDE_STUB_DIR/prompt-3.txt")" "本文が新しい session に渡る"
 assert_contains "resume: session 再作成時は引き継ぎも渡す" "$(cat "$CLAUDE_STUB_DIR/prompt-3.txt")" "## 前回からの引き継ぎ"
 assert_contains "resume: 新しい --session-id で起動する" "$(cat "$CLAUDE_STUB_DIR/argv-3.txt")" "--session-id"
 assert_eq "resume: 完走して merged" "merged" "$(cat "$(state_dir 131)/status" 2>/dev/null)"
+
+# エスカレーション後の issue コメント (人間の回答) と本文の更新を再開時に worker へ渡す
+make_fixture t15c
+add_issue 132 "Handoff" OPEN "wt-loop" "元の本文"
+add_comment 132 carol "2000-01-01T00:00:00Z" "エスカレーション前の古いコメント"
+cat >"$CLAUDE_STUB_DIR/step-1.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"BLOCKED: A と B のどちらにするか"}'
+EOF
+chmod +x "$CLAUDE_STUB_DIR/step-1.sh"
+out="$(loop)"
+sd="$(state_dir 132)"
+assert_eq "handoff: 開始時に issue 本文を保存する" "元の本文" "$(cat "$sd/issue.body.md" 2>/dev/null)"
+if grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$sd/escalated-at" 2>/dev/null; then
+  pass "handoff: escalate が escalated-at を UTC の ISO 8601 で書く"
+else
+  fail "handoff: escalate が escalated-at を UTC の ISO 8601 で書く ($(cat "$sd/escalated-at" 2>/dev/null))"
+fi
+# 人間が回答をコメントし、本文も直してからラベルを外す
+add_comment 132 alice "2099-01-01T00:00:00Z" "答え: A にする"
+set_issue 132 '.body = "新しい本文" | .labels = [{"name":"wt-loop"}]'
+cat >"$CLAUDE_STUB_DIR/step-2.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"BLOCKED: もう一度確認したい"}'
+EOF
+chmod +x "$CLAUDE_STUB_DIR/step-2.sh"
+out="$(loop 132)"
+p2="$(cat "$CLAUDE_STUB_DIR/prompt-2.txt")"
+assert_contains "handoff: 再開プロンプトに引き継ぎ節を付ける" "$p2" "## 前回からの引き継ぎ"
+assert_contains "handoff: 従来の続きから進める指示も残す" "$p2" "前回の run は途中で止まった"
+assert_contains "handoff: 人間からの回答の見出し" "$p2" "### 人間からの回答"
+assert_contains "handoff: 回答の本文を渡す" "$p2" "答え: A にする"
+assert_contains "handoff: 回答の投稿者を渡す" "$p2" "alice"
+assert_contains "handoff: 回答の日時を渡す" "$p2" "2099-01-01T00:00:00Z"
+assert_not_contains "handoff: driver 自身のコメントは渡さない" "$p2" "## wt loop:"
+assert_not_contains "handoff: エスカレーション前のコメントは渡さない" "$p2" "エスカレーション前の古いコメント"
+assert_contains "handoff: 本文更新の見出し" "$p2" "### issue 本文の更新"
+assert_contains "handoff: 新しい本文の全文を渡す" "$p2" "新しい本文"
+assert_eq "handoff: 引き継いだコメントの最新 createdAt を記録する" "2099-01-01T00:00:00Z" "$(cat "$sd/handoff-at" 2>/dev/null)"
+assert_eq "handoff: 保存した本文を更新する" "新しい本文" "$(cat "$sd/issue.body.md" 2>/dev/null)"
+assert_eq "handoff: 2 回目の BLOCKED で needs-human" "needs-human" "$(cat "$sd/status" 2>/dev/null)"
+# 2 回目の再開では新しいコメントだけを渡す
+add_comment 132 alice "2099-01-02T00:00:00Z" "追加の答え: B も許容"
+set_issue 132 '.labels = [{"name":"wt-loop"}]'
+worker_step 3 a.txt finished
+reviewer_step 4 PASS ok '[]'
+out="$(loop 132)"
+p3="$(cat "$CLAUDE_STUB_DIR/prompt-3.txt")"
+assert_contains "handoff: 2 回目の再開で新しい回答を渡す" "$p3" "追加の答え: B も許容"
+assert_not_contains "handoff: 既出の回答を重複して渡さない" "$p3" "答え: A にする"
+assert_not_contains "handoff: 本文が変わっていなければ本文更新を渡さない" "$p3" "### issue 本文の更新"
+assert_eq "handoff: handoff-at を進める" "2099-01-02T00:00:00Z" "$(cat "$sd/handoff-at" 2>/dev/null)"
+assert_eq "handoff: 完走して merged" "merged" "$(cat "$sd/status" 2>/dev/null)"
 
 # --- test 16: ラベル付きの子 issue も依存判定を受ける (一覧は新しい順) ----------
 make_fixture t16

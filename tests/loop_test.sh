@@ -878,6 +878,9 @@ assert_contains "doctor NG: 本体が default branch 上に無い" "$out" "NG   
 assert_contains "doctor NG: ブランチの直し方" "$out" "git switch dev"
 assert_contains "doctor NG: exit 1" "$out" "rc=1"
 assert_eq "doctor NG: NG は 1 項目 1 行" "7" "$(printf '%s\n' "$out" | grep -c '^NG   ')"
+# WT_HOME で worktree を repo の外に作るなら ignore は要らない
+out="$(cd "$REPO" && env HOME="$TMP/home" PATH="$TMP/bin:$SAFE_PATH" WT_LOOP_STATE="$STATE_ROOT" WT_HOME="$TMP/wt-home" "$WT" loop doctor 2>&1)"
+assert_contains "doctor: WT_HOME 使用時は ignore を求めない" "$out" "OK   .claude/worktrees/ が ignore 済み (WT_HOME"
 # 本体の未コミット変更
 git -C "$REPO" switch -q dev
 printf 'dirty\n' >"$REPO/shared.txt"
@@ -911,7 +914,7 @@ out="$(loop doctor --fix-labels; echo "rc=$?")"
 assert_contains "fix-labels: wt-loop を作る" "$(cat "$GH_STUB_DIR/gh.log")" "label create wt-loop"
 assert_contains "fix-labels: needs-human を作る" "$(cat "$GH_STUB_DIR/gh.log")" "label create needs-human"
 assert_contains "fix-labels: 作ったラベルは OK になる" "$out" "OK   ラベル wt-loop がある"
-assert_contains "fix-labels: 作ったことを出す" "$out" "ラベル wt-loop を作った"
+assert_contains "fix-labels: 作ったことを出す" "$out" "ラベル wt-loop がある (--fix-labels で作った)"
 assert_contains "fix-labels: 他の NG は残る" "$out" "NG   .github/workflows/ci.yml がある"
 assert_contains "fix-labels: 他の NG があれば exit 1" "$out" "rc=1"
 if [ -e "$REPO/.github/workflows/ci.yml" ]; then fail "fix-labels: ci.yml を作らない"; else pass "fix-labels: ci.yml を作らない"; fi

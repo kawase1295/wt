@@ -159,10 +159,8 @@ has_label() { # json label
   jq -e --arg l "$2" '[.labels[]?.name] | index($l) != null' <<<"$1" >/dev/null
 }
 
-ensure_label() { # name color description
-  gh_main label list --limit 500 --json name -q '.[].name' 2>/dev/null | grep -qx "$1" && return 0
-  gh_main label create "$1" --color "$2" --description "$3" >/dev/null 2>&1 ||
-    log "警告: ラベル $1 を作れなかった (手動で作る: gh label create $1)"
+label_exists() { # name
+  gh_main label list --limit 500 --json name -q '.[].name' 2>/dev/null | grep -qx -- "$1"
 }
 
 # 本文の「## 子タスク」節 (見出しは 子タスク / 子 Issue / 子 issue / sub-issues) の
@@ -890,11 +888,117 @@ cmd_status() {
   return 0
 }
 
+# --- doctor ----------------------------------------------------------------------
+# repo が loop に乗せられる状態かを本体 checkout で検査する。1 項目 1 行で
+# "OK   <項目>" か "NG   <項目> — <直し方>" を stdout に出し、NG が 1 つでもあれば 1 を返す。
+# 直すのは FIX_LABELS=1 のときのラベルだけ (repo のファイルや git の状態には触らない)。
+# 副作用として DEFAULT を埋める。
+FIX_LABELS=0
+DOCTOR_NG=0
+
+doctor_line() { # ok|ng item [fix]
+  if [ "$1" = ok ]; then
+    printf 'OK   %s\n' "$2"
+  else
+    printf 'NG   %s — %s\n' "$2" "$3"
+    DOCTOR_NG=1
+  fi
+}
+
+doctor_label() { # name color description
+  local item="ラベル $1 がある" fix="wt loop doctor --fix-labels で作る"
+  [ "$LABEL" = "wt-loop" ] || fix="wt loop doctor --label $LABEL --fix-labels で作る"
+  if label_exists "$1"; then
+    doctor_line ok "$item"
+  elif [ "$FIX_LABELS" -eq 0 ]; then
+    doctor_line ng "$item" "$fix"
+  elif gh_main label create "$1" --color "$2" --description "$3" >/dev/null 2>&1; then
+    doctor_line ok "$item (--fix-labels で作った)"
+  else
+    doctor_line ng "$item" "作れなかった。repo への書き込み権限を確認して gh label create $1 で作る"
+  fi
+}
+
+run_doctor() {
+  DOCTOR_NG=0
+  local m="$MAIN_ROOT" cur
+  if [ -f "$m/scripts/check" ] && [ -x "$m/scripts/check" ]; then
+    doctor_line ok "scripts/check が実行可能"
+  else
+    doctor_line ng "scripts/check が実行可能" "マージ前ゲートの入口 scripts/check を置き、chmod +x scripts/check する"
+  fi
+  if [ -f "$m/.github/workflows/ci.yml" ]; then
+    doctor_line ok ".github/workflows/ci.yml がある"
+  else
+    doctor_line ng ".github/workflows/ci.yml がある" "scripts/check を叩く workflow を .github/workflows/ci.yml に置く"
+  fi
+  if [ -n "${WT_HOME:-}" ]; then
+    doctor_line ok ".claude/worktrees/ が ignore 済み (WT_HOME により worktree は repo の外に作る)"
+  elif git -C "$m" check-ignore -q .claude/worktrees/wt-loop-doctor; then
+    doctor_line ok ".claude/worktrees/ が ignore 済み"
+  else
+    doctor_line ng ".claude/worktrees/ が ignore 済み" "本体の .gitignore か .git/info/exclude に .claude/worktrees/ を足す"
+  fi
+  if ! command -v gh >/dev/null 2>&1; then
+    doctor_line ng "gh が認証済み" "gh (GitHub CLI) を入れて gh auth login する"
+  elif gh_main auth status >/dev/null 2>&1; then
+    doctor_line ok "gh が認証済み"
+  else
+    doctor_line ng "gh が認証済み" "gh auth login する"
+  fi
+  DEFAULT=""
+  if command -v gh >/dev/null 2>&1; then DEFAULT="$(default_branch || true)"; fi
+  if [ -n "$DEFAULT" ]; then
+    doctor_line ok "default branch を取得できる ($DEFAULT)"
+  else
+    doctor_line ng "default branch を取得できる" "gh repo view が通らない。origin が GitHub の repo を指しているか、gh の認証を確認する"
+  fi
+  doctor_label "$LABEL" "1d76db" "wt loop が無人で進める issue"
+  doctor_label "$HUMAN_LABEL" "d93f0b" "wt loop が人間の判断待ちに切り出した issue"
+  if [ -z "$DEFAULT" ]; then
+    doctor_line ng "本体が default branch 上でクリーン" "default branch が分からないため検査できない。先に default branch の NG を直す"
+  else
+    cur="$(git -C "$m" symbolic-ref --short -q HEAD || true)"
+    if [ "$cur" != "$DEFAULT" ]; then
+      doctor_line ng "本体が $DEFAULT 上でクリーン" "本体は ${cur:-detached HEAD} 上にある。本体 ($m) で git switch $DEFAULT する"
+    elif [ -n "$(git -C "$m" status --porcelain -uno)" ]; then
+      doctor_line ng "本体が $DEFAULT 上でクリーン" "本体 ($m) に未コミットの変更がある。commit するか退避する"
+    else
+      doctor_line ok "本体が $DEFAULT 上でクリーン"
+    fi
+  fi
+  if command -v claude >/dev/null 2>&1; then
+    doctor_line ok "claude CLI がある"
+  else
+    doctor_line ng "claude CLI がある" "Claude Code を入れて PATH に通す"
+  fi
+  return "$DOCTOR_NG"
+}
+
+cmd_doctor() {
+  log "本体 checkout を診断する: $MAIN_ROOT"
+  if run_doctor; then
+    log "すべて OK。wt loop に乗せられる"
+    return 0
+  fi
+  log "NG がある。直し方に沿って直してから、もう一度 wt loop doctor で確認する"
+  return 1
+}
+
+# 起動前の診断 (wt loop doctor と同じ検査)。NG なら始めない。--dry-run は診断を出して続ける
+# (対象の一覧まで見せる。何も作らない) が、NG があれば最後に 1 で終わる。
+PREFLIGHT_NG=0
 preflight() {
-  command -v gh >/dev/null 2>&1 || die "gh が無い"
   command -v jq >/dev/null 2>&1 || die "jq が無い"
-  [ "$DRY_RUN" -eq 1 ] || command -v claude >/dev/null 2>&1 || die "claude CLI が無い"
-  gh_main repo view --json nameWithOwner >/dev/null 2>&1 || die "GitHub リポジトリではない (gh repo view が失敗)"
+  local out rc=0 line
+  out="$(run_doctor)" || rc=$?
+  log "起動前の診断 (wt loop doctor と同じ検査):"
+  while IFS= read -r line; do log "$line"; done <<<"$out"
+  if [ "$rc" -ne 0 ]; then
+    [ "$DRY_RUN" -eq 1 ] || die "NG があるため始めない。直し方に沿って直し、wt loop doctor で確認してから起動する"
+    log "NG があるため、このままでは wt loop は始まらない (--dry-run なので対象の一覧までは出す)"
+    PREFLIGHT_NG=1
+  fi
   DEFAULT="$(default_branch)"
   [ -n "$DEFAULT" ] || die "default branch を取得できない"
   git -C "$MAIN_ROOT" fetch -q origin "$DEFAULT" || die "origin/$DEFAULT を fetch できない"
@@ -908,8 +1012,6 @@ cmd_loop() {
     acquire_lock
     rm -f "$STATE/STOP"
   fi
-  ensure_label "$LABEL" "1d76db" "wt loop が無人で進める issue"
-  ensure_label "$HUMAN_LABEL" "d93f0b" "wt loop が人間の判断待ちに切り出した issue"
 
   local total=0 merged=0 human=0 pass=0 selected n t rc pass_merged stop=0
   while :; do
@@ -924,7 +1026,7 @@ cmd_loop() {
     printf '%s\n' "$selected" | while IFS=$'\t' read -r n t; do printf '  #%s %s\n' "$n" "$t" >&2; done
     if [ "$DRY_RUN" -eq 1 ]; then
       log "--dry-run のためここで終わる"
-      return 0
+      return "$PREFLIGHT_NG"
     fi
     pass_merged=0
     while IFS=$'\t' read -r n t; do
@@ -964,7 +1066,7 @@ cmd_loop() {
   done
   log "終了: 処理 $total 件 / マージ $merged 件 / $HUMAN_LABEL $human 件 (state: $STATE)"
   [ "$stop" -eq 2 ] && return 1
-  return 0
+  return "$PREFLIGHT_NG"
 }
 
 # --- 引数 ----------------------------------------------------------------------
@@ -973,6 +1075,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --stop) MODE=stop ;;
     status) MODE=status ;;
+    doctor) MODE=doctor ;;
+    --fix-labels) FIX_LABELS=1 ;;
     --label)
       [ $# -ge 2 ] || die "--label に値が必要"
       LABEL="$2"
@@ -1017,6 +1121,9 @@ if ! [[ "$MAX_ROUNDS" =~ ^[0-9]+$ ]] || [ "$MAX_ROUNDS" -lt 1 ]; then
 fi
 [[ "$MAX_ISSUES" =~ ^[0-9]+$ ]] || die "--max-issues は整数"
 [ "${#ISSUES[@]}" -gt 0 ] && EXPLICIT=1
+if [ "$FIX_LABELS" -eq 1 ] && [ "$MODE" != doctor ]; then
+  die "--fix-labels は wt loop doctor と組み合わせて使う"
+fi
 
 resolve_repo
 STATE="$(state_root)"
@@ -1025,5 +1132,6 @@ DEFAULT=""
 case "$MODE" in
   stop) cmd_stop ;;
   status) cmd_status ;;
+  doctor) cmd_doctor ;;
   loop) cmd_loop ;;
 esac

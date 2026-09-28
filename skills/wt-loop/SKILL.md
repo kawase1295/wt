@@ -31,7 +31,7 @@ description: ラベル付き issue を人間の操作なしに worktree → head
 ## 前提と制約（ユーザーに聞かれたら答える）
 
 - 権限設定は変えない。worker は `--permission-mode acceptEdits` と allowlist（git / テスト / パッケージマネージャ / 読み取り系のシェルコマンド。`bash` / `sh` / `gh` は入れない。`WT_LOOP_EXTRA_TOOLS` で追記）で動く。
-- worker は push できない。permission ルールではなく、worker プロセスだけに効く環境で保証する（git の `pushInsteadOf` を環境変数で与えて全 push 先を無効なパスに書き換える + `GH_CONFIG_DIR` を空にして gh を無認証にする）。push / PR / merge は driver が自分の環境の git / gh で行う。
+- worker は push できない。permission ルールではなく、worker プロセスだけに効く環境で保証する（git の `pushInsteadOf` を環境変数で与えて全 push 先を無効なパスに書き換える + PATH 先頭の `git` shim が `push` を拒否 + `GH_CONFIG_DIR` を空にして gh を無認証にする）。防ぐのは誤操作で、意図的な回避までは防がない。push / PR / merge は driver が自分の環境の git / gh で行う。
 - worker と reviewer は別セッション。reviewer には diff と issue 本文と合否基準だけを渡す（実装の経緯は渡さない）。minor のみ PASS、blocker / major は FAIL。迷ったら FAIL。
 - 落ちた工程（未コミット / コンフリクト / scripts/check / レビュー FAIL / CI）はその内容を同じ worker セッションに `--resume` で渡して次ラウンド。上限（既定 3）超過、worker の `BLOCKED:`、push / merge の拒否、CI 待ちの上限（既定 30 分）で issue に `needs-human` ラベルとコメント（理由・worktree・state の場所）を付けて次の issue へ進む。worktree は残る。worker が起動直後に異常終了したら（利用上限・API 障害の疑い）その issue を `failed` にして loop 全体を止める。
 - 親 issue（`## 子タスク` のチェックリスト）は子に展開し、「（#M のあと）」の依存が CLOSED の子だけを対象にする。子を単体で指定・ラベル付けしても、本文の「親 issue: #P」から同じ依存判定をする。親自体は閉じない（子が全部 CLOSED になったらユーザーが閉じる）。

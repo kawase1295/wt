@@ -306,7 +306,7 @@ Claude が担うのは「実装」と「レビュー判定」だけで、どち�
 
 **権限設定は変えない。** worker は `--permission-mode acceptEdits` と allowlist（git / テスト / パッケージマネージャ / 読み取り系のシェルコマンド。任意コードを実行できる `bash` / `sh` と `gh` は入れない。`WT_LOOP_EXTRA_TOOLS` で追記、`WT_LOOP_ALLOWED_TOOLS` で差し替え）で動く。headless では `--permission-mode auto` が書き込みを拒否するため使わない。
 
-**worker は push できない。** これは permission ルール（`git -C` や `bash -c` で回避できる）ではなく、worker プロセスだけに効く環境で保証する: git の `url.<無効なパス>.pushInsteadOf` を環境変数（`GIT_CONFIG_*`）で与え、remote 名・`-C`・URL 直指定のどれで push しても存在しないパスへ書き換えて失敗させる（fetch / pull は通る）。あわせて `GH_CONFIG_DIR` を空ディレクトリにして gh を無認証にする（`gh pr merge` 等が失敗する）。push / PR / merge は driver が自分の環境の git / gh で行う。
+**worker は push できない。** これは permission ルール（`git -C` や `bash -c` で回避できる）ではなく、worker プロセスだけに効く環境で保証する: git の `url.<無効なパス>.pushInsteadOf` を環境変数（`GIT_CONFIG_*`）で与え、remote 名・`-C`・URL 直指定のどれで push しても存在しないパスへ書き換えて失敗させる（fetch / pull は通る）。環境変数の塞ぎは `git -c` や `GIT_CONFIG_COUNT` の上書きで外せるので、worker の PATH 先頭に置いた `git` の shim（サブコマンドが `push` なら拒否、それ以外は実 git に委譲）でコマンド経路でも止める。あわせて `GH_CONFIG_DIR` を空ディレクトリにして gh を無認証にする（`gh pr merge` 等が失敗する）。防いでいるのは「気を利かせて push してしまう」誤操作であって、実 git を絶対パスで呼ぶような意図的な回避までは防がない。push / PR / merge は driver が自分の環境の git / gh で行う。
 
 対象の選び方:
 

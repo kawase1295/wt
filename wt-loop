@@ -377,9 +377,40 @@ run_claude() { # cwd prompt_file out_json timeout_sec args...
   (cd "$cwd" && "${pre[@]}" claude -p --output-format json --model "$MODEL" "$@" <"$prompt" >"$out" 2>"$out.err")
 }
 
+# worker の PATH 先頭に置く git の shim。サブコマンドが push なら拒否し、それ以外は
+# 実 git に委譲する。環境変数の塞ぎ (pushInsteadOf) は git -c や GIT_CONFIG_COUNT の
+# 上書きで外せるので、コマンド経路でも止める (絶対パスで実 git を呼ぶ経路は残る。
+# 防ぐ対象は悪意ではなく「気を利かせて push してしまう」誤操作)。
+write_git_shim() { # dir
+  mkdir -p "$1"
+  cat >"$1/git" <<'SHIM'
+#!/usr/bin/env bash
+# wt loop の worker 用 git shim: push を拒否する (driver が push する)
+sub=""
+skip=0
+for a in "$@"; do
+  if [ "$skip" -eq 1 ]; then skip=0; continue; fi
+  case "$a" in
+    -C | -c | --git-dir | --work-tree | --namespace | --super-prefix | --config-env | --exec-path | --list-cmds) skip=1 ;;
+    -*) ;;
+    *)
+      sub="$a"
+      break
+      ;;
+  esac
+done
+if [ "$sub" = "push" ]; then
+  echo "wt loop: worker は push できない (push / PR / merge は driver が行う)" >&2
+  exit 1
+fi
+exec "$WT_LOOP_REAL_GIT" "$@"
+SHIM
+  chmod +x "$1/git"
+}
+
 # worker / reviewer を、push と gh の書き込みができない環境で走らせる。
 # 環境変数は claude の Bash tool が起動する子プロセスにも引き継がれる。
-# GIT_CONFIG_* はこのサブシェルだけに効き、driver 自身の git には影響しない。
+# GIT_CONFIG_* / PATH はこのサブシェルだけに効き、driver 自身の git には影響しない。
 run_sandboxed() { # cwd prompt_file out_json timeout_sec args...
   (
     local i=0 p
@@ -391,6 +422,10 @@ run_sandboxed() { # cwd prompt_file out_json timeout_sec args...
     unset GH_TOKEN GITHUB_TOKEN
     mkdir -p "$STATE/no-gh"
     export GH_CONFIG_DIR="$STATE/no-gh" GIT_TERMINAL_PROMPT=0
+    WT_LOOP_REAL_GIT="$(command -v git)"
+    export WT_LOOP_REAL_GIT
+    write_git_shim "$STATE/shim"
+    export PATH="$STATE/shim:$PATH"
     run_claude "$@"
   )
 }

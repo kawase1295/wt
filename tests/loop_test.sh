@@ -424,9 +424,9 @@ git add -A
 git -c user.email=w@example.com -c user.name=worker commit -qm implement
 printf 'upstream\n' >"$adv/shared.txt"
 git -C "$adv" -c user.email=u@example.com -c user.name=up commit -qam upstream
-# worker の環境では push が塞がれているので、上流役の push だけ塞ぎを外す
+# worker の環境では push が塞がれている (環境 + PATH の shim) ので、上流役の push だけ両方外す
 unset GIT_CONFIG_COUNT
-git -C "$adv" push -q origin dev
+"\$WT_LOOP_REAL_GIT" -C "$adv" push -q origin dev
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"実装した"}'
 EOF
 chmod +x "$CLAUDE_STUB_DIR/step-1.sh"
@@ -552,6 +552,12 @@ git -c user.email=w@example.com -c user.name=worker commit -qm add
 # worker が push を試みても (allowlist をすり抜けても) 失敗すること
 git push origin HEAD:evil1 >/dev/null 2>&1; echo "push1=$?" >>"$CLAUDE_STUB_DIR/push.log"
 git -C . push "$(git remote get-url origin)" HEAD:evil2 >/dev/null 2>&1; echo "push2=$?" >>"$CLAUDE_STUB_DIR/push.log"
+# 環境の塞ぎを -c や GIT_CONFIG_COUNT で外しても、PATH の shim が push を止める
+git -c "url.$(git remote get-url origin).pushInsteadOf=$(git remote get-url origin)" push origin HEAD:evil3 >/dev/null 2>&1; echo "push3=$?" >>"$CLAUDE_STUB_DIR/push.log"
+GIT_CONFIG_COUNT=0 git push origin HEAD:evil4 >/dev/null 2>&1; echo "push4=$?" >>"$CLAUDE_STUB_DIR/push.log"
+# shim を外した素の git でも環境の塞ぎが効く
+"$WT_LOOP_REAL_GIT" -C . push origin HEAD:evil5 >/dev/null 2>&1; echo "push5=$?" >>"$CLAUDE_STUB_DIR/push.log"
+git -c core.pager=cat commit --allow-empty -qm "push という語を含むコミット" ; echo "commit=$?" >>"$CLAUDE_STUB_DIR/push.log"
 git fetch -q origin dev; echo "fetch=$?" >>"$CLAUDE_STUB_DIR/push.log"
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
 EOF
@@ -562,10 +568,14 @@ assert_contains "sandbox: worker に pushInsteadOf を渡す" "$(cat "$CLAUDE_ST
 assert_contains "sandbox: worker の gh を無認証にする" "$(cat "$CLAUDE_STUB_DIR/env-1.txt")" "GH_CONFIG_DIR="
 assert_not_contains "sandbox: GH_TOKEN を渡さない" "$(cat "$CLAUDE_STUB_DIR/env-1.txt")" "GH_TOKEN="
 assert_contains "sandbox: reviewer にも同じ環境" "$(cat "$CLAUDE_STUB_DIR/env-2.txt")" "pushInsteadOf"
-assert_contains "sandbox: remote 名への push が失敗する" "$(cat "$CLAUDE_STUB_DIR/push.log")" "push1=128"
-assert_contains "sandbox: URL 直指定の push も失敗する" "$(cat "$CLAUDE_STUB_DIR/push.log")" "push2=128"
+assert_contains "sandbox: remote 名への push は shim が止める" "$(cat "$CLAUDE_STUB_DIR/push.log")" "push1=1"
+assert_contains "sandbox: URL 直指定の push も失敗する" "$(cat "$CLAUDE_STUB_DIR/push.log")" "push2=1"
+assert_contains "sandbox: -c で pushInsteadOf を上書きしても shim が止める" "$(cat "$CLAUDE_STUB_DIR/push.log")" "push3=1"
+assert_contains "sandbox: GIT_CONFIG_COUNT=0 でも shim が止める" "$(cat "$CLAUDE_STUB_DIR/push.log")" "push4=1"
+assert_contains "sandbox: shim を外した実 git でも環境の塞ぎが効く" "$(cat "$CLAUDE_STUB_DIR/push.log")" "push5=128"
+assert_contains "sandbox: push 以外の git は shim を素通りする" "$(cat "$CLAUDE_STUB_DIR/push.log")" "commit=0"
 assert_contains "sandbox: fetch は通る" "$(cat "$CLAUDE_STUB_DIR/push.log")" "fetch=0"
-if git -C "$ORIGIN" rev-parse --verify -q refs/heads/evil1 >/dev/null || git -C "$ORIGIN" rev-parse --verify -q refs/heads/evil2 >/dev/null; then
+if git -C "$ORIGIN" for-each-ref 'refs/heads/evil*' | grep -q evil; then
   fail "sandbox: origin に worker の push が届かない"
 else
   pass "sandbox: origin に worker の push が届かない"

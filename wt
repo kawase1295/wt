@@ -435,6 +435,18 @@ leftover_hints() { # task [retry_cmd]
   fi
 }
 
+# herdr の agent 名規則 (小文字始まり、[a-z0-9_-]、1〜32 字) を wt 側で先に検査する。
+# agent 名は claude-<task> なので、task は小文字・数字・_ - のみで 25 字以内になる。
+AGENT_NAME_PREFIX="claude-"
+AGENT_NAME_MAX=32
+check_agent_name() { # task
+  local name="$AGENT_NAME_PREFIX$1" max_task=$((AGENT_NAME_MAX - ${#AGENT_NAME_PREFIX}))
+  [[ "$name" =~ ^[a-z][a-z0-9_-]*$ ]] ||
+    die "new: task 名は小文字・数字・_ - のみにする (herdr の agent 名 $name の規則。--no-claude なら不要): $1"
+  [ "${#name}" -le "$AGENT_NAME_MAX" ] ||
+    die "new: task 名は ${max_task} 字以内にする (${#1} 字。herdr の agent 名 $name が ${AGENT_NAME_MAX} 字を超える。--no-claude なら不要): $1"
+}
+
 # herdr agent start の失敗を error.code で分け、1 行目にエラー、2 行目以降に次の手を
 # 出す。原因で次の一手が変わるため、一律に herdr update を促さない (典型ケースの
 # 信頼ダイアログは pane を見れば承認で進める)。新しい code への対応はこの case に足す。
@@ -450,6 +462,14 @@ agent_start_failure() { # task ws pane herdr_output retry_cmd claude_args...
         "典型的な原因は起動直後の信頼ダイアログ「Quick safety check: Is this a project you created or one you trust?」" \
         "1. workspace $ws の pane $pane を開いて (wt open $task) ダイアログを承認する"
       [ -n "$retry" ] && printf '%s\n' "2. 承認後に初期プロンプトを再投入する: $retry"
+      ;;
+    invalid_agent_name)
+      # 事前検証 (check_agent_name) をすり抜けた = herdr 側の規則が変わった可能性がある。
+      # herdr の本文が規則そのものを述べるので、そのまま見せる。
+      printf '%s\n' "new: herdr が agent 名 claude-$task を受け付けなかった (herdr: invalid_agent_name)" \
+        "task 名を herdr の agent 名規則に合わせて付け直す (wt rm $task で片付けてから wt new)"
+      herdr_output_hints "$start_out"
+      retry=""
       ;;
     invalid_agent_argument)
       # argv は wt が組む (-n wt-<task> + 既定フラグ or WT_CLAUDE_ARGS)。
@@ -501,6 +521,10 @@ cmd_new() {
   [ -n "$task" ] || usage 1
   # ディレクトリ名・ブランチ名に埋め込むので、パスやブランチ参照を壊さない文字に限る。
   [[ "$task" =~ ^[A-Za-z0-9._-]+$ ]] || die "task 名に使えるのは英数字と . _ - のみ: $task"
+  # Claude を起動するなら agent 名 claude-<task> が herdr の規則に収まることも確かめる。
+  # 違反は worktree / workspace を作った後の agent start で初めて失敗し、空の worktree が
+  # 残るため、副作用の前に弾く。
+  [ "$start_claude" -eq 0 ] || check_agent_name "$task"
 
   # prompt の検証は worktree 作成の副作用が出る前に fail-fast する。
   # herdr 不可のまま進むと初期プロンプトを黙って取りこぼすため die する。

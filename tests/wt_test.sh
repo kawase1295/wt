@@ -238,6 +238,54 @@ else
   fail "prompt: 本文途中の / # は先頭文字チェックに掛からない (rc=$rc out=$out)"
 fi
 
+# --- test 14c: Claude を起動する task は herdr の agent 名規則を worktree 作成前に検証する ---
+# agent 名 claude-<task> は herdr の規則 (小文字始まり、[a-z0-9_-]、1〜32 字) に従う。
+# 違反は worktree / workspace を作った後の agent start で初めて失敗し、空の worktree が
+# 残って再実行も「同名ブランチあり」で止まるため、副作用の前に弾く。
+assert_task_err() { # desc pattern task [args...]
+  local desc="$1" pattern="$2" out rc
+  shift 2
+  out="$(wt_local "$R14" new "$@" 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF -- "$pattern"; then
+    pass "task: $desc"
+  else
+    fail "task: $desc (rc=$rc out=$out)"
+  fi
+  if [ -d "$R14/.claude/worktrees/$1" ] || has_branch "$R14" "worktree-$1"; then
+    fail "task: $desc で worktree/ブランチを作らない"
+  else
+    pass "task: $desc で worktree/ブランチを作らない"
+  fi
+}
+T26="10-validate-connectivity-d" # 26 字 (claude- を足すと 33 字)
+assert_task_err "26 字の task は agent 名の上限を理由に弾く" '25 字' "$T26"
+assert_task_err "上限超過の案内に agent 名を示す" "claude-$T26" "$T26" --prompt "hi"
+assert_task_err "大文字を含む task は agent 名の文字種を理由に弾く" '小文字' Fix-login
+assert_task_err ". を含む task は agent 名の文字種を理由に弾く" '小文字' fix.login
+# 境界: 25 字は agent 名の検証を通り、次の段階 (herdr チェック) まで進む
+T25="10-validate-connectivity-"
+out="$(wt_local "$R14" new "$T25" --prompt "hi" 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'herdr サーバなし' &&
+  ! printf '%s' "$out" | grep -q '25 字'; then
+  pass "task: 25 字の task は agent 名の検証を通る"
+else
+  fail "task: 25 字の task は agent 名の検証を通る (rc=$rc out=$out)"
+fi
+# --no-claude は agent を起動しないので、従来の task 名規則のまま許可する
+wt_local "$R14" new "$T26" --no-claude >/dev/null 2>&1
+assert_dir "$R14/.claude/worktrees/$T26" "task: --no-claude なら 26 字の task も作れる"
+# worktree 名を生成する skill の規約が wt new の上限 (25 字) と食い違わないこと
+SKILLS14="$(cd "$(dirname "$WT")/skills" && pwd)"
+for s in wt wt-detail; do
+  if grep -q '25 字以内' "$SKILLS14/$s/SKILL.md" && ! grep -q '30 字以内' "$SKILLS14/$s/SKILL.md"; then
+    pass "task: /$s の worktree 名の規約は 25 字以内"
+  else
+    fail "task: /$s の worktree 名の規約は 25 字以内"
+  fi
+done
+
 # --- test 15: herdr 不可で --prompt はプロンプトを取りこぼさないよう die する ---
 out="$(wt_local "$R14" new p15 --prompt "hello" 2>&1)"
 rc=$?
@@ -602,6 +650,14 @@ STUB
   rc=$?
   assert_start_fail "stub: invalid_agent_argument は WT_CLAUDE_ARGS を指す" \
     "$rc" "$out" 'invalid_agent_argument' 'WT_CLAUDE_ARGS' 'wt rm p21i' '!trust'
+
+  # invalid_agent_name: 事前検証をすり抜けた (herdr 側の規則が変わった等) ときも、
+  # 原因が agent 名であることと herdr の本文を示し、herdr update に誘導しない
+  out="$(start_fail_out p21q invalid_agent_name --prompt "hi")"
+  rc=$?
+  assert_start_fail "stub: invalid_agent_name は agent 名の規則違反と herdr の本文を示す" \
+    "$rc" "$out" 'invalid_agent_name' 'agent 名 claude-p21q' 'stub failure for claude-p21q' \
+    'wt rm p21q' '!herdr update' '!trust'
 
   # 整形された (複数行の) JSON でも error.code を取れる
   out="$(HERDR_STUB_START_PRETTY=1 start_fail_out p21m agent_not_ready --prompt "hi")"
